@@ -588,6 +588,8 @@ def main():
     else:
         df_filtered = df_raw
 
+    df_filtered["NAV Date"] = pd.to_datetime(df_filtered["NAV Date"], errors="coerce")
+
     # ── Build AUM data and daily scale ────────────────────────────────────────
     df_port = load_portfolio_aum_data()
     raw_rows_with_aum = []
