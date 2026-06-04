@@ -839,7 +839,7 @@ def main():
 
     st.markdown("")
 
-    fetch_btn = st.button("⚡ Fetch Data", use_container_width=True)
+    fetch_btn = st.button("⚡ FetchData", use_container_width=True)
 
     if not fetch_btn:
         return
