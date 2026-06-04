@@ -111,6 +111,298 @@ def calculate_aum_for_row(row, df_port: pd.DataFrame) -> float:
         
     return aum_monthly
 
+
+def map_section_to_ids(sec):
+    sec_lower = str(sec).lower()
+    
+    # Maturity Type
+    maturity_id = 1  # Open ended default
+    if "close" in sec_lower:
+        maturity_id = 2
+    elif "interval" in sec_lower:
+        maturity_id = 2
+        
+    # Category
+    cat_id = 1  # Equity default
+    if "debt" in sec_lower:
+        cat_id = 2
+    elif "hybrid" in sec_lower:
+        cat_id = 3
+    elif "solution" in sec_lower:
+        cat_id = 4
+    elif "other" in sec_lower:
+        cat_id = 5
+    elif "gilt" in sec_lower or "money market" in sec_lower or "income" in sec_lower:
+        cat_id = 2
+        
+    # Subcategory defaults
+    if cat_id == 1:
+        sub_id = 1
+    elif cat_id == 2:
+        sub_id = 15
+    elif cat_id == 3:
+        sub_id = 30
+    elif cat_id == 4:
+        sub_id = 36
+    elif cat_id == 5:
+        sub_id = 38
+    else:
+        sub_id = 1
+    
+    # Subcategory mapping rules
+    if cat_id == 1:  # Equity
+        if "large & mid" in sec_lower:
+            sub_id = 2
+        elif "large cap" in sec_lower:
+            sub_id = 1
+        elif "flexi cap" in sec_lower:
+            sub_id = 3
+        elif "multi cap" in sec_lower:
+            sub_id = 4
+        elif "mid cap" in sec_lower:
+            sub_id = 5
+        elif "small cap" in sec_lower:
+            sub_id = 6
+        elif "value" in sec_lower:
+            sub_id = 7
+        elif "elss" in sec_lower:
+            sub_id = 8
+        elif "contra" in sec_lower:
+            sub_id = 9
+        elif "dividend yield" in sec_lower:
+            sub_id = 10
+        elif "focused" in sec_lower:
+            sub_id = 11
+        elif "sectoral" in sec_lower or "thematic" in sec_lower:
+            sub_id = 12
+    elif cat_id == 2:  # Debt
+        if "gilt with 10" in sec_lower or "10 year constant" in sec_lower:
+            sub_id = 29
+        elif "gilt" in sec_lower:
+            sub_id = 28
+        elif "medium to long" in sec_lower:
+            sub_id = 14
+        elif "long duration" in sec_lower:
+            sub_id = 13
+        elif "ultra short" in sec_lower:
+            sub_id = 19
+        elif "short duration" in sec_lower:
+            sub_id = 15
+        elif "medium duration" in sec_lower:
+            sub_id = 16
+        elif "money market" in sec_lower:
+            sub_id = 17
+        elif "low duration" in sec_lower:
+            sub_id = 18
+        elif "liquid" in sec_lower:
+            sub_id = 20
+        elif "overnight" in sec_lower:
+            sub_id = 21
+        elif "dynamic bond" in sec_lower:
+            sub_id = 22
+        elif "corporate bond" in sec_lower:
+            sub_id = 23
+        elif "credit risk" in sec_lower:
+            sub_id = 24
+        elif "banking" in sec_lower or "psu" in sec_lower:
+            sub_id = 25
+        elif "floater" in sec_lower:
+            sub_id = 26
+        elif "fmp" in sec_lower:
+            sub_id = 27
+    elif cat_id == 3:  # Hybrid
+        if "aggressive hybrid" in sec_lower:
+            sub_id = 30
+        elif "conservative hybrid" in sec_lower or "conservative hyrbid" in sec_lower:
+            sub_id = 31
+        elif "equity savings" in sec_lower:
+            sub_id = 32
+        elif "arbitrage" in sec_lower:
+            sub_id = 33
+        elif "multi asset" in sec_lower:
+            sub_id = 34
+        elif "dynamic asset" in sec_lower or "balanced advantage" in sec_lower:
+            sub_id = 35
+        elif "balanced hybrid" in sec_lower:
+            sub_id = 40
+    elif cat_id == 4:  # Solution Oriented
+        if "children" in sec_lower:
+            sub_id = 36
+        elif "retirement" in sec_lower:
+            sub_id = 37
+    elif cat_id == 5:  # Other
+        if "index fund" in sec_lower or "index" in sec_lower:
+            sub_id = 38
+        elif "etf" in sec_lower:
+            sub_id = 38
+        elif "fof" in sec_lower or "fund of funds" in sec_lower:
+            sub_id = 39
+        
+    return maturity_id, cat_id, sub_id
+
+
+def clean_name(name: str) -> str:
+    n = str(name).lower()
+    n = n.replace("flexicap", "flexi cap")
+    n = n.replace("multicap", "multi cap")
+    n = n.replace("midcap", "mid cap")
+    n = n.replace("smallcap", "small cap")
+    n = n.replace("largecap", "large cap")
+    
+    n = n.replace("-", " ").replace("/", " ").replace("(", " ").replace(")", " ")
+    tokens = n.split()
+    suffixes_to_remove = {
+        "direct", "regular", "retail", "plan", "growth", "option", "idcw", "dividend", 
+        "payout", "reinvestment", "annual", "monthly", "weekly", "quarterly", "fortnightly",
+        "bonus", "fund"
+    }
+    cleaned_tokens = [t for t in tokens if t not in suffixes_to_remove]
+    return " ".join(cleaned_tokens)
+
+
+API_CACHE = {}
+
+
+def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id: int, subcategory_id: int) -> list:
+    key = (date_str, maturity_id, category_id, subcategory_id)
+    if key in API_CACHE:
+        return API_CACHE[key]
+        
+    url = "https://www.amfiindia.com/gateway/pollingsebi/api/amfi/fundperformance"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "maturityType": maturity_id,
+        "category": category_id,
+        "subCategory": subcategory_id,
+        "mfid": 0,
+        "reportDate": date_str
+    }
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=20)
+        if resp.status_code == 200:
+            res_data = resp.json()
+            if res_data.get("validationMsg") == "SUCCESS":
+                rows = res_data.get("data", [])
+                API_CACHE[key] = rows
+                return rows
+    except Exception as e:
+        pass
+    API_CACHE[key] = []
+    return []
+
+
+def find_matching_perf_row(nav_name: str, perf_rows: list) -> dict | None:
+    if not perf_rows:
+        return None
+    cleaned_nav = clean_name(nav_name)
+    if not cleaned_nav:
+        return None
+        
+    # 1. Substring match
+    for p_row in perf_rows:
+        p_name = p_row.get("schemeName") or ""
+        cleaned_perf = clean_name(p_name)
+        if cleaned_perf and (cleaned_perf in cleaned_nav or cleaned_nav in cleaned_perf):
+            return p_row
+            
+    # 2. Token overlap fallback
+    nav_tokens = set(cleaned_nav.split())
+    best_row = None
+    best_score = 0.0
+    for p_row in perf_rows:
+        p_name = p_row.get("schemeName") or ""
+        cleaned_perf = clean_name(p_name)
+        if not cleaned_perf:
+            continue
+        perf_tokens = set(cleaned_perf.split())
+        intersection = nav_tokens.intersection(perf_tokens)
+        if intersection:
+            score = len(intersection) / len(nav_tokens.union(perf_tokens))
+            if score > best_score:
+                best_score = score
+                best_row = p_row
+                
+    if best_score > 0.4:
+        return best_row
+    return None
+
+
+def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+        
+    # 1. First, calculate the fallback AUM for all rows using the old method.
+    # We do this so that we always have a default value.
+    raw_rows = []
+    for idx, r_dict in df.iterrows():
+        r_copy = r_dict.copy()
+        m_aum = calculate_aum_for_row(r_copy.to_dict(), df_port)
+        r_copy["Monthly_AUM"] = m_aum
+        raw_rows.append(r_copy)
+    df_res = pd.DataFrame(raw_rows)
+    
+    mean_navs = df_res.groupby("Scheme Code")["NAV"].transform("mean")
+    mean_navs = mean_navs.fillna(1.0).replace(0.0, 1.0)
+    df_res["AUM"] = df_res["Monthly_AUM"] * (df_res["NAV"] / mean_navs)
+    df_res["AUM"] = df_res["AUM"].round(4)
+    
+    # 2. Now, try to fetch the actual AUM from the performance API for each row.
+    def get_date_str(dt):
+        try:
+            if isinstance(dt, pd.Timestamp) or hasattr(dt, "strftime"):
+                return dt.strftime("%d-%b-%Y")
+            parsed = pd.to_datetime(dt)
+            if pd.notna(parsed):
+                return parsed.strftime("%d-%b-%Y")
+        except Exception:
+            pass
+        return str(dt)
+        
+    date_col = "NAV Date" if "NAV Date" in df_res.columns else "Date"
+    df_res["Date_Str_Temp"] = df_res[date_col].apply(get_date_str)
+    
+    # Group unique combinations of (Asset Class, Date_Str_Temp)
+    unique_groups = df_res[["Asset Class", "Date_Str_Temp"]].drop_duplicates()
+    
+    # Fetch performance data for each group and build a lookup cache
+    perf_lookup = {}
+    
+    for _, grp in unique_groups.iterrows():
+        asset_class = grp["Asset Class"]
+        date_str = grp["Date_Str_Temp"]
+        if not asset_class or not date_str:
+            continue
+            
+        m_id, c_id, s_id = map_section_to_ids(asset_class)
+        # Fetch from API
+        perf_rows = fetch_performance_data_from_api(date_str, m_id, c_id, s_id)
+        if perf_rows:
+            perf_lookup[(date_str, asset_class)] = perf_rows
+            
+    # Now, try to match each row to the fetched performance rows
+    for idx, row in df_res.iterrows():
+        asset_class = row["Asset Class"]
+        date_str = row["Date_Str_Temp"]
+        scheme_name = row["Scheme Name"]
+        
+        perf_rows = perf_lookup.get((date_str, asset_class), [])
+        match = find_matching_perf_row(scheme_name, perf_rows)
+        if match:
+            daily_aum = match.get("dailyAUM")
+            if daily_aum is not None and daily_aum != "":
+                try:
+                    df_res.at[idx, "AUM"] = float(daily_aum)
+                except Exception:
+                    pass
+                    
+    # Drop temporary column
+    df_res = df_res.drop(columns=["Date_Str_Temp"])
+    return df_res
+
+
 # ─── Project helpers ─────────────────────────────────────────────────────────
 sys.path.append(str(Path(__file__).parent))
 from amfi_nav import classify_option_type, classify_plan_type
@@ -415,9 +707,9 @@ def style_excel(df: pd.DataFrame, date_cols: List[str], is_aum_only: bool = Fals
                 cell.fill = fill
                 cell.font = data_font
                 cell.border = border
-                if col_name in date_cols:
+                if col_name in date_cols or col_name in ("NAV", "AUM"):
                     if cell.value is not None:
-                        if "(AUM)" in col_name or is_aum_only:
+                        if "(AUM)" in col_name or col_name == "AUM" or is_aum_only:
                             cell.number_format = "0.00"
                         else:
                             cell.number_format = "0.0000"
@@ -590,19 +882,9 @@ def main():
 
     df_filtered["NAV Date"] = pd.to_datetime(df_filtered["NAV Date"], errors="coerce")
 
-    # ── Build AUM data and daily scale ────────────────────────────────────────
+    # ── Build AUM data using Performance API with Excel portfolio fallback ────
     df_port = load_portfolio_aum_data()
-    raw_rows_with_aum = []
-    for idx, r_dict in df_filtered.iterrows():
-        m_aum = calculate_aum_for_row(r_dict.to_dict(), df_port)
-        r_dict["Monthly_AUM"] = m_aum
-        raw_rows_with_aum.append(r_dict)
-    df_filtered = pd.DataFrame(raw_rows_with_aum)
-    
-    mean_navs = df_filtered.groupby("Scheme Code")["NAV"].transform("mean")
-    mean_navs = mean_navs.fillna(1.0).replace(0.0, 1.0)
-    df_filtered["AUM"] = df_filtered["Monthly_AUM"] * (df_filtered["NAV"] / mean_navs)
-    df_filtered["AUM"] = df_filtered["AUM"].round(4)
+    df_filtered = populate_actual_aum(df_filtered, df_port)
 
     # ── Build target date columns ─────────────────────────────────────────────
     date_cols = build_date_cols(start_date, end_date, skip_sunday)
