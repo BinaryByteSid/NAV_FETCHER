@@ -346,8 +346,10 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame) -> pd.DataFrame
     
     mean_navs = df_res.groupby("Scheme Code")["NAV"].transform("mean")
     mean_navs = mean_navs.fillna(1.0).replace(0.0, 1.0)
-    df_res["AUM"] = df_res["Monthly_AUM"] * (df_res["NAV"] / mean_navs)
-    df_res["AUM"] = df_res["AUM"].round(4)
+    df_res["Fallback_AUM"] = (df_res["Monthly_AUM"] * (df_res["NAV"] / mean_navs)).round(4)
+    
+    # Initialize AUM with None to allow carry-forward for missing dates
+    df_res["AUM"] = None
     
     # 2. Now, try to fetch the actual AUM from the performance API for each row.
     def get_date_str(dt):
@@ -967,6 +969,24 @@ def main():
                     df_display[f"{curr} (NAV)"] = df_display[f"{curr} (NAV)"].fillna(df_display[f"{prev} (NAV)"])
                     df_display[f"{curr} (AUM)"] = df_display[f"{curr} (AUM)"].fillna(df_display[f"{prev} (AUM)"])
                     
+        # Fill any remaining NaNs in AUM columns with fallback values
+        if want_aum:
+            df_pivot_fallback = df_filtered.pivot_table(index="Scheme Code", columns="NAV_Date_Str", values="Fallback_AUM", aggfunc="first").reset_index()
+            fallback_cols_map = {}
+            for d in date_cols:
+                if want_aum and not want_nav:
+                    fallback_cols_map[d] = f"{d}_fallback_temp"
+                elif want_nav and want_aum:
+                    fallback_cols_map[f"{d} (AUM)"] = f"{d}_fallback_temp"
+                    
+            if fallback_cols_map:
+                df_pivot_fallback_renamed = df_pivot_fallback.rename(columns={d: f"{d}_fallback_temp" for d in date_cols if d in df_pivot_fallback.columns})
+                available_temp_cols = [col for col in fallback_cols_map.values() if col in df_pivot_fallback_renamed.columns]
+                df_display_temp = pd.merge(df_display, df_pivot_fallback_renamed[["Scheme Code"] + available_temp_cols], on="Scheme Code", how="left")
+                for main_col, temp_col in fallback_cols_map.items():
+                    if main_col in df_display.columns and temp_col in df_display_temp.columns:
+                        df_display[main_col] = df_display[main_col].fillna(df_display_temp[temp_col])
+                    
         df_display = df_display[meta_cols + display_date_cols].sort_values(["Asset Class", "Scheme Name"]).reset_index(drop=True)
     else:
         # Long format — show raw rows with selected columns
@@ -977,6 +997,10 @@ def main():
             wanted.append("AUM")
         wanted.append("NAV Date")
         
+        # Fill NaNs in df_filtered AUM before extracting
+        if "AUM" in df_filtered.columns and "Fallback_AUM" in df_filtered.columns:
+            df_filtered["AUM"] = df_filtered["AUM"].fillna(df_filtered["Fallback_AUM"])
+            
         df_display = df_filtered[[c for c in wanted if c in df_filtered.columns]].copy()
         df_display["NAV Date"] = df_display["NAV Date"].dt.strftime("%d-%b-%Y")
         display_date_cols = []  # no date pivot columns for long format

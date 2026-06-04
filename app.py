@@ -336,8 +336,10 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame) -> pd.DataFrame
     
     mean_navs = df_res.groupby("Scheme Code")["NAV"].transform("mean")
     mean_navs = mean_navs.fillna(1.0).replace(0.0, 1.0)
-    df_res["AUM"] = df_res["Monthly_AUM"] * (df_res["NAV"] / mean_navs)
-    df_res["AUM"] = df_res["AUM"].round(4)
+    df_res["Fallback_AUM"] = (df_res["Monthly_AUM"] * (df_res["NAV"] / mean_navs)).round(4)
+    
+    # Initialize AUM with None to allow carry-forward for missing dates
+    df_res["AUM"] = None
     
     # 2. Now, try to fetch the actual AUM from the performance API for each row.
     def get_date_str(dt):
@@ -897,6 +899,24 @@ def main() -> None:
                                     else:
                                         df_final[f"{curr_col} (NAV)"] = df_final[f"{curr_col} (NAV)"].fillna(df_final[f"{prev_col} (NAV)"])
                                         df_final[f"{curr_col} (AUM)"] = df_final[f"{curr_col} (AUM)"].fillna(df_final[f"{prev_col} (AUM)"])
+                                        
+                            # Fill any remaining NaNs in AUM columns with fallback values
+                            if want_aum:
+                                df_pivot_fallback = df_raw.pivot(index="Scheme Code", columns="Date", values="Fallback_AUM").reset_index()
+                                fallback_cols_map = {}
+                                for d in target_dates:
+                                    if want_aum and not want_nav:
+                                        fallback_cols_map[d] = f"{d}_fallback_temp"
+                                    elif want_nav and want_aum:
+                                        fallback_cols_map[f"{d} (AUM)"] = f"{d}_fallback_temp"
+                                        
+                                if fallback_cols_map:
+                                    df_pivot_fallback_renamed = df_pivot_fallback.rename(columns={d: f"{d}_fallback_temp" for d in target_dates if d in df_pivot_fallback.columns})
+                                    available_temp_cols = [col for col in fallback_cols_map.values() if col in df_pivot_fallback_renamed.columns]
+                                    df_final_temp = pd.merge(df_final, df_pivot_fallback_renamed[["Scheme Code"] + available_temp_cols], on="Scheme Code", how="left")
+                                    for main_col, temp_col in fallback_cols_map.items():
+                                        if main_col in df_final.columns and temp_col in df_final_temp.columns:
+                                            df_final[main_col] = df_final[main_col].fillna(df_final_temp[temp_col])
                                     
                             ordered_cols = [
                                 "Asset Class", 
