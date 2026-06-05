@@ -666,148 +666,173 @@ def pivot_to_wide(df: pd.DataFrame, date_cols: List[str]) -> pd.DataFrame:
     return result.sort_values(["Asset Class", "Scheme Name"]).reset_index(drop=True)
 
 
+def _date_to_dmy(date_str: str) -> str:
+    """Convert '29-May-2026' → '29/05/2026'."""
+    try:
+        return datetime.strptime(date_str, "%d-%b-%Y").strftime("%d/%m/%Y")
+    except Exception:
+        return date_str
+
+
 def style_excel(df: pd.DataFrame, date_cols: List[str], is_aum_only: bool = False) -> bytes:
     """Write df to a styled Excel workbook and return as bytes.
 
     When both NAV and AUM columns are present (columns named like '29-May-2026 (NAV)'
     and '29-May-2026 (AUM)'), the Excel uses a two-row header:
-      Row 1: date label merged across the two sub-columns (no NAV/AUM suffix)
-      Row 2: 'NAV' and 'AUM' sub-labels
-    Data starts at row 3. Meta columns span both header rows.
+      Row 1: meta cols (merged ↕) | 'NAV' merged across all NAV date cols | 'AUM' merged across all AUM date cols
+      Row 2: date labels in dd/mm/yyyy under each group
+    Data starts at row 3.
     """
+    import openpyxl
     from openpyxl.utils import get_column_letter
 
     buf = BytesIO()
+
+    font_name   = "Segoe UI"
+    h_fill      = PatternFill("solid", fgColor="1F497D")   # dark blue – meta headers
+    nav_fill    = PatternFill("solid", fgColor="1E4D8C")   # blue – NAV group header
+    aum_fill    = PatternFill("solid", fgColor="145A32")   # green – AUM group header
+    date_nav_fill = PatternFill("solid", fgColor="2E75B6") # lighter blue – NAV date row
+    date_aum_fill = PatternFill("solid", fgColor="1E8449") # lighter green – AUM date row
+    h_font      = Font(name=font_name, size=11, bold=True, color="FFFFFF")
+    date_font   = Font(name=font_name, size=10, bold=True, color="FFFFFF")
+    data_font   = Font(name=font_name, size=10)
+    even_fill   = PatternFill("solid", fgColor="F2F5F8")
+    odd_fill    = PatternFill("solid", fgColor="FFFFFF")
+    border = Border(
+        left=Side(style="thin", color="D3D3D3"),
+        right=Side(style="thin", color="D3D3D3"),
+        top=Side(style="thin", color="D3D3D3"),
+        bottom=Side(style="thin", color="D3D3D3"),
+    )
+    center_va = Alignment(horizontal="center", vertical="center")
+    left_va   = Alignment(horizontal="left",   vertical="center")
 
     # ── Detect whether we have interleaved (NAV)/(AUM) pairs ─────────────────
     has_nav_aum_pairs = any("(NAV)" in c for c in df.columns)
 
     if has_nav_aum_pairs:
-        # Build a mapping: original column → (date_label, sub_label)
-        # meta columns have sub_label = None (they will span two rows)
-        col_info = []  # list of (orig_col, date_label, sub_label)
-        for col in df.columns:
-            if col.endswith(" (NAV)"):
-                date_label = col[: -len(" (NAV)")]
-                col_info.append((col, date_label, "NAV"))
-            elif col.endswith(" (AUM)"):
-                date_label = col[: -len(" (AUM)")]
-                col_info.append((col, date_label, "AUM"))
-            else:
-                col_info.append((col, col, None))  # meta column
+        # Split columns into: meta, nav_dates, aum_dates (preserving order)
+        meta_cols  = [c for c in df.columns if "(NAV)" not in c and "(AUM)" not in c]
+        nav_cols   = [c for c in df.columns if c.endswith(" (NAV)")]
+        aum_cols   = [c for c in df.columns if c.endswith(" (AUM)")]
 
-        # Write data manually (skip the default header from to_excel)
-        wb_obj = __import__("openpyxl").Workbook()
-        ws = wb_obj.active
+        nav_dates  = [c[: -len(" (NAV)")] for c in nav_cols]  # "29-May-2026"
+        aum_dates  = [c[: -len(" (AUM)")] for c in aum_cols]
+
+        # Re-order df columns: meta | all NAV cols | all AUM cols
+        ordered_cols = meta_cols + nav_cols + aum_cols
+        df = df[ordered_cols]
+
+        n_meta = len(meta_cols)
+        n_nav  = len(nav_cols)
+        n_aum  = len(aum_cols)
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
         ws.title = "NAV Data"
 
-        font_name = "Segoe UI"
-        h_fill      = PatternFill("solid", fgColor="1F497D")
-        date_fill   = PatternFill("solid", fgColor="2E5F9E")   # slightly lighter for date row
-        nav_fill    = PatternFill("solid", fgColor="2563AB")   # NAV sub-header
-        aum_fill    = PatternFill("solid", fgColor="1A6B5E")   # AUM sub-header (green tint)
-        h_font      = Font(name=font_name, size=11, bold=True, color="FFFFFF")
-        sub_font    = Font(name=font_name, size=10, bold=True, color="FFFFFF")
-        data_font   = Font(name=font_name, size=10)
-        even_fill   = PatternFill("solid", fgColor="F2F5F8")
-        odd_fill    = PatternFill("solid", fgColor="FFFFFF")
-        border = Border(
-            left=Side(style="thin", color="D3D3D3"),
-            right=Side(style="thin", color="D3D3D3"),
-            top=Side(style="thin", color="D3D3D3"),
-            bottom=Side(style="thin", color="D3D3D3"),
-        )
-        center_align = Alignment(horizontal="center", vertical="center")
-        left_align   = Alignment(horizontal="left",   vertical="center")
+        ws.row_dimensions[1].height = 28
+        ws.row_dimensions[2].height = 22
 
-        # ── Row 1: date labels (merged for paired cols, merged vertically for meta) ──
-        ws.row_dimensions[1].height = 26
-        ws.row_dimensions[2].height = 20
-        ci = 1
-        # We'll iterate and merge as we go; track processed pairs
-        skip_next = False
-        pair_starts = {}  # date_label → start column index (for merging)
+        # ── Row 1 ─────────────────────────────────────────────────────────────
+        # Meta columns: merged vertically (rows 1–2)
+        for i, col in enumerate(meta_cols):
+            ci = i + 1
+            cell = ws.cell(row=1, column=ci, value=col)
+            cell.fill = h_fill
+            cell.font = h_font
+            cell.border = border
+            cell.alignment = left_va if col in ("Scheme Name", "Asset Class") else center_va
+            ws.merge_cells(start_row=1, start_column=ci, end_row=2, end_column=ci)
 
-        # First pass: write row-1 cells
-        processed_dates = set()
-        for orig_col, date_label, sub_label in col_info:
-            if sub_label is None:
-                # Meta column — write in row 1, merge down to row 2
-                cell1 = ws.cell(row=1, column=ci, value=date_label)
-                cell1.fill = h_fill
-                cell1.font = h_font
-                cell1.border = border
-                cell1.alignment = left_align if date_label in ("Scheme Name", "Asset Class") else center_align
-                ws.merge_cells(start_row=1, start_column=ci, end_row=2, end_column=ci)
-            elif date_label not in processed_dates:
-                # First of a pair — write date label, will merge with next column
-                cell1 = ws.cell(row=1, column=ci, value=date_label)
-                cell1.fill = date_fill
-                cell1.font = h_font
-                cell1.border = border
-                cell1.alignment = center_align
-                # Merge across NAV + AUM columns
-                ws.merge_cells(start_row=1, start_column=ci, end_row=1, end_column=ci + 1)
-                processed_dates.add(date_label)
-            # else: second of pair — row-1 cell is covered by merge, skip
-            ci += 1
+        # NAV group label: merged across all NAV date columns
+        nav_start = n_meta + 1
+        nav_end   = n_meta + n_nav
+        if n_nav > 0:
+            cell = ws.cell(row=1, column=nav_start, value="NAV")
+            cell.fill = nav_fill
+            cell.font = h_font
+            cell.border = border
+            cell.alignment = center_va
+            if n_nav > 1:
+                ws.merge_cells(start_row=1, start_column=nav_start, end_row=1, end_column=nav_end)
+            # Apply border to all cells in the merge range
+            for ci in range(nav_start, nav_end + 1):
+                ws.cell(row=1, column=ci).border = border
 
-        # ── Row 2: sub-header (NAV / AUM for paired; meta cols already merged) ──
-        ci = 1
-        for orig_col, date_label, sub_label in col_info:
-            if sub_label is None:
-                # Already merged — just style the cell
-                cell2 = ws.cell(row=2, column=ci)
-                cell2.fill = h_fill
-                cell2.font = h_font
-                cell2.border = border
-            else:
-                fill2 = nav_fill if sub_label == "NAV" else aum_fill
-                cell2 = ws.cell(row=2, column=ci, value=sub_label)
-                cell2.fill = fill2
-                cell2.font = sub_font
-                cell2.border = border
-                cell2.alignment = center_align
-            ci += 1
+        # AUM group label: merged across all AUM date columns
+        aum_start = n_meta + n_nav + 1
+        aum_end   = n_meta + n_nav + n_aum
+        if n_aum > 0:
+            cell = ws.cell(row=1, column=aum_start, value="AUM")
+            cell.fill = aum_fill
+            cell.font = h_font
+            cell.border = border
+            cell.alignment = center_va
+            if n_aum > 1:
+                ws.merge_cells(start_row=1, start_column=aum_start, end_row=1, end_column=aum_end)
+            for ci in range(aum_start, aum_end + 1):
+                ws.cell(row=1, column=ci).border = border
+
+        # ── Row 2: date labels in dd/mm/yyyy ──────────────────────────────────
+        # Meta cells in row 2 are covered by merges, just apply styling
+        for i in range(n_meta):
+            ci = i + 1
+            cell = ws.cell(row=2, column=ci)
+            cell.fill = h_fill
+            cell.font = h_font
+            cell.border = border
+
+        for i, d in enumerate(nav_dates):
+            ci = nav_start + i
+            cell = ws.cell(row=2, column=ci, value=_date_to_dmy(d))
+            cell.fill = date_nav_fill
+            cell.font = date_font
+            cell.border = border
+            cell.alignment = center_va
+
+        for i, d in enumerate(aum_dates):
+            ci = aum_start + i
+            cell = ws.cell(row=2, column=ci, value=_date_to_dmy(d))
+            cell.fill = date_aum_fill
+            cell.font = date_font
+            cell.border = border
+            cell.alignment = center_va
 
         # ── Data rows (start at row 3) ────────────────────────────────────────
         for ri_data, (_, row_data) in enumerate(df.iterrows()):
             ri = ri_data + 3
             ws.row_dimensions[ri].height = 20
             fill = even_fill if ri % 2 == 0 else odd_fill
-            ci = 1
-            for orig_col, date_label, sub_label in col_info:
+            for ci, col in enumerate(ordered_cols, 1):
                 cell = ws.cell(row=ri, column=ci)
-                val = row_data[orig_col]
-                cell.fill = fill
-                cell.font = data_font
+                val  = row_data[col]
+                cell.fill   = fill
+                cell.font   = data_font
                 cell.border = border
-                if sub_label is not None or orig_col in ("NAV", "AUM"):
+                if col in nav_cols or col in aum_cols:
                     if pd.notna(val) and val is not None:
                         cell.value = val
-                        if sub_label == "AUM" or orig_col == "AUM" or is_aum_only:
-                            cell.number_format = "0.00"
-                        else:
-                            cell.number_format = "0.0000"
+                        cell.number_format = "0.00" if col in aum_cols else "0.0000"
                     else:
                         cell.value = "—"
-                    cell.alignment = center_align
+                    cell.alignment = center_va
                 else:
                     cell.value = val if pd.notna(val) else None
-                    cell.alignment = left_align if orig_col in ("Scheme Name", "Asset Class") else center_align
-                ci += 1
+                    cell.alignment = left_va if col in ("Scheme Name", "Asset Class") else center_va
 
         # ── Column widths ─────────────────────────────────────────────────────
         for col_cells in ws.iter_cols(min_row=1, max_row=ws.max_row):
             max_len = 10
             for c in col_cells:
                 try:
-                    max_len = max(max_len, len(str(c.value or "")) + (3 if c.row <= 2 else 0))
+                    max_len = max(max_len, len(str(c.value or "")) + (2 if c.row <= 2 else 0))
                 except Exception:
                     pass
             ws.column_dimensions[get_column_letter(col_cells[0].column)].width = max(min(max_len + 2, 55), 10)
 
-        wb_obj.save(buf)
+        wb.save(buf)
 
     else:
         # ── Original single-header path (NAV only, AUM only, or long format) ──
@@ -816,30 +841,18 @@ def style_excel(df: pd.DataFrame, date_cols: List[str], is_aum_only: bool = Fals
             wb = writer.book
             ws = writer.sheets["NAV Data"]
 
-            font_name = "Segoe UI"
-            h_fill = PatternFill("solid", fgColor="1F497D")
-            h_font = Font(name=font_name, size=11, bold=True, color="FFFFFF")
-            data_font = Font(name=font_name, size=10)
-            even_fill = PatternFill("solid", fgColor="F2F5F8")
-            odd_fill = PatternFill("solid", fgColor="FFFFFF")
-            border = Border(
-                left=Side(style="thin", color="D3D3D3"),
-                right=Side(style="thin", color="D3D3D3"),
-                top=Side(style="thin", color="D3D3D3"),
-                bottom=Side(style="thin", color="D3D3D3"),
-            )
+            h_fill2    = PatternFill("solid", fgColor="1F497D")
+            h_font2    = Font(name=font_name, size=11, bold=True, color="FFFFFF")
+            data_font2 = Font(name=font_name, size=10)
 
             ws.row_dimensions[1].height = 28
             for ci, col_name in enumerate(df.columns, 1):
                 cell = ws.cell(row=1, column=ci)
-                cell.fill = h_fill
-                cell.font = h_font
+                cell.fill = h_fill2
+                cell.font = h_font2
                 cell.border = border
-                left_align = col_name in ("Scheme Name", "Asset Class")
-                cell.alignment = Alignment(
-                    horizontal="left" if left_align else "center",
-                    vertical="center",
-                )
+                left_a = col_name in ("Scheme Name", "Asset Class")
+                cell.alignment = Alignment(horizontal="left" if left_a else "center", vertical="center")
 
             for ri in range(2, len(df) + 2):
                 ws.row_dimensions[ri].height = 20
@@ -847,14 +860,11 @@ def style_excel(df: pd.DataFrame, date_cols: List[str], is_aum_only: bool = Fals
                 for ci, col_name in enumerate(df.columns, 1):
                     cell = ws.cell(row=ri, column=ci)
                     cell.fill = fill
-                    cell.font = data_font
+                    cell.font = data_font2
                     cell.border = border
                     if col_name in date_cols or col_name in ("NAV", "AUM"):
                         if cell.value is not None:
-                            if "(AUM)" in col_name or col_name == "AUM" or is_aum_only:
-                                cell.number_format = "0.00"
-                            else:
-                                cell.number_format = "0.0000"
+                            cell.number_format = "0.00" if ("(AUM)" in col_name or col_name == "AUM" or is_aum_only) else "0.0000"
                         else:
                             cell.value = "—"
                         cell.alignment = Alignment(horizontal="center", vertical="center")
@@ -864,13 +874,8 @@ def style_excel(df: pd.DataFrame, date_cols: List[str], is_aum_only: bool = Fals
                         cell.alignment = Alignment(horizontal="center", vertical="center")
 
             for col in ws.columns:
-                max_len = max(
-                    (len(str(c.value or "")) + (3 if c.row == 1 else 0) for c in col),
-                    default=12,
-                )
-                ws.column_dimensions[get_column_letter(col[0].column)].width = max(
-                    min(max_len + 2, 55), 12
-                )
+                max_len = max((len(str(c.value or "")) + (3 if c.row == 1 else 0) for c in col), default=12)
+                ws.column_dimensions[get_column_letter(col[0].column)].width = max(min(max_len + 2, 55), 12)
 
     return buf.getvalue()
 
