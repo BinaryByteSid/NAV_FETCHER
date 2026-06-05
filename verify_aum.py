@@ -23,7 +23,7 @@ row = {
     "ISIN Div Payout / ISIN Growth": "INF209K01AJ8",
     "ISIN Div Reinvestment": "-",
     "NAV": 125.43,
-    "Date": "25-May-2026"
+    "Date": "25/05/2026"
 }
 
 print("\nTesting calculate_aum_for_row...")
@@ -32,9 +32,9 @@ print(f"Calculated AUM: {aum} Crores")
 
 # 3. Test daily scaling logic
 rows = [
-    {"Scheme Code": "100", "Scheme Name": "Test Fund", "ISIN Div Payout / ISIN Growth": "INF209K01AJ8", "ISIN Div Reinvestment": "-", "NAV": 100.0, "Date": "25-May-2026"},
-    {"Scheme Code": "100", "Scheme Name": "Test Fund", "ISIN Div Payout / ISIN Growth": "INF209K01AJ8", "ISIN Div Reinvestment": "-", "NAV": 105.0, "Date": "26-May-2026"},
-    {"Scheme Code": "100", "Scheme Name": "Test Fund", "ISIN Div Payout / ISIN Growth": "INF209K01AJ8", "ISIN Div Reinvestment": "-", "NAV": 95.0, "Date": "27-May-2026"},
+    {"Scheme Code": "100", "Scheme Name": "Test Fund", "ISIN Div Payout / ISIN Growth": "INF209K01AJ8", "ISIN Div Reinvestment": "-", "NAV": 100.0, "Date": "25/05/2026"},
+    {"Scheme Code": "100", "Scheme Name": "Test Fund", "ISIN Div Payout / ISIN Growth": "INF209K01AJ8", "ISIN Div Reinvestment": "-", "NAV": 105.0, "Date": "26/05/2026"},
+    {"Scheme Code": "100", "Scheme Name": "Test Fund", "ISIN Div Payout / ISIN Growth": "INF209K01AJ8", "ISIN Div Reinvestment": "-", "NAV": 95.0, "Date": "27/05/2026"},
 ]
 
 df_raw = pd.DataFrame(rows)
