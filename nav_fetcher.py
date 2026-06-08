@@ -1161,14 +1161,18 @@ def main():
                     r_item["AUM Date"] = d
                     r_item["AUM"] = row.get(f"{d} (AUM)")
                 vertical_rows.append(r_item)
-        df_display = pd.DataFrame(vertical_rows)
 
         v_cols = list(meta_cols)
         if want_nav:
             v_cols += ["NAV Date", "NAV"]
         if want_aum:
             v_cols += ["AUM Date", "AUM"]
-        df_display = df_display[v_cols].sort_values(["Asset Class", "Scheme Name"]).reset_index(drop=True)
+
+        if vertical_rows:
+            df_display = pd.DataFrame(vertical_rows)
+            df_display = df_display[v_cols].sort_values(["Asset Class", "Scheme Name"]).reset_index(drop=True)
+        else:
+            df_display = pd.DataFrame(columns=v_cols)
 
     else:
         # Long format — show raw rows with selected columns

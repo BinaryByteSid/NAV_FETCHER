@@ -951,7 +951,6 @@ def main() -> None:
                                         r_item["AUM Date"] = d
                                         r_item["AUM"] = row[f"{d} (AUM)"]
                                     vertical_rows.append(r_item)
-                            df_final = pd.DataFrame(vertical_rows)
 
                             ordered_cols = [
                                 "Asset Class", 
@@ -967,8 +966,12 @@ def main() -> None:
                             if want_aum:
                                 ordered_cols.extend(["AUM Date", "AUM"])
                             
-                            df_final = df_final[ordered_cols]
-                            df_final = df_final.sort_values(by=["Asset Class", "Scheme Name"]).reset_index(drop=True)
+                            if vertical_rows:
+                                df_final = pd.DataFrame(vertical_rows)
+                                df_final = df_final[ordered_cols]
+                                df_final = df_final.sort_values(by=["Asset Class", "Scheme Name"]).reset_index(drop=True)
+                            else:
+                                df_final = pd.DataFrame(columns=ordered_cols)
                             
                             st.success(f"Successfully processed {len(df_final)} vertical records!")
                             
