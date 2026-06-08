@@ -862,12 +862,22 @@ def style_excel(df: pd.DataFrame, date_cols: List[str], is_aum_only: bool = Fals
                     cell.fill = fill
                     cell.font = data_font2
                     cell.border = border
-                    if col_name in date_cols or col_name in ("NAV", "AUM"):
-                        if cell.value is not None:
-                            cell.number_format = "0.00" if ("(AUM)" in col_name or col_name == "AUM" or is_aum_only) else "0.0000"
-                        else:
+                    if col_name in ("NAV Date", "AUM Date"):
+                        if cell.value is None or cell.value == "":
                             cell.value = "—"
                         cell.alignment = Alignment(horizontal="center", vertical="center")
+                    elif col_name == "NAV":
+                        if cell.value is not None and cell.value != "":
+                            cell.number_format = "0.0000"
+                        else:
+                            cell.value = "—"
+                        cell.alignment = Alignment(horizontal="right", vertical="center")
+                    elif col_name == "AUM":
+                        if cell.value is not None and cell.value != "":
+                            cell.number_format = "0.00"
+                        else:
+                            cell.value = "—"
+                        cell.alignment = Alignment(horizontal="right", vertical="center")
                     elif col_name in ("Scheme Name", "Asset Class"):
                         cell.alignment = Alignment(horizontal="left", vertical="center")
                     else:
@@ -1132,6 +1142,34 @@ def main():
                         df_display[main_col] = df_display[main_col].fillna(df_display_temp[temp_col])
                     
         df_display = df_display[meta_cols + display_date_cols].sort_values(["Asset Class", "Scheme Name"]).reset_index(drop=True)
+
+        # Convert to vertical layout
+        vertical_rows = []
+        for _, row in df_display.iterrows():
+            meta = {c: row[c] for c in meta_cols}
+            for d in date_cols:
+                r_item = meta.copy()
+                if want_nav and not want_aum:
+                    r_item["NAV Date"] = d
+                    r_item["NAV"] = row.get(d)
+                elif want_aum and not want_nav:
+                    r_item["AUM Date"] = d
+                    r_item["AUM"] = row.get(d)
+                else:
+                    r_item["NAV Date"] = d
+                    r_item["NAV"] = row.get(f"{d} (NAV)")
+                    r_item["AUM Date"] = d
+                    r_item["AUM"] = row.get(f"{d} (AUM)")
+                vertical_rows.append(r_item)
+        df_display = pd.DataFrame(vertical_rows)
+
+        v_cols = list(meta_cols)
+        if want_nav:
+            v_cols += ["NAV Date", "NAV"]
+        if want_aum:
+            v_cols += ["AUM Date", "AUM"]
+        df_display = df_display[v_cols].sort_values(["Asset Class", "Scheme Name"]).reset_index(drop=True)
+
     else:
         # Long format — show raw rows with selected columns
         wanted = ["Asset Class", "Scheme Code", "ISIN Div Payout / ISIN Growth", "ISIN Div Reinvestment", "Scheme Name", "Plan Type", "Option Type"]
@@ -1156,7 +1194,7 @@ def main():
 
     # ── Export ────────────────────────────────────────────────────────────────
     with st.spinner("Generating styled Excel…"):
-        excel_bytes = style_excel(df_display, display_date_cols, is_aum_only=is_aum_only)
+        excel_bytes = style_excel(df_display, [], is_aum_only=is_aum_only)
 
     file_label = f"amfi_nav_{start_date}_to_{end_date}.xlsx"
     st.download_button(

@@ -428,9 +428,11 @@ def generate_historical_excel(df_final: pd.DataFrame, target_dates: List[str], i
             "Scheme Name": Alignment(horizontal="left", vertical="center"),
             "Plan Type": Alignment(horizontal="center", vertical="center"),
             "Option Type": Alignment(horizontal="center", vertical="center"),
+            "NAV Date": Alignment(horizontal="center", vertical="center"),
+            "AUM Date": Alignment(horizontal="center", vertical="center"),
+            "NAV": Alignment(horizontal="right", vertical="center"),
+            "AUM": Alignment(horizontal="right", vertical="center"),
         }
-        for date_col in target_dates:
-            alignments[date_col] = Alignment(horizontal="right", vertical="center")
             
         worksheet.row_dimensions[1].height = 28
         for col_idx, col_name in enumerate(df_final.columns, 1):
@@ -451,16 +453,21 @@ def generate_historical_excel(df_final: pd.DataFrame, target_dates: List[str], i
                 cell.border = thin_border
                 
                 val = cell.value
-                if col_name in target_dates:
+                if col_name == "NAV":
                     if val is not None and val != "":
-                        if "(AUM)" in col_name or is_aum_only:
-                            cell.number_format = "0.00"
-                        else:
-                            cell.number_format = "0.0000"
+                        cell.number_format = "0.0000"
                     else:
                         cell.value = "-"
                         cell.alignment = Alignment(horizontal="center", vertical="center")
-                        continue
+                elif col_name == "AUM":
+                    if val is not None and val != "":
+                        cell.number_format = "0.00"
+                    else:
+                        cell.value = "-"
+                        cell.alignment = Alignment(horizontal="center", vertical="center")
+                elif col_name in ("NAV Date", "AUM Date"):
+                    if val is None or val == "":
+                        cell.value = "-"
                 
                 align = alignments.get(col_name, Alignment(horizontal="left", vertical="center"))
                 cell.alignment = align
@@ -918,6 +925,34 @@ def main() -> None:
                                         if main_col in df_final.columns and temp_col in df_final_temp.columns:
                                             df_final[main_col] = df_final[main_col].fillna(df_final_temp[temp_col])
                                     
+                            # Convert df_final to vertical layout
+                            vertical_rows = []
+                            for _, row in df_final.iterrows():
+                                meta = {
+                                    "Asset Class": row["Asset Class"],
+                                    "Scheme Code": row["Scheme Code"],
+                                    "ISIN Div Payout / ISIN Growth": row["ISIN Div Payout / ISIN Growth"],
+                                    "ISIN Div Reinvestment": row["ISIN Div Reinvestment"],
+                                    "Scheme Name": row["Scheme Name"],
+                                    "Plan Type": row["Plan Type"],
+                                    "Option Type": row["Option Type"]
+                                }
+                                for d in target_dates:
+                                    r_item = meta.copy()
+                                    if want_nav and not want_aum:
+                                        r_item["NAV Date"] = d
+                                        r_item["NAV"] = row[d]
+                                    elif want_aum and not want_nav:
+                                        r_item["AUM Date"] = d
+                                        r_item["AUM"] = row[d]
+                                    else:
+                                        r_item["NAV Date"] = d
+                                        r_item["NAV"] = row[f"{d} (NAV)"]
+                                        r_item["AUM Date"] = d
+                                        r_item["AUM"] = row[f"{d} (AUM)"]
+                                    vertical_rows.append(r_item)
+                            df_final = pd.DataFrame(vertical_rows)
+
                             ordered_cols = [
                                 "Asset Class", 
                                 "Scheme Code", 
@@ -926,17 +961,21 @@ def main() -> None:
                                 "Scheme Name", 
                                 "Plan Type", 
                                 "Option Type"
-                            ] + display_date_cols
+                            ]
+                            if want_nav:
+                                ordered_cols.extend(["NAV Date", "NAV"])
+                            if want_aum:
+                                ordered_cols.extend(["AUM Date", "AUM"])
                             
                             df_final = df_final[ordered_cols]
                             df_final = df_final.sort_values(by=["Asset Class", "Scheme Name"]).reset_index(drop=True)
                             
-                            st.success(f"Successfully processed {len(df_final)} funds across {len(display_date_cols)} columns!")
+                            st.success(f"Successfully processed {len(df_final)} vertical records!")
                             
                             st.subheader("Data Preview")
                             st.dataframe(df_final, use_container_width=True)
                             
-                            excel_bytes = generate_historical_excel(df_final, display_date_cols, is_aum_only=is_aum_only)
+                            excel_bytes = generate_historical_excel(df_final, [], is_aum_only=is_aum_only)
                             
                             st.download_button(
                                 label="📥 Download Styled Excel (.xlsx)",
