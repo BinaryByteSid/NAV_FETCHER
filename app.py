@@ -623,8 +623,8 @@ def main() -> None:
 
     try:
         nav_data = load_data(force_refresh=False)
-    except AMFINavError as exc:
-        st.error(str(exc))
+    except Exception as exc:
+        st.error(f"Fatal error loading data: {exc}")
         st.stop()
 
     latest_update = format_timestamp(nav_data)
@@ -653,8 +653,8 @@ def main() -> None:
                 summary = summarize_families(nav_data)
                 latest_update = format_timestamp(nav_data)
                 st.success("Refreshed AMFI data.")
-            except AMFINavError as exc:
-                st.error(str(exc))
+            except Exception as exc:
+                st.error(f"Failed to refresh data: {exc}")
                 st.stop()
 
         suggestions: List[str] = []
@@ -690,8 +690,8 @@ def main() -> None:
                 summary = summarize_families(nav_data)
                 latest_update = format_timestamp(nav_data)
                 st.success("Refreshed AMFI data.")
-            except AMFINavError as exc:
-                st.error(str(exc))
+            except Exception as exc:
+                st.error(f"Failed to refresh data: {exc}")
                 st.stop()
 
         batch_queries = st.text_area("Batch search", placeholder="One fund per line, or comma separated")

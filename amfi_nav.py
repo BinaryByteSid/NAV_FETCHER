@@ -169,10 +169,17 @@ def _write_cache(frame: pd.DataFrame, metadata: CacheMetadata) -> None:
 def _read_cache() -> pd.DataFrame:
     if not LATEST_CACHE_FILE.exists():
         raise AMFINavError("No cached AMFI NAV data is available.")
-    frame = pd.read_csv(LATEST_CACHE_FILE)
-    frame["NAV Date"] = pd.to_datetime(frame["NAV Date"], errors="coerce")
-    frame["Updated At"] = pd.to_datetime(frame["Updated At"], errors="coerce")
-    return frame
+    try:
+        frame = pd.read_csv(LATEST_CACHE_FILE)
+        if frame.empty:
+            return pd.DataFrame()
+        if "NAV Date" in frame.columns:
+            frame["NAV Date"] = pd.to_datetime(frame["NAV Date"], errors="coerce")
+        if "Updated At" in frame.columns:
+            frame["Updated At"] = pd.to_datetime(frame["Updated At"], errors="coerce")
+        return frame
+    except Exception as exc:
+        raise AMFINavError(f"Failed to read cached data: {exc}") from exc
 
 
 def _archive_snapshot(frame: pd.DataFrame, fetched_at: datetime) -> None:
@@ -193,9 +200,12 @@ def fetch_nav_data(force_refresh: bool = False, session: Optional[requests.Sessi
 
     ensure_cache_dirs()
     if not force_refresh and LATEST_CACHE_FILE.exists():
-        cached = _read_cache()
-        if not cached.empty:
-            return cached
+        try:
+            cached = _read_cache()
+            if not cached.empty:
+                return cached
+        except Exception as exc:
+            print(f"Warning: Failed to load cache: {exc}. Attempting to fetch live data.")
 
     try:
         text = _download_nav_text(session=session)
@@ -206,14 +216,20 @@ def fetch_nav_data(force_refresh: bool = False, session: Optional[requests.Sessi
             source_url=AMFI_NAV_URL,
             row_count=int(len(frame)),
         )
-        _write_cache(frame, metadata)
-        _archive_snapshot(frame, fetched_at)
+        try:
+            _write_cache(frame, metadata)
+            _archive_snapshot(frame, fetched_at)
+        except Exception as write_exc:
+            print(f"Warning: Failed to write cache: {write_exc}")
         return frame
     except Exception as exc:
         if LATEST_CACHE_FILE.exists():
-            cached = _read_cache()
-            if not cached.empty:
-                return cached
+            try:
+                cached = _read_cache()
+                if not cached.empty:
+                    return cached
+            except Exception:
+                pass
         raise AMFINavError(f"Unable to fetch AMFI NAV data: {exc}") from exc
 
 
