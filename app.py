@@ -4,7 +4,7 @@ import os
 import re
 from datetime import datetime
 from io import BytesIO, StringIO
-from typing import List
+from typing import List, Optional, Union
 
 import pandas as pd
 import requests
@@ -284,7 +284,7 @@ def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id
     return []
 
 
-def find_matching_perf_row(nav_name: str, perf_rows: list) -> dict | None:
+def find_matching_perf_row(nav_name: str, perf_rows: list) -> Optional[dict]:
     if not perf_rows:
         return None
     cleaned_nav = clean_name(nav_name)
@@ -599,7 +599,7 @@ def render_history(selected_summary: pd.Series) -> None:
     metric_cols[2].metric("Delta %", "N/A" if delta["delta_pct"] is None else f"{delta['delta_pct']:.2f}")
 
 
-def render_sip_calculator(default_nav: float | None) -> None:
+def render_sip_calculator(default_nav: Optional[float]) -> None:
     st.subheader("SIP Calculator")
     col1, col2, col3 = st.columns(3)
     with col1:

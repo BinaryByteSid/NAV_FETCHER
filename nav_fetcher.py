@@ -14,7 +14,7 @@ import sys
 from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Union
 
 import pandas as pd
 import requests
@@ -294,7 +294,7 @@ def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id
     return []
 
 
-def find_matching_perf_row(nav_name: str, perf_rows: list) -> dict | None:
+def find_matching_perf_row(nav_name: str, perf_rows: list) -> Optional[dict]:
     if not perf_rows:
         return None
     cleaned_nav = clean_name(nav_name)

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Union
 
 import pandas as pd
 import requests
@@ -387,7 +387,7 @@ def comparison_table(frame: pd.DataFrame, family_key: str) -> pd.DataFrame:
     )
 
 
-def export_to_excel(frame: pd.DataFrame, file_path: str | Path) -> None:
+def export_to_excel(frame: pd.DataFrame, file_path: Union[str, Path]) -> None:
     export_frame = frame.copy()
     if "NAV Date" in export_frame.columns:
         export_frame["NAV Date"] = pd.to_datetime(export_frame["NAV Date"], errors="coerce").dt.strftime("%d-%b-%Y")
@@ -398,7 +398,7 @@ def export_to_excel(frame: pd.DataFrame, file_path: str | Path) -> None:
         export_frame.to_excel(writer, index=False, sheet_name="NAV Results")
 
 
-def export_to_csv(frame: pd.DataFrame, file_path: str | Path) -> None:
+def export_to_csv(frame: pd.DataFrame, file_path: Union[str, Path]) -> None:
     export_frame = frame.copy()
     if "NAV Date" in export_frame.columns:
         export_frame["NAV Date"] = pd.to_datetime(export_frame["NAV Date"], errors="coerce").dt.strftime("%d-%b-%Y")
@@ -493,7 +493,7 @@ def load_all_historical_snapshots() -> pd.DataFrame:
     return history.reset_index(drop=True)
 
 
-def load_navs_on_date(target_date: str | datetime) -> pd.DataFrame:
+def load_navs_on_date(target_date: Union[str, datetime]) -> pd.DataFrame:
     """Return all archived NAV rows whose NAV Date falls exactly on target_date."""
 
     target = pd.to_datetime(target_date, errors="coerce")
