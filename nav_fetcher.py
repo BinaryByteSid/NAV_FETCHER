@@ -330,14 +330,21 @@ def find_matching_perf_row(nav_name: str, perf_rows: list) -> Optional[dict]:
     return None
 
 
-def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame) -> pd.DataFrame:
+def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool = True, fetch_live_aum: bool = False) -> pd.DataFrame:
     if df.empty:
         return df.copy()
+        
+    df_res = df.copy()
+    
+    if not want_aum:
+        df_res["AUM"] = None
+        df_res["Fallback_AUM"] = None
+        return df_res
         
     # 1. First, calculate the fallback AUM for all rows using the old method.
     # We do this so that we always have a default value.
     raw_rows = []
-    for idx, r_dict in df.iterrows():
+    for idx, r_dict in df_res.iterrows():
         r_copy = r_dict.copy()
         m_aum = calculate_aum_for_row(r_copy.to_dict(), df_port)
         r_copy["Monthly_AUM"] = m_aum
@@ -348,6 +355,11 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame) -> pd.DataFrame
     mean_navs = mean_navs.fillna(1.0).replace(0.0, 1.0)
     df_res["Fallback_AUM"] = (df_res["Monthly_AUM"] * (df_res["NAV"] / mean_navs)).round(4)
     
+    if not fetch_live_aum:
+        # If user does not want slow live AUM, use Fallback AUM immediately
+        df_res["AUM"] = df_res["Fallback_AUM"]
+        return df_res
+        
     # Initialize AUM with None to allow carry-forward for missing dates
     df_res["AUM"] = None
     
@@ -574,10 +586,12 @@ AMFI_LATEST_URL = "https://portal.amfiindia.com/spages/NAVAll.txt"
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
-def parse_amfi_text(text: str) -> pd.DataFrame:
+def parse_amfi_text(text: str, isin_list: tuple[str, ...] | None = None) -> pd.DataFrame:
     """Parse the semicolon-delimited AMFI NAV feed into a DataFrame."""
     rows: List[dict] = []
     current_section = "Unknown"
+
+    isin_set = {isin.strip().upper() for isin in isin_list} if isin_list else None
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -595,6 +609,13 @@ def parse_amfi_text(text: str) -> pd.DataFrame:
         if line.count(";") < 5:
             continue
 
+        # Optimize memory & parsing: Skip processing the line if isin_list is provided
+        # and none of the targeted ISINs are in the raw text line (case-insensitive)
+        if isin_set:
+            line_upper = line.upper()
+            if not any(isin in line_upper for isin in isin_set):
+                continue
+
         parts = [p.strip() for p in line.split(";")]
         if len(parts) < 8:
             continue
@@ -605,6 +626,13 @@ def parse_amfi_text(text: str) -> pd.DataFrame:
         isin_reinvest = parts[3] if parts[3] not in ("", "-") else None
         nav_value = parts[4]
         nav_date = parts[7]
+
+        # Double check matching against ISIN set
+        if isin_set:
+            g_match = isin_growth is not None and isin_growth.upper() in isin_set
+            r_match = isin_reinvest is not None and isin_reinvest.upper() in isin_set
+            if not (g_match or r_match):
+                continue
 
         nav = pd.to_numeric(nav_value.replace(",", ""), errors="coerce")
 
@@ -891,11 +919,39 @@ def style_excel(df: pd.DataFrame, date_cols: List[str], is_aum_only: bool = Fals
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_amfi_data(frmdt: str, todt: str) -> pd.DataFrame:
+def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = None) -> pd.DataFrame:
     url = AMFI_HISTORY_URL.format(frmdt=frmdt, todt=todt)
-    resp = requests.get(url, timeout=60)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    resp = requests.get(url, headers=headers, timeout=90)
     resp.raise_for_status()
-    return parse_amfi_text(resp.text)
+    return parse_amfi_text(resp.text, isin_list)
+
+
+def fetch_amfi_data_chunked(start_date, end_date, isin_list: List[str] | None = None) -> pd.DataFrame:
+    """Fetch AMFI data by chunking the date range into 90-day intervals to prevent timeout & memory crash."""
+    import time
+    passed_isins = tuple(isin_list) if isin_list else None
+    dfs = []
+    current_start = start_date
+    
+    while current_start <= end_date:
+        current_end = min(current_start + timedelta(days=90), end_date)
+        frmdt_str = current_start.strftime("%d-%b-%Y")
+        todt_str = current_end.strftime("%d-%b-%Y")
+        
+        df_chunk = fetch_amfi_data(frmdt_str, todt_str, passed_isins)
+        if not df_chunk.empty:
+            dfs.append(df_chunk)
+            
+        current_start = current_end + timedelta(days=1)
+        if current_start <= end_date:
+            time.sleep(0.5)  # avoid hitting rate limits
+        
+    if not dfs:
+        return pd.DataFrame()
+    return pd.concat(dfs, ignore_index=True)
 
 
 # ─── UI ───────────────────────────────────────────────────────────────────────
@@ -990,6 +1046,9 @@ def main():
         want_nav = st.checkbox("Want NAV", value=True)
     with col_c2:
         want_aum = st.checkbox("Want AUM", value=True)
+        fetch_live_aum = False
+        if want_aum:
+            fetch_live_aum = st.checkbox("Fetch live daily AUM (Slows down query)", value=False)
 
     st.markdown("")
 
@@ -1009,13 +1068,19 @@ def main():
         st.error("Please enter at least one ISIN.")
         return
 
+    # Limit Date Range mode to 90 days to prevent server OOM/crash
+    date_diff_days = (end_date - start_date).days
+    if not mode.startswith("🔍") and date_diff_days > 90:
+        st.error("For 'By Date Range Only (all funds)' mode, the date range is limited to 90 days to prevent memory crash on Streamlit Cloud. Please use 'By ISIN' mode for larger date ranges.")
+        return
+
     # ── Fetch ─────────────────────────────────────────────────────────────────
     frmdt_str = start_date.strftime("%d-%b-%Y")
     todt_str = end_date.strftime("%d-%b-%Y")
 
     with st.spinner(f"Contacting AMFI India for {frmdt_str} → {todt_str} …"):
         try:
-            df_raw = fetch_amfi_data(frmdt_str, todt_str)
+            df_raw = fetch_amfi_data_chunked(start_date, end_date, isin_list if mode.startswith("🔍") else None)
         except Exception as exc:
             st.error(f"Failed to fetch data: {exc}")
             return
@@ -1040,7 +1105,7 @@ def main():
 
     # ── Build AUM data using Performance API with Excel portfolio fallback ────
     df_port = load_portfolio_aum_data()
-    df_filtered = populate_actual_aum(df_filtered, df_port)
+    df_filtered = populate_actual_aum(df_filtered, df_port, want_aum=want_aum, fetch_live_aum=fetch_live_aum)
 
     # ── Build target date columns ─────────────────────────────────────────────
     date_cols = build_date_cols(start_date, end_date, skip_sunday)
