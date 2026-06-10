@@ -695,9 +695,9 @@ def pivot_to_wide(df: pd.DataFrame, date_cols: List[str]) -> pd.DataFrame:
 
 
 def _date_to_dmy(date_str: str) -> str:
-    """Convert '29-May-2026' → '29/05/2026'."""
+    """Convert '29-May-2026' → '29-05-2026'."""
     try:
-        return datetime.strptime(date_str, "%d-%b-%Y").strftime("%d/%m/%Y")
+        return datetime.strptime(date_str, "%d-%b-%Y").strftime("%d-%m-%Y")
     except Exception:
         return date_str
 
@@ -1064,7 +1064,7 @@ def build_date_cols(start_date, end_date, skip_sunday: bool) -> List[str]:
     current = start_date
     while current <= end_date:
         if not (skip_sunday and current.weekday() == 6):
-            cols.append(current.strftime("%d-%b-%Y"))
+            cols.append(current.strftime("%d-%m-%Y"))
         current += timedelta(days=1)
     return cols
 
@@ -1226,7 +1226,7 @@ def main():
             "Option Type",
         ]
         fund_metadata = df_filtered[meta_cols].drop_duplicates(subset=["Scheme Code"])
-        df_filtered["NAV_Date_Str"] = df_filtered["NAV Date"].dt.strftime("%d-%b-%Y")
+        df_filtered["NAV_Date_Str"] = df_filtered["NAV Date"].dt.strftime("%d-%m-%Y")
         
         if want_nav and not want_aum:
             df_pivot = df_filtered.pivot_table(index="Scheme Code", columns="NAV_Date_Str", values="NAV", aggfunc="first").reset_index()
@@ -1263,8 +1263,8 @@ def main():
                 
         # Carry forward
         if carry_forward and len(date_cols) > 1:
-            date_objs = sorted([datetime.strptime(d, "%d-%b-%Y") for d in date_cols])
-            sorted_cols = [d.strftime("%d-%b-%Y") for d in date_objs]
+            date_objs = sorted([datetime.strptime(d, "%d-%m-%Y") for d in date_cols])
+            sorted_cols = [d.strftime("%d-%m-%Y") for d in date_objs]
             for i in range(1, len(sorted_cols)):
                 prev, curr = sorted_cols[i - 1], sorted_cols[i]
                 if want_nav and not want_aum:
@@ -1340,7 +1340,7 @@ def main():
             df_filtered["AUM"] = df_filtered["AUM"].fillna(df_filtered["Fallback_AUM"])
             
         df_display = df_filtered[[c for c in wanted if c in df_filtered.columns]].copy()
-        df_display["NAV Date"] = df_display["NAV Date"].dt.strftime("%d-%b-%Y")
+        df_display["NAV Date"] = df_display["NAV Date"].dt.strftime("%d-%m-%Y")
         display_date_cols = []  # no date pivot columns for long format
         is_aum_only = want_aum and not want_nav
 

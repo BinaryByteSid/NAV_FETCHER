@@ -160,7 +160,7 @@ def _parse_nav_text(text: str) -> pd.DataFrame:
 def _write_cache(frame: pd.DataFrame, metadata: CacheMetadata) -> None:
     ensure_cache_dirs()
     export_frame = frame.copy()
-    export_frame["NAV Date"] = export_frame["NAV Date"].dt.strftime("%d-%b-%Y")
+    export_frame["NAV Date"] = export_frame["NAV Date"].dt.strftime("%d-%m-%Y")
     export_frame["Updated At"] = export_frame["Updated At"].astype(str)
     export_frame.to_csv(LATEST_CACHE_FILE, index=False)
     META_CACHE_FILE.write_text(json.dumps(metadata.__dict__, indent=2), encoding="utf-8")
@@ -186,7 +186,7 @@ def _archive_snapshot(frame: pd.DataFrame, fetched_at: datetime) -> None:
     ensure_cache_dirs()
     archive_file = DEFAULT_ARCHIVE_DIR / f"nav_{fetched_at.strftime('%Y%m%d_%H%M%S')}.csv.gz"
     archive_frame = frame.copy()
-    archive_frame["NAV Date"] = archive_frame["NAV Date"].dt.strftime("%d-%b-%Y")
+    archive_frame["NAV Date"] = archive_frame["NAV Date"].dt.strftime("%d-%m-%Y")
     archive_frame["Updated At"] = archive_frame["Updated At"].astype(str)
     archive_frame.to_csv(archive_file, index=False, compression="gzip")
 
@@ -390,7 +390,7 @@ def comparison_table(frame: pd.DataFrame, family_key: str) -> pd.DataFrame:
 def export_to_excel(frame: pd.DataFrame, file_path: Union[str, Path]) -> None:
     export_frame = frame.copy()
     if "NAV Date" in export_frame.columns:
-        export_frame["NAV Date"] = pd.to_datetime(export_frame["NAV Date"], errors="coerce").dt.strftime("%d-%b-%Y")
+        export_frame["NAV Date"] = pd.to_datetime(export_frame["NAV Date"], errors="coerce").dt.strftime("%d-%m-%Y")
     if "Updated At" in export_frame.columns:
         export_frame["Updated At"] = pd.to_datetime(export_frame["Updated At"], errors="coerce").astype(str)
 
@@ -401,7 +401,7 @@ def export_to_excel(frame: pd.DataFrame, file_path: Union[str, Path]) -> None:
 def export_to_csv(frame: pd.DataFrame, file_path: Union[str, Path]) -> None:
     export_frame = frame.copy()
     if "NAV Date" in export_frame.columns:
-        export_frame["NAV Date"] = pd.to_datetime(export_frame["NAV Date"], errors="coerce").dt.strftime("%d-%b-%Y")
+        export_frame["NAV Date"] = pd.to_datetime(export_frame["NAV Date"], errors="coerce").dt.strftime("%d-%m-%Y")
     export_frame.to_csv(file_path, index=False)
 
 

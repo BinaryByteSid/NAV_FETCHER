@@ -514,7 +514,7 @@ def frame_to_csv_bytes(frame: pd.DataFrame) -> bytes:
     buffer = StringIO()
     export_frame = frame.copy()
     if "NAV Date" in export_frame.columns:
-        export_frame["NAV Date"] = pd.to_datetime(export_frame["NAV Date"], errors="coerce").dt.strftime("%d-%b-%Y")
+        export_frame["NAV Date"] = pd.to_datetime(export_frame["NAV Date"], errors="coerce").dt.strftime("%d-%m-%Y")
     export_frame.to_csv(buffer, index=False)
     return buffer.getvalue().encode("utf-8")
 
@@ -552,7 +552,7 @@ def format_timestamp(frame: pd.DataFrame) -> str:
     latest = pd.to_datetime(frame["NAV Date"], errors="coerce").dropna().max()
     if pd.isna(latest):
         return "Unavailable"
-    return pd.Timestamp(latest).strftime("%d-%b-%Y")
+    return pd.Timestamp(latest).strftime("%d-%m-%Y")
 
 
 def render_result_card(selected_summary: pd.Series, selected_rows: pd.DataFrame) -> None:
@@ -566,7 +566,7 @@ def render_result_card(selected_summary: pd.Series, selected_rows: pd.DataFrame)
         st.metric("Latest NAV", f"{latest_nav:.4f}" if pd.notna(latest_nav) else "N/A")
     with col4:
         latest_date = pd.to_datetime(selected_summary.get("Latest NAV Date"), errors="coerce")
-        st.metric("NAV Date", latest_date.strftime("%d-%b-%Y") if pd.notna(latest_date) else "N/A")
+        st.metric("NAV Date", latest_date.strftime("%d-%m-%Y") if pd.notna(latest_date) else "N/A")
 
     st.subheader("Regular vs Direct Comparison")
     comparison = comparison_table(selected_rows, selected_summary["Family Key"])
@@ -987,6 +987,10 @@ def main() -> None:
                             
                             if vertical_rows:
                                 df_final = pd.DataFrame(vertical_rows)
+                                if "NAV Date" in df_final.columns:
+                                    df_final["NAV Date"] = pd.to_datetime(df_final["NAV Date"], format="%d-%b-%Y", errors="coerce").dt.strftime("%d-%m-%Y")
+                                if "AUM Date" in df_final.columns:
+                                    df_final["AUM Date"] = pd.to_datetime(df_final["AUM Date"], format="%d-%b-%Y", errors="coerce").dt.strftime("%d-%m-%Y")
                                 df_final = df_final[ordered_cols]
                                 df_final = df_final.sort_values(by=["Asset Class", "Scheme Name"]).reset_index(drop=True)
                             else:
@@ -1014,7 +1018,7 @@ def main() -> None:
         render_result_card(selected_summary, selected_rows)
         st.subheader("Latest NAV Table")
         latest_rows = selected_rows[["Scheme Name", "Scheme Code", "AMC Name", "Plan Type", "Option Type", "NAV", "NAV Date"]].copy()
-        latest_rows["NAV Date"] = pd.to_datetime(latest_rows["NAV Date"], errors="coerce").dt.strftime("%d-%b-%Y")
+        latest_rows["NAV Date"] = pd.to_datetime(latest_rows["NAV Date"], errors="coerce").dt.strftime("%d-%m-%Y")
         st.dataframe(latest_rows, use_container_width=True, hide_index=True)
 
         export_frame = build_export_frame(selected_rows)
@@ -1055,7 +1059,7 @@ def main() -> None:
             st.info("No fund summaries are available.")
         else:
             browse = summary[["Family Name", "AMC Name", "Latest Scheme Name", "Latest Scheme Code", "Latest NAV", "Latest NAV Date", "Plan Types", "Option Types"]].copy()
-            browse["Latest NAV Date"] = pd.to_datetime(browse["Latest NAV Date"], errors="coerce").dt.strftime("%d-%b-%Y")
+            browse["Latest NAV Date"] = pd.to_datetime(browse["Latest NAV Date"], errors="coerce").dt.strftime("%d-%m-%Y")
             st.dataframe(browse.head(200), use_container_width=True, hide_index=True)
 
     # Quick Export: user can type a scheme name or Scheme Code and download an Excel of NAVs
@@ -1092,12 +1096,12 @@ def main() -> None:
                         if not latest_rows.empty:
                             export_latest = latest_rows.copy()
                             if "NAV Date" in export_latest.columns:
-                                export_latest["NAV Date"] = pd.to_datetime(export_latest["NAV Date"], errors="coerce").dt.strftime("%d-%b-%Y")
+                                export_latest["NAV Date"] = pd.to_datetime(export_latest["NAV Date"], errors="coerce").dt.strftime("%d-%m-%Y")
                             export_latest.to_excel(writer, index=False, sheet_name="Latest NAVs")
                         if history is not None and not history.empty:
                             export_hist = history.copy()
                             if "NAV Date" in export_hist.columns:
-                                export_hist["NAV Date"] = pd.to_datetime(export_hist["NAV Date"], errors="coerce").dt.strftime("%d-%b-%Y")
+                                export_hist["NAV Date"] = pd.to_datetime(export_hist["NAV Date"], errors="coerce").dt.strftime("%d-%m-%Y")
                             export_hist.to_excel(writer, index=False, sheet_name="History")
                     out.seek(0)
                     file_name = f"nav_export_{normalize_filename(quick_query)}.xlsx"
