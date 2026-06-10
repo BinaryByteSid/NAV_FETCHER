@@ -778,8 +778,20 @@ def main() -> None:
                         todt_str = end_date.strftime("%d-%b-%Y")
                         
                         url = f"https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx?frmdt={frmdt_str}&todt={todt_str}"
-                        response = requests.get(url, stream=True, timeout=120)
-                        response.raise_for_status()
+                        import time
+                        max_retries = 3
+                        delay = 2.0
+                        response = None
+                        for attempt in range(max_retries):
+                            try:
+                                response = requests.get(url, stream=True, timeout=300)
+                                response.raise_for_status()
+                                break
+                            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                                if attempt == max_retries - 1:
+                                    raise e
+                                time.sleep(delay)
+                                delay *= 2
                         
                         rows = []
                         current_section = "Unknown"

@@ -924,8 +924,20 @@ def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = N
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    resp = requests.get(url, headers=headers, stream=True, timeout=120)
-    resp.raise_for_status()
+    import time
+    max_retries = 3
+    delay = 2.0
+    resp = None
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, headers=headers, stream=True, timeout=300)
+            resp.raise_for_status()
+            break
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if attempt == max_retries - 1:
+                raise e
+            time.sleep(delay)
+            delay *= 2
     
     rows: List[dict] = []
     current_section = "Unknown"
