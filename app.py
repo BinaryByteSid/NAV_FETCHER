@@ -778,47 +778,54 @@ def main() -> None:
                         todt_str = end_date.strftime("%d-%b-%Y")
                         
                         url = f"https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx?frmdt={frmdt_str}&todt={todt_str}"
-                        response = requests.get(url, timeout=60)
+                        response = requests.get(url, stream=True, timeout=120)
                         response.raise_for_status()
-                        
-                        lines = response.text.splitlines()
                         
                         rows = []
                         current_section = "Unknown"
                         
                         df_port = load_portfolio_aum_data()
+                        parsed_isins_set = {x.upper() for x in parsed_isins}
                         
-                        for line in lines:
-                            line = line.strip()
-                            if not line:
+                        for line_bytes in response.iter_lines():
+                            if not line_bytes:
                                 continue
-                            if line.startswith("Scheme Code;"):
-                                continue
-                            if line.startswith("Open Ended") or line.startswith("Closed Ended") or line.startswith("Interval Fund Schemes"):
-                                current_section = line
-                                continue
-                            if line.count(";") < 5:
+                            line = line_bytes.decode('utf-8', errors='ignore')
+                            
+                            # Fast check: AMC and section lines do not contain semicolons
+                            if ";" not in line:
+                                line_stripped = line.strip()
+                                if (
+                                    line_stripped.startswith("Open Ended")
+                                    or line_stripped.startswith("Closed Ended")
+                                    or line_stripped.startswith("Interval Fund Schemes")
+                                ):
+                                    current_section = line_stripped
                                 continue
                             
-                            parts = [part.strip() for part in line.split(";")]
+                            parts = line.split(";")
                             if len(parts) < 8:
                                 continue
                                 
-                            scheme_code = parts[0]
-                            scheme_name = parts[1]
-                            isin_growth = parts[2]
-                            isin_reinvestment = parts[3]
-                            nav_value = parts[4]
-                            nav_date = parts[7]
+                            isin_growth = parts[2].strip()
+                            isin_reinvestment = parts[3].strip()
                             
-                            scheme_code = scheme_code if scheme_code != "-" else None
-                            isin_growth = isin_growth if isin_growth != "-" else None
-                            isin_reinvestment = isin_reinvestment if isin_reinvestment != "-" else None
+                            isin_growth_upper = isin_growth.upper() if isin_growth != "-" else ""
+                            isin_reinvest_upper = isin_reinvestment.upper() if isin_reinvestment != "-" else ""
                             
-                            g_match = isin_growth in parsed_isins and isin_growth is not None
-                            r_match = isin_reinvestment in parsed_isins and isin_reinvestment is not None
+                            g_match = isin_growth_upper and isin_growth_upper in parsed_isins_set
+                            r_match = isin_reinvest_upper and isin_reinvest_upper in parsed_isins_set
                             
                             if g_match or r_match:
+                                scheme_code = parts[0].strip()
+                                scheme_name = parts[1].strip()
+                                nav_value = parts[4].strip()
+                                nav_date = parts[7].strip()
+                                
+                                scheme_code = scheme_code if scheme_code != "-" else None
+                                isin_growth = isin_growth if isin_growth != "-" else None
+                                isin_reinvestment = isin_reinvestment if isin_reinvestment != "-" else None
+                                
                                 nav = pd.to_numeric(nav_value.replace(",", ""), errors="coerce")
                                 rows.append({
                                     "Asset Class": current_section,

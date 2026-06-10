@@ -924,9 +924,84 @@ def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = N
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    resp = requests.get(url, headers=headers, timeout=90)
+    resp = requests.get(url, headers=headers, stream=True, timeout=120)
     resp.raise_for_status()
-    return parse_amfi_text(resp.text, isin_list)
+    
+    rows: List[dict] = []
+    current_section = "Unknown"
+    
+    isin_set = {isin.strip().upper() for isin in isin_list if isin.strip()} if isin_list else None
+    
+    for line_bytes in resp.iter_lines():
+        if not line_bytes:
+            continue
+        line = line_bytes.decode('utf-8', errors='ignore')
+        
+        # Fast section check (no semicolons in section headers)
+        if ";" not in line:
+            line_stripped = line.strip()
+            if (
+                line_stripped.startswith("Open Ended")
+                or line_stripped.startswith("Closed Ended")
+                or line_stripped.startswith("Interval Fund Schemes")
+            ):
+                current_section = line_stripped
+            continue
+            
+        # Optimize memory & parsing: Skip processing the line if isin_set is provided
+        # and none of the targeted ISINs are in the raw text line (case-insensitive)
+        if isin_set:
+            line_upper = line.upper()
+            if not any(isin in line_upper for isin in isin_set):
+                continue
+                
+        parts = line.split(";")
+        if len(parts) < 8:
+            continue
+            
+        isin_growth = parts[2].strip()
+        isin_reinvest = parts[3].strip()
+        
+        isin_growth_upper = isin_growth.upper() if isin_growth != "-" else ""
+        isin_reinvest_upper = isin_reinvest.upper() if isin_reinvest != "-" else ""
+        
+        # Double check matching against ISIN set
+        if isin_set:
+            g_match = isin_growth_upper and isin_growth_upper in isin_set
+            r_match = isin_reinvest_upper and isin_reinvest_upper in isin_set
+            if not (g_match or r_match):
+                continue
+                
+        scheme_code = parts[0].strip()
+        scheme_name = parts[1].strip()
+        nav_value = parts[4].strip()
+        nav_date = parts[7].strip()
+        
+        scheme_code = scheme_code if scheme_code != "-" else None
+        isin_growth_val = isin_growth if isin_growth != "-" else None
+        isin_reinvest_val = isin_reinvest if isin_reinvest != "-" else None
+        
+        nav = pd.to_numeric(nav_value.replace(",", ""), errors="coerce")
+        
+        rows.append(
+            {
+                "Asset Class": current_section,
+                "Scheme Code": scheme_code,
+                "ISIN Div Payout / ISIN Growth": isin_growth_val,
+                "ISIN Div Reinvestment": isin_reinvest_val,
+                "Scheme Name": scheme_name,
+                "NAV": nav,
+                "NAV Date": nav_date,
+            }
+        )
+        
+    if not rows:
+        return pd.DataFrame()
+        
+    df = pd.DataFrame(rows)
+    df["Plan Type"] = df["Scheme Name"].apply(classify_plan_type)
+    df["Option Type"] = df["Scheme Name"].apply(classify_option_type)
+    return df
 
 
 def fetch_amfi_data_chunked(start_date, end_date, isin_list: List[str] | None = None) -> pd.DataFrame:
