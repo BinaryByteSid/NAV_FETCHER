@@ -420,6 +420,13 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
 # ─── Project helpers ─────────────────────────────────────────────────────────
 sys.path.append(str(Path(__file__).parent))
 from amfi_nav import classify_option_type, classify_plan_type
+from ui_theme import (
+    inject_custom_css,
+    render_app_footer,
+    render_hero,
+    render_info_card,
+    render_section_header,
+)
 
 # ─── Page config ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -427,154 +434,6 @@ st.set_page_config(
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed",
-)
-
-# ─── Custom CSS ──────────────────────────────────────────────────────────────
-st.markdown(
-    """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-
-html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-
-/* Dark background */
-.stApp { background: linear-gradient(135deg, #0f1724 0%, #162032 50%, #0f1f2e 100%); }
-
-/* Hero section */
-.hero-card {
-    background: linear-gradient(135deg, #1a2d45 0%, #1e3a56 100%);
-    border: 1px solid rgba(64, 156, 255, 0.2);
-    border-radius: 16px;
-    padding: 2rem 2.5rem;
-    margin-bottom: 1.5rem;
-    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
-}
-.hero-title {
-    font-size: 2rem; font-weight: 700;
-    background: linear-gradient(90deg, #60a5fa, #38bdf8, #34d399);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    margin: 0; padding-bottom: 0.3rem;
-}
-.hero-sub { color: #94a3b8; font-size: 1rem; margin: 0; }
-
-/* Mode card */
-.mode-info {
-    background: rgba(30, 58, 86, 0.6);
-    border: 1px solid rgba(64, 156, 255, 0.15);
-    border-left: 4px solid #3b82f6;
-    border-radius: 10px;
-    padding: 1rem 1.2rem;
-    margin-bottom: 1rem;
-    color: #94a3b8;
-    font-size: 0.88rem;
-    line-height: 1.6;
-}
-
-/* Stat chips */
-.stat-row { display: flex; gap: 12px; margin-bottom: 1rem; flex-wrap: wrap; }
-.stat-chip {
-    background: rgba(59, 130, 246, 0.12);
-    border: 1px solid rgba(59, 130, 246, 0.3);
-    border-radius: 20px;
-    padding: 6px 14px;
-    color: #60a5fa;
-    font-size: 0.82rem;
-    font-weight: 500;
-}
-
-/* Buttons */
-.stButton > button {
-    background: linear-gradient(135deg, #2563eb, #1d4ed8) !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 10px !important;
-    font-weight: 600 !important;
-    font-size: 0.95rem !important;
-    padding: 0.6rem 1.5rem !important;
-    transition: all 0.2s !important;
-    box-shadow: 0 4px 14px rgba(37,99,235,0.4) !important;
-}
-.stButton > button:hover {
-    transform: translateY(-1px) !important;
-    box-shadow: 0 6px 20px rgba(37,99,235,0.55) !important;
-}
-
-/* Download button */
-.stDownloadButton > button {
-    background: linear-gradient(135deg, #059669, #047857) !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 10px !important;
-    font-weight: 600 !important;
-    box-shadow: 0 4px 14px rgba(5,150,105,0.4) !important;
-}
-.stDownloadButton > button:hover {
-    transform: translateY(-1px) !important;
-    box-shadow: 0 6px 20px rgba(5,150,105,0.55) !important;
-}
-
-/* Inputs */
-.stTextArea textarea, .stTextInput input {
-    background: rgba(15, 30, 50, 0.8) !important;
-    border: 1px solid rgba(64, 156, 255, 0.25) !important;
-    border-radius: 8px !important;
-    color: #e2e8f0 !important;
-    font-family: 'Inter', monospace !important;
-}
-.stTextArea textarea:focus, .stTextInput input:focus {
-    border-color: #3b82f6 !important;
-    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2) !important;
-}
-
-/* Date inputs */
-.stDateInput input {
-    background: rgba(15, 30, 50, 0.8) !important;
-    border: 1px solid rgba(64, 156, 255, 0.25) !important;
-    border-radius: 8px !important;
-    color: #e2e8f0 !important;
-}
-
-/* Radio */
-.stRadio > div { gap: 8px; }
-.stRadio label {
-    background: rgba(30, 58, 86, 0.5) !important;
-    border: 1px solid rgba(64, 156, 255, 0.2) !important;
-    border-radius: 8px !important;
-    padding: 6px 16px !important;
-    color: #94a3b8 !important;
-    font-weight: 500 !important;
-    transition: all 0.15s !important;
-}
-.stRadio label:has(input:checked) {
-    background: rgba(37, 99, 235, 0.25) !important;
-    border-color: #3b82f6 !important;
-    color: #60a5fa !important;
-}
-
-/* Checkboxes */
-.stCheckbox label { color: #94a3b8 !important; font-size: 0.9rem !important; }
-
-/* Dataframe */
-.stDataFrame { border: 1px solid rgba(64,156,255,0.15) !important; border-radius: 10px !important; overflow: hidden; }
-
-/* Alerts */
-.stSuccess { background: rgba(5,150,105,0.12) !important; border: 1px solid rgba(5,150,105,0.3) !important; border-radius: 8px !important; }
-.stWarning { background: rgba(245,158,11,0.12) !important; border: 1px solid rgba(245,158,11,0.3) !important; border-radius: 8px !important; }
-.stError { background: rgba(239,68,68,0.12) !important; border: 1px solid rgba(239,68,68,0.3) !important; border-radius: 8px !important; }
-.stInfo { background: rgba(59,130,246,0.12) !important; border: 1px solid rgba(59,130,246,0.3) !important; border-radius: 8px !important; }
-
-/* Labels */
-label { color: #94a3b8 !important; font-weight: 500 !important; font-size: 0.88rem !important; }
-h3, h4 { color: #e2e8f0 !important; }
-
-/* Divider */
-hr { border-color: rgba(64,156,255,0.1) !important; }
-
-/* Spinner */
-.stSpinner > div { color: #60a5fa !important; }
-</style>
-""",
-    unsafe_allow_html=True,
 )
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -1041,23 +900,6 @@ def fetch_amfi_data_chunked(start_date, end_date, isin_list: List[str] | None = 
     return pd.concat(dfs, ignore_index=True)
 
 
-# ─── UI ───────────────────────────────────────────────────────────────────────
-
-def render_hero():
-    st.markdown(
-        """
-        <div class="hero-card">
-            <p class="hero-title">📊 AMFI NAV Fetcher</p>
-            <p class="hero-sub">
-                Fetch live &amp; historical NAV data from AMFI India — by ISIN or date range.
-                Preview inline and export as a styled Excel report.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
 def build_date_cols(start_date, end_date, skip_sunday: bool) -> List[str]:
     """Generate sorted list of date strings between start and end."""
     cols = []
@@ -1072,36 +914,46 @@ def build_date_cols(start_date, end_date, skip_sunday: bool) -> List[str]:
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    render_hero()
-
-    # ── Mode selector ─────────────────────────────────────────────────────────
-    mode = st.radio(
-        "Fetch mode",
-        ["🔍 By ISIN + Date Range", "📅 By Date Range Only (all funds)"],
-        horizontal=True,
+    inject_custom_css()
+    render_hero(
+        title="AMFI NAV Fetcher",
+        subtitle=(
+            "Fetch live and historical NAV data from AMFI India by ISIN or date range. "
+            "Preview results inline and export corporate-styled Excel reports."
+        ),
+        chips=[
+            "🔍 ISIN + date range lookup",
+            "📅 Full-market date range export",
+            "📥 Styled Excel download",
+        ],
     )
 
-    st.markdown("<hr>", unsafe_allow_html=True)
+    render_section_header("⚙️", "Fetch Configuration", "Choose mode, dates, and export options")
+    mode = st.radio(
+        "Fetch mode",
+        ["By ISIN + Date Range", "By Date Range Only (all funds)"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
 
-    # ── Date inputs ───────────────────────────────────────────────────────────
+    st.markdown('<hr class="panel-divider">', unsafe_allow_html=True)
+
     default_end = datetime.today().date()
     default_start = (datetime.today() - timedelta(days=7)).date()
 
+    render_section_header("📅", "Date Range")
     col_a, col_b = st.columns(2)
     with col_a:
-        start_date = st.date_input("📅 Start Date", value=default_start)
+        start_date = st.date_input("Start Date", value=default_start)
     with col_b:
-        end_date = st.date_input("📅 End Date", value=default_end)
+        end_date = st.date_input("End Date", value=default_end)
 
-    # ── ISIN input (only shown in ISIN mode) ──────────────────────────────────
     isin_list: List[str] = []
-    if mode.startswith("🔍"):
-        st.markdown(
-            '<div class="mode-info">'
-            "<strong>ISIN Mode:</strong> Enter one or more ISINs (Growth <em>or</em> Reinvestment) — "
-            "one per line, or comma-separated. Rows matching either ISIN column will be fetched."
-            "</div>",
-            unsafe_allow_html=True,
+    isin_mode = mode.startswith("By ISIN")
+    if isin_mode:
+        render_info_card(
+            "<strong>ISIN mode:</strong> Enter one or more ISINs (Growth <em>or</em> Reinvestment) — "
+            "one per line or comma-separated. Rows matching either ISIN column will be fetched."
         )
         raw_isins = st.text_area(
             "ISINs",
@@ -1110,16 +962,13 @@ def main():
         )
         isin_list = [x.strip() for x in re.split(r"[,\n\s]+", raw_isins) if x.strip()]
     else:
-        st.markdown(
-            '<div class="mode-info">'
-            "<strong>Date-Range Mode:</strong> No ISINs required — the full AMFI database "
+        render_info_card(
+            "<strong>Date-range mode:</strong> No ISINs required — the full AMFI database "
             "for the selected period will be fetched (~8,000+ schemes). "
-            "Large date ranges may take a few seconds."
-            "</div>",
-            unsafe_allow_html=True,
+            "Ranges are limited to 90 days in this mode."
         )
 
-    # ── Options ───────────────────────────────────────────────────────────────
+    render_section_header("🎛️", "Export Options")
     c1, c2, c3 = st.columns(3)
     with c1:
         skip_sunday = st.checkbox("Skip Sundays", value=True)
@@ -1135,13 +984,12 @@ def main():
         want_aum = st.checkbox("Want AUM", value=True)
         fetch_live_aum = False
         if want_aum:
-            fetch_live_aum = st.checkbox("Fetch live daily AUM (Slows down query)", value=False)
+            fetch_live_aum = st.checkbox("Fetch live daily AUM (slower)", value=False)
 
-    st.markdown("")
-
-    fetch_btn = st.button("⚡ FetchData", use_container_width=True)
+    fetch_btn = st.button("Fetch data", type="primary", use_container_width=True)
 
     if not fetch_btn:
+        render_app_footer()
         return
 
     # ── Validation ────────────────────────────────────────────────────────────
@@ -1151,23 +999,24 @@ def main():
     if start_date > end_date:
         st.error("Start Date must be before or equal to End Date.")
         return
-    if mode.startswith("🔍") and not isin_list:
+    if isin_mode and not isin_list:
         st.error("Please enter at least one ISIN.")
         return
 
-    # Limit Date Range mode to 90 days to prevent server OOM/crash
     date_diff_days = (end_date - start_date).days
-    if not mode.startswith("🔍") and date_diff_days > 90:
-        st.error("For 'By Date Range Only (all funds)' mode, the date range is limited to 90 days to prevent memory crash on Streamlit Cloud. Please use 'By ISIN' mode for larger date ranges.")
+    if not isin_mode and date_diff_days > 90:
+        st.error(
+            "For 'By Date Range Only (all funds)' mode, the date range is limited to 90 days. "
+            "Use ISIN mode for larger ranges."
+        )
         return
 
-    # ── Fetch ─────────────────────────────────────────────────────────────────
     frmdt_str = start_date.strftime("%d-%b-%Y")
     todt_str = end_date.strftime("%d-%b-%Y")
 
     with st.spinner(f"Contacting AMFI India for {frmdt_str} → {todt_str} …"):
         try:
-            df_raw = fetch_amfi_data_chunked(start_date, end_date, isin_list if mode.startswith("🔍") else None)
+            df_raw = fetch_amfi_data_chunked(start_date, end_date, isin_list if isin_mode else None)
         except Exception as exc:
             st.error(f"Failed to fetch data: {exc}")
             return
@@ -1177,7 +1026,7 @@ def main():
         return
 
     # ── Filter by ISINs if needed ─────────────────────────────────────────────
-    if mode.startswith("🔍"):
+    if isin_mode:
         df_filtered = filter_by_isins(df_raw, isin_list)
         if df_filtered.empty:
             st.warning(
@@ -1344,26 +1193,24 @@ def main():
         display_date_cols = []  # no date pivot columns for long format
         is_aum_only = want_aum and not want_nav
 
-    # ── Preview ───────────────────────────────────────────────────────────────
-    st.markdown("### 📋 Data Preview")
+    render_section_header("👁️", "Data Preview")
     st.dataframe(df_display, use_container_width=True, hide_index=True)
 
-    # ── Export ────────────────────────────────────────────────────────────────
+    render_section_header("📥", "Export")
     with st.spinner("Generating styled Excel…"):
         excel_bytes = style_excel(df_display, [], is_aum_only=is_aum_only)
 
     file_label = f"amfi_nav_{start_date}_to_{end_date}.xlsx"
     st.download_button(
-        label="📥  Download Styled Excel (.xlsx)",
+        label="Download styled Excel (.xlsx)",
         data=excel_bytes,
         file_name=file_label,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
 
-    # ── Summary table (long format only) ─────────────────────────────────────
     if not pivot_dates:
-        with st.expander("📊 Scheme Summary", expanded=False):
+        with st.expander("Scheme summary", expanded=False):
             summary = (
                 df_filtered.groupby(["Scheme Code", "Scheme Name", "Plan Type", "Option Type"])
                 .agg(
@@ -1375,6 +1222,8 @@ def main():
                 .reset_index()
             )
             st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    render_app_footer()
 
 
 if __name__ == "__main__":
