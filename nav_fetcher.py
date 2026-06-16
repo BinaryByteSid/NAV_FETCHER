@@ -280,16 +280,31 @@ def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id
         "mfid": 0,
         "reportDate": date_str
     }
-    try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=20)
-        if resp.status_code == 200:
-            res_data = resp.json()
-            if res_data.get("validationMsg") == "SUCCESS":
-                rows = res_data.get("data", [])
-                API_CACHE[key] = rows
-                return rows
-    except Exception as e:
-        pass
+    
+    import time
+    max_retries = 3
+    backoff = 1.0
+    
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=20)
+            if resp.status_code == 200:
+                res_data = resp.json()
+                if res_data.get("validationMsg") == "SUCCESS":
+                    rows = res_data.get("data", [])
+                    API_CACHE[key] = rows
+                    return rows
+                else:
+                    print(f"AMFI API Validation failed for {key}: {res_data.get('validationMsg')}")
+            else:
+                print(f"AMFI API returned HTTP code {resp.status_code} for {key}")
+        except Exception as e:
+            print(f"Attempt {attempt+1} failed for {key} with error: {e}")
+        
+        if attempt < max_retries - 1:
+            time.sleep(backoff)
+            backoff *= 2
+            
     API_CACHE[key] = []
     return []
 
@@ -383,14 +398,20 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
     
     # Fetch performance data for each group and build a lookup cache
     perf_lookup = {}
+    import time
     
-    for _, grp in unique_groups.iterrows():
+    for i, (_, grp) in enumerate(unique_groups.iterrows()):
         asset_class = grp["Asset Class"]
         date_str = grp["Date_Str_Temp"]
         if not asset_class or not date_str:
             continue
             
         m_id, c_id, s_id = map_section_to_ids(asset_class)
+        
+        # Rate-limiting sleep between calls to AMFI APIs
+        if i > 0:
+            time.sleep(0.5)
+            
         # Fetch from API
         perf_rows = fetch_performance_data_from_api(date_str, m_id, c_id, s_id)
         if perf_rows:
