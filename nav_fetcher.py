@@ -107,7 +107,6 @@ def calculate_aum_for_row(row, df_port: pd.DataFrame) -> float:
         base_aum = (seed % 35 + 15) * 1000 + (seed % 97) + 0.56
         month_offset = (2026 - year) * 12 + (4 - month)
         aum_multiplier = 1.0 - (month_offset * 0.012) + ((seed + month) % 5 - 2) * 0.002
-        aum_multiplier = max(0.05, aum_multiplier)
         aum_monthly = round(base_aum * aum_multiplier, 4)
         
     return aum_monthly
@@ -961,7 +960,7 @@ def main():
     st.markdown('<hr class="panel-divider">', unsafe_allow_html=True)
 
     default_end = datetime.today().date()
-    default_start = datetime(2000, 1, 1).date()
+    default_start = (datetime.today() - timedelta(days=7)).date()
 
     render_section_header("📅", "Date Range")
     col_a, col_b = st.columns(2)

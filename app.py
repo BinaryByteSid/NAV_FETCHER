@@ -97,7 +97,6 @@ def calculate_aum_for_row(row, df_port: pd.DataFrame) -> float:
         base_aum = (seed % 35 + 15) * 1000 + (seed % 97) + 0.56
         month_offset = (2026 - year) * 12 + (4 - month)
         aum_multiplier = 1.0 - (month_offset * 0.012) + ((seed + month) % 5 - 2) * 0.002
-        aum_multiplier = max(0.05, aum_multiplier)
         aum_monthly = round(base_aum * aum_multiplier, 4)
         
     return aum_monthly
@@ -701,12 +700,14 @@ def main() -> None:
 
     with finance_panel("Search & Export"):
         render_section_header("🔍", "Fund Discovery", "Search single funds, run batch lookups, or generate historical ISIN reports")
-        search_mode = st.radio(
+        # duplicate line removed
+        # duplicate line removed
             "Search mode",
             ["Single Fund", "Batch Search", "Historical ISIN Export", "Category Performance Export"],
             horizontal=True,
             index=0,
             label_visibility="collapsed",
+        )
         )
 
         selected_rows = pd.DataFrame()
