@@ -494,7 +494,7 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
             
             if pd.notna(nav_curr) and pd.notna(nav_prev) and nav_prev != 0:
                 daily_return = (nav_curr - nav_prev) / nav_prev
-                df.at[idx, "Daily return"] = daily_return
+                df.at[idx, "Daily return"] = daily_return * 100
             else:
                 daily_return = None
                 
@@ -888,7 +888,7 @@ def style_excel(df: pd.DataFrame, date_cols: List[str], is_aum_only: bool = Fals
                         cell.alignment = Alignment(horizontal="right", vertical="center")
                     elif col_name == "Daily return":
                         if cell.value is not None and cell.value != "":
-                            cell.number_format = "0.00%"
+                            cell.number_format = '0.00"%"'
                         else:
                             cell.value = "—"
                         cell.alignment = Alignment(horizontal="right", vertical="center")

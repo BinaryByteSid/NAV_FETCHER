@@ -473,7 +473,7 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
             
             if pd.notna(nav_curr) and pd.notna(nav_prev) and nav_prev != 0:
                 daily_return = (nav_curr - nav_prev) / nav_prev
-                df.at[idx, "Daily return"] = daily_return
+                df.at[idx, "Daily return"] = daily_return * 100
             else:
                 daily_return = None
                 
@@ -596,7 +596,7 @@ def generate_historical_excel(df_final: pd.DataFrame, target_dates: List[str], i
                         cell.alignment = Alignment(horizontal="center", vertical="center")
                 elif col_name == "Daily return":
                     if val is not None and val != "":
-                        cell.number_format = "0.00%"
+                        cell.number_format = '0.00"%"'
                     else:
                         cell.value = "-"
                         cell.alignment = Alignment(horizontal="center", vertical="center")
@@ -825,14 +825,12 @@ def main() -> None:
 
     with finance_panel("Search & Export"):
         render_section_header("🔍", "Fund Discovery", "Search single funds, run batch lookups, or generate historical ISIN reports")
-        # duplicate line removed
-        # duplicate line removed
+        search_mode = st.radio(
             "Search mode",
             ["Single Fund", "Batch Search", "Historical ISIN Export", "Category Performance Export"],
             horizontal=True,
             index=0,
             label_visibility="collapsed",
-        )
         )
 
         selected_rows = pd.DataFrame()
