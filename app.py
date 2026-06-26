@@ -360,7 +360,8 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame) -> pd.DataFrame
     
     # Initialize AUM with the fallback so every row already has a value.
     # Rows where the live API succeeds will get overwritten below.
-    df_res["AUM"] = df_res["Fallback_AUM"]
+    # Initialize AUM as NaN; we'll fill only where real API values are available.
+    df_res["AUM"] = pd.NA
     
     # 2. Try to fetch real AUM from the AMFI performance API for each unique (date, asset-class) pair.
     def get_date_str(dt):

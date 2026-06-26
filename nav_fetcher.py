@@ -1266,20 +1266,6 @@ def main():
             if date_col not in df_display.columns:
                 df_display[date_col] = None
                 
-        # Carry forward
-        if carry_forward and len(date_cols) > 1:
-            date_objs = sorted([datetime.strptime(d, "%d-%m-%Y") for d in date_cols])
-            sorted_cols = [d.strftime("%d-%m-%Y") for d in date_objs]
-            for i in range(1, len(sorted_cols)):
-                prev, curr = sorted_cols[i - 1], sorted_cols[i]
-                if want_nav and not want_aum:
-                    df_display[curr] = df_display[curr].fillna(df_display[prev])
-                elif want_aum and not want_nav:
-                    df_display[curr] = df_display[curr].fillna(df_display[prev])
-                else:
-                    df_display[f"{curr} (NAV)"] = df_display[f"{curr} (NAV)"].fillna(df_display[f"{prev} (NAV)"])
-                    df_display[f"{curr} (AUM)"] = df_display[f"{curr} (AUM)"].fillna(df_display[f"{prev} (AUM)"])
-                    
         # Fill any remaining NaNs in AUM columns with fallback values
         if want_aum:
             df_pivot_fallback = df_filtered.pivot_table(index="Scheme Code", columns="NAV_Date_Str", values="Fallback_AUM", aggfunc="first").reset_index()
@@ -1297,6 +1283,20 @@ def main():
                 for main_col, temp_col in fallback_cols_map.items():
                     if main_col in df_display.columns and temp_col in df_display_temp.columns:
                         df_display[main_col] = df_display[main_col].fillna(df_display_temp[temp_col])
+
+        # Carry forward
+        if carry_forward and len(date_cols) > 1:
+            date_objs = sorted([datetime.strptime(d, "%d-%m-%Y") for d in date_cols])
+            sorted_cols = [d.strftime("%d-%m-%Y") for d in date_objs]
+            for i in range(1, len(sorted_cols)):
+                prev, curr = sorted_cols[i - 1], sorted_cols[i]
+                if want_nav and not want_aum:
+                    df_display[curr] = df_display[curr].fillna(df_display[prev])
+                elif want_aum and not want_nav:
+                    df_display[curr] = df_display[curr].fillna(df_display[prev])
+                else:
+                    df_display[f"{curr} (NAV)"] = df_display[f"{curr} (NAV)"].fillna(df_display[f"{prev} (NAV)"])
+                    df_display[f"{curr} (AUM)"] = df_display[f"{curr} (AUM)"].fillna(df_display[f"{prev} (AUM)"])
                     
         df_display = df_display[meta_cols + display_date_cols].sort_values(["Asset Class", "Scheme Name"]).reset_index(drop=True)
 
