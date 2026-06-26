@@ -384,8 +384,12 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
     def get_date_str(dt):
         try:
             if isinstance(dt, pd.Timestamp) or hasattr(dt, "strftime"):
-                return dt.strftime("%d-%b-%Y")
-            parsed = pd.to_datetime(dt)
+                if pd.notna(dt):
+                    return dt.strftime("%d-%b-%Y")
+                return None
+            parsed = pd.to_datetime(dt, format="%d-%b-%Y", errors="coerce")
+            if pd.isna(parsed):
+                parsed = pd.to_datetime(dt, errors="coerce")
             if pd.notna(parsed):
                 return parsed.strftime("%d-%b-%Y")
         except Exception:
@@ -1193,7 +1197,10 @@ def main():
     else:
         df_filtered = df_raw
 
-    df_filtered["NAV Date"] = pd.to_datetime(df_filtered["NAV Date"], errors="coerce")
+    parsed_dates = pd.to_datetime(df_filtered["NAV Date"], format="%d-%b-%Y", errors="coerce")
+    if parsed_dates.isna().all():
+        parsed_dates = pd.to_datetime(df_filtered["NAV Date"], errors="coerce")
+    df_filtered["NAV Date"] = parsed_dates
 
     # ── Build AUM data using Performance API with Excel portfolio fallback ────
     df_port = load_portfolio_aum_data()

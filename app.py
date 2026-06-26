@@ -367,8 +367,12 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame) -> pd.DataFrame
     def get_date_str(dt):
         try:
             if isinstance(dt, pd.Timestamp) or hasattr(dt, "strftime"):
-                return dt.strftime("%d-%b-%Y")
-            parsed = pd.to_datetime(dt)
+                if pd.notna(dt):
+                    return dt.strftime("%d-%b-%Y")
+                return None
+            parsed = pd.to_datetime(dt, format="%d-%b-%Y", errors="coerce")
+            if pd.isna(parsed):
+                parsed = pd.to_datetime(dt, errors="coerce")
             if pd.notna(parsed):
                 return parsed.strftime("%d-%b-%Y")
         except Exception:
