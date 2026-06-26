@@ -342,8 +342,8 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame) -> pd.DataFrame
     if df.empty:
         return df.copy()
         
-    # 1. First, calculate the fallback AUM for all rows using the old method.
-    # We do this so that we always have a default value.
+    # 1. Calculate the fallback AUM (NAV-scaled monthly AUM) for every row.
+    # This ensures we always have a meaningful, date-varying AUM estimate.
     raw_rows = []
     for idx, r_dict in df.iterrows():
         r_copy = r_dict.copy()
@@ -352,14 +352,17 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame) -> pd.DataFrame
         raw_rows.append(r_copy)
     df_res = pd.DataFrame(raw_rows)
     
+    # Scale the monthly AUM by each day's NAV relative to the scheme mean NAV
+    # so that AUM varies day-to-day proportional to NAV movement.
     mean_navs = df_res.groupby("Scheme Code")["NAV"].transform("mean")
     mean_navs = mean_navs.fillna(1.0).replace(0.0, 1.0)
     df_res["Fallback_AUM"] = (df_res["Monthly_AUM"] * (df_res["NAV"] / mean_navs)).round(4)
     
-    # Initialize AUM with None to allow carry-forward for missing dates
-    df_res["AUM"] = None
+    # Initialize AUM with the fallback so every row already has a value.
+    # Rows where the live API succeeds will get overwritten below.
+    df_res["AUM"] = df_res["Fallback_AUM"]
     
-    # 2. Now, try to fetch the actual AUM from the performance API for each row.
+    # 2. Try to fetch real AUM from the AMFI performance API for each unique (date, asset-class) pair.
     def get_date_str(dt):
         try:
             if isinstance(dt, pd.Timestamp) or hasattr(dt, "strftime"):
@@ -374,10 +377,9 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame) -> pd.DataFrame
     date_col = "NAV Date" if "NAV Date" in df_res.columns else "Date"
     df_res["Date_Str_Temp"] = df_res[date_col].apply(get_date_str)
     
-    # Group unique combinations of (Asset Class, Date_Str_Temp)
+    # Only fetch for unique (asset_class, date) combinations to minimise API calls.
     unique_groups = df_res[["Asset Class", "Date_Str_Temp"]].drop_duplicates()
     
-    # Fetch performance data for each group and build a lookup cache
     perf_lookup = {}
     import time
     
@@ -389,16 +391,14 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame) -> pd.DataFrame
             
         m_id, c_id, s_id = map_section_to_ids(asset_class)
         
-        # Rate-limiting sleep between calls to AMFI APIs
         if i > 0:
-            time.sleep(0.5)
+            time.sleep(0.5)  # rate-limit
             
-        # Fetch from API
         perf_rows = fetch_performance_data_from_api(date_str, m_id, c_id, s_id)
         if perf_rows:
             perf_lookup[(date_str, asset_class)] = perf_rows
             
-    # Now, try to match each row to the fetched performance rows
+    # Overwrite AUM with real API values where a match is found.
     for idx, row in df_res.iterrows():
         asset_class = row["Asset Class"]
         date_str = row["Date_Str_Temp"]
@@ -414,7 +414,6 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame) -> pd.DataFrame
                 except Exception:
                     pass
                     
-    # Drop temporary column
     df_res = df_res.drop(columns=["Date_Str_Temp"])
     return df_res
 
@@ -1152,21 +1151,25 @@ def main() -> None:
                                     axis=1)
                                 df_raw = populate_actual_aum(df_raw, df_port)
                                 if not df_raw.empty:
-                                    # Parse dates
+                                    # Parse dates robustly
                                     parsed_dates = pd.to_datetime(df_raw["Date"], format="%d-%b-%Y", errors="coerce")
                                     if parsed_dates.isna().all():
                                         parsed_dates = pd.to_datetime(df_raw["Date"], errors="coerce")
+                                    df_raw["Date_parsed"] = parsed_dates
                                     df_raw["Date"] = parsed_dates.dt.strftime("%d-%m-%Y")
-                                    # Compute daily return % and flows
-                                    df_raw.sort_values(["Scheme Code", "Date"], inplace=True)
+                                    # Sort by scheme + parsed date so shift() gives the correct previous trading day
+                                    df_raw = df_raw.sort_values(["Scheme Code", "Date_parsed"]).reset_index(drop=True)
+                                    # Compute daily return %: only where NAV actually changed between real trading days
                                     df_raw["Prev NAV"] = df_raw.groupby("Scheme Code")["NAV"].shift(1)
-                                    df_raw["Daily Return %"] = df_raw.apply(
-                                        lambda r: ((r["NAV"] - r["Prev NAV"]) / r["Prev NAV"] * 100) if r["Prev NAV"] and r["Prev NAV"] != 0 else None,
-                                        axis=1)
-                                    df_raw["Flows"] = df_raw.apply(
-                                        lambda r: (r["Daily Return %"] * r["AUM"] / 100) if (r["Daily Return %"] is not None and pd.notnull(r.get("AUM"))) else None,
-                                        axis=1)
-                                    df_raw.drop(columns=["Prev NAV"], inplace=True)
+                                    df_raw["Daily Return %"] = (
+                                        (df_raw["NAV"] - df_raw["Prev NAV"]) / df_raw["Prev NAV"] * 100
+                                    ).where(df_raw["Prev NAV"].notna() & (df_raw["Prev NAV"] != 0))
+                                    # Flows = Daily Return % * previous-day AUM / 100
+                                    df_raw["Prev AUM"] = df_raw.groupby("Scheme Code")["AUM"].shift(1)
+                                    df_raw["Flows"] = (
+                                        df_raw["Daily Return %"] / 100 * df_raw["Prev AUM"]
+                                    ).where(df_raw["Daily Return %"].notna() & df_raw["Prev AUM"].notna())
+                                    df_raw.drop(columns=["Prev NAV", "Prev AUM", "Date_parsed"], inplace=True)
                             
                                 all_dates = pd.date_range(start=fetch_start_date, end=end_date)
                             
@@ -1233,13 +1236,15 @@ def main() -> None:
                                         curr_col = sorted_date_cols[i]
                                     
                                         if want_nav and not want_aum:
+                                            # Only carry-forward NAV (holidays/weekends have no new NAV)
                                             df_final[curr_col] = df_final[curr_col].fillna(df_final[prev_col])
                                         elif want_aum and not want_nav:
-                                            df_final[curr_col] = df_final[curr_col].fillna(df_final[prev_col])
+                                            # AUM: do NOT carry forward — each date gets its own Fallback_AUM
+                                            pass
                                         else:
+                                            # Carry forward NAV only; AUM is already populated per-day via Fallback_AUM
                                             df_final[f"{curr_col} (NAV)"] = df_final[f"{curr_col} (NAV)"].fillna(df_final[f"{prev_col} (NAV)"])
-                                            df_final[f"{curr_col} (AUM)"] = df_final[f"{curr_col} (AUM)"].fillna(df_final[f"{prev_col} (AUM)"])
-                                            df_final[f"{curr_col} (Flows)"] = df_final[f"{curr_col} (Flows)"].fillna(df_final[f"{prev_col} (Flows)"])
+                                            # Do NOT carry forward AUM or Flows — they vary per day
                                         
                                 # Fill any remaining NaNs in AUM columns with fallback values
                                 if want_aum:
