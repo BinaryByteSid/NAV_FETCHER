@@ -238,8 +238,10 @@ def clean_name(name: str) -> str:
     n = n.replace("midcap", "mid cap")
     n = n.replace("smallcap", "small cap")
     n = n.replace("largecap", "large cap")
+    n = n.replace("focussed", "focused")
     
     n = n.replace("-", " ").replace("/", " ").replace("(", " ").replace(")", " ")
+    n = n.replace(" sl ", " sun life ")
     tokens = n.split()
     suffixes_to_remove = {
         "direct", "regular", "retail", "plan", "growth", "option", "idcw", "dividend", 

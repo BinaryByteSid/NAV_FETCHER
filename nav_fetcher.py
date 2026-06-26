@@ -248,8 +248,10 @@ def clean_name(name: str) -> str:
     n = n.replace("midcap", "mid cap")
     n = n.replace("smallcap", "small cap")
     n = n.replace("largecap", "large cap")
+    n = n.replace("focussed", "focused")
     
     n = n.replace("-", " ").replace("/", " ").replace("(", " ").replace(")", " ")
+    n = n.replace(" sl ", " sun life ")
     tokens = n.split()
     suffixes_to_remove = {
         "direct", "regular", "retail", "plan", "growth", "option", "idcw", "dividend", 
@@ -1126,7 +1128,9 @@ def main():
 
     fetch_live_aum = False
     if want_aum or want_flows:
-        fetch_live_aum = st.checkbox("Fetch live daily AUM (slower)", value=False)
+        fetch_live_aum = st.checkbox("Fetch live daily AUM (slower)", value=True)
+        if want_flows:
+            fetch_live_aum = True
 
     fetch_btn = st.button("Fetch data", type="primary", use_container_width=True)
 
@@ -1157,6 +1161,7 @@ def main():
         want_nav = True
         want_aum = True
         pivot_dates = True
+        fetch_live_aum = True
 
     frmdt_str = start_date.strftime("%d-%b-%Y")
     todt_str = end_date.strftime("%d-%b-%Y")
