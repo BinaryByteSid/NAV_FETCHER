@@ -1350,7 +1350,17 @@ def main():
         is_aum_only = False
 
     render_section_header("👁️", "Data Preview")
-    st.dataframe(df_display, use_container_width=True, hide_index=True)
+    st.dataframe(
+        df_display,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Daily return": st.column_config.NumberColumn(
+                "Daily return",
+                format="%.2f%%"
+            )
+        }
+    )
 
     render_section_header("📥", "Export")
     with st.spinner("Generating styled Excel…"):

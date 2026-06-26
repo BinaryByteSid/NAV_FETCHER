@@ -1286,7 +1286,16 @@ def main() -> None:
                                 st.success(f"Successfully processed {len(df_final)} vertical records!")
                             
                                 render_section_header("👁️", "Data Preview")
-                                st.dataframe(df_final, use_container_width=True)
+                                st.dataframe(
+                                    df_final,
+                                    use_container_width=True,
+                                    column_config={
+                                        "Daily return": st.column_config.NumberColumn(
+                                            "Daily return",
+                                            format="%.2f%%"
+                                        )
+                                    }
+                                )
                             
                                 excel_bytes = generate_historical_excel(df_final, [], is_aum_only=is_aum_only)
                             
