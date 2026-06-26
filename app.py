@@ -13,6 +13,51 @@ from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
 
+# ─── Robust date parsing (locale-independent) ────────────────────────────────
+
+_MONTH_ABBR = {
+    "jan": "01", "feb": "02", "mar": "03", "apr": "04",
+    "may": "05", "jun": "06", "jul": "07", "aug": "08",
+    "sep": "09", "oct": "10", "nov": "11", "dec": "12",
+}
+
+
+def _parse_amfi_date_str(date_str: str) -> str | None:
+    """Convert a single AMFI date string like '01-Jun-2026' → '2026-06-01' (ISO)."""
+    if not isinstance(date_str, str) or not date_str.strip():
+        return None
+    parts = date_str.strip().split("-")
+    if len(parts) == 3:
+        day, month_abbr, year = parts
+        month_num = _MONTH_ABBR.get(month_abbr.lower()[:3])
+        if month_num and day.isdigit() and year.isdigit():
+            return f"{year}-{month_num}-{day.zfill(2)}"
+    return None
+
+
+def parse_amfi_date_series(series: pd.Series) -> pd.Series:
+    """Parse a Series of AMFI date strings ('dd-Mon-YYYY' or 'dd-mm-YYYY') to datetime.
+
+    Uses a manual month-abbreviation lookup so it works identically on all
+    locales / pandas versions (including Streamlit Cloud).
+    """
+    result = pd.to_datetime(series, format="%d-%b-%Y", errors="coerce")
+    if not result.isna().all():
+        mask = result.isna() & series.notna()
+        if mask.any():
+            iso_strs = series[mask].apply(_parse_amfi_date_str)
+            result[mask] = pd.to_datetime(iso_strs, errors="coerce")
+        return result
+    result = pd.to_datetime(series, format="%d-%m-%Y", errors="coerce")
+    if not result.isna().all():
+        return result
+    iso_strs = series.apply(_parse_amfi_date_str)
+    result = pd.to_datetime(iso_strs, errors="coerce")
+    if not result.isna().all():
+        return result
+    return pd.to_datetime(series, errors="coerce")
+
+
 def get_fund_seed(name: str) -> int:
     hash_val = 0
     for char in name:
@@ -451,9 +496,7 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
     if "NAV Date" not in df.columns:
         df["NAV Date"] = None
         
-    df["NAV Date_parsed"] = pd.to_datetime(df["NAV Date"], format="%d-%m-%Y", errors="coerce")
-    if df["NAV Date_parsed"].isna().all():
-        df["NAV Date_parsed"] = pd.to_datetime(df["NAV Date"], errors="coerce")
+    df["NAV Date_parsed"] = parse_amfi_date_series(df["NAV Date"])
         
     df = df.sort_values(by=["Scheme Code", "NAV Date_parsed"]).reset_index(drop=True)
     
@@ -510,9 +553,7 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
     ]
     
     if "NAV Date" in df.columns:
-        parsed = pd.to_datetime(df["NAV Date"], format="%d-%m-%Y", errors="coerce")
-        if parsed.isna().all():
-            parsed = pd.to_datetime(df["NAV Date"], errors="coerce")
+        parsed = parse_amfi_date_series(df["NAV Date"])
         df["NAV Date"] = parsed.dt.strftime("%d-%m-%Y")
         
     final_cols = list(meta_cols) + flow_cols
@@ -520,9 +561,7 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
         if col not in df.columns:
             df[col] = None
             
-    df["NAV Date_parsed"] = pd.to_datetime(df["NAV Date"], format="%d-%m-%Y", errors="coerce")
-    if df["NAV Date_parsed"].isna().all():
-        df["NAV Date_parsed"] = pd.to_datetime(df["NAV Date"], errors="coerce")
+    df["NAV Date_parsed"] = parse_amfi_date_series(df["NAV Date"])
     df = df.sort_values(by=["Asset Class", "Scheme Name", "NAV Date_parsed"]).reset_index(drop=True)
     df = df.drop(columns=["NAV Date_parsed"])
     
@@ -652,6 +691,7 @@ from amfi_nav import (
     classify_plan_type,
     classify_option_type,
 )
+from nav_fetcher import parse_bucket_input, run_portfolio_simulation, style_portfolio_excel
 from ui_theme import (
     finance_panel,
     inject_custom_css,
@@ -833,7 +873,7 @@ def main() -> None:
         render_section_header("🔍", "Fund Discovery", "Search single funds, run batch lookups, or generate historical ISIN reports")
         search_mode = st.radio(
             "Search mode",
-            ["Single Fund", "Batch Search", "Historical ISIN Export", "Category Performance Export"],
+            ["Single Fund", "Batch Search", "Historical ISIN Export", "Category Performance Export", "Portfolio Bucket Simulator"],
             horizontal=True,
             index=0,
             label_visibility="collapsed",
@@ -996,7 +1036,208 @@ def main() -> None:
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True,
                         )
-        else:
+        elif search_mode == "Portfolio Bucket Simulator":
+            st.markdown('<hr class="panel-divider">', unsafe_allow_html=True)
+            
+            # 1. Initialize session state buckets if they don't exist
+            if "portfolio_buckets" not in st.session_state:
+                # Prepopulate with a default balanced portfolio
+                default_df = pd.DataFrame([
+                    {"Scheme Name": "Quant Large Cap Fund-Reg(G)", "ISIN": "INF966L01AW4", "Weight (%)": 10.0},
+                    {"Scheme Name": "DSP Equity Opportunities Fund-Reg(G)", "ISIN": "INF740K01094", "Weight (%)": 9.0},
+                    {"Scheme Name": "SBI Large & Midcap Fund-Reg(G)", "ISIN": "INF200K01305", "Weight (%)": 6.0},
+                    {"Scheme Name": "HDFC Flexi Cap Fund(G)", "ISIN": "INF179K01608", "Weight (%)": 9.0},
+                    {"Scheme Name": "ICICI Pru Focused Equity Fund(G)", "ISIN": "INF109K01BZ4", "Weight (%)": 7.0},
+                    {"Scheme Name": "ICICI Pru Dividend Yield Equity Fund(G)", "ISIN": "INF109KA1TX4", "Weight (%)": 7.0},
+                    {"Scheme Name": "Canara Rob Multi Cap Fund-Reg(G)", "ISIN": "INF760K01KR2", "Weight (%)": 7.0},
+                    {"Scheme Name": "Kotak Multicap Fund-Reg(G)", "ISIN": "INF174KA1HS9", "Weight (%)": 7.0},
+                    {"Scheme Name": "Bandhan Large & Mid Cap Fund-Reg(G)", "ISIN": "INF194K01524", "Weight (%)": 7.0},
+                    {"Scheme Name": "Invesco India Focused Fund-Reg(G)", "ISIN": "INF205KA1189", "Weight (%)": 7.0},
+                    {"Scheme Name": "Kotak Emerging Equity Fund(G)", "ISIN": "INF174K01DS9", "Weight (%)": 6.0},
+                    {"Scheme Name": "SBI Infrastructure Fund-Reg(G)", "ISIN": "INF200K01CT2", "Weight (%)": 6.0},
+                    {"Scheme Name": "Invesco India Smallcap Fund-Reg(G)", "ISIN": "INF205K011T7", "Weight (%)": 7.0},
+                    {"Scheme Name": "HDFC Small Cap Fund-Reg(G)", "ISIN": "INF179KA1RZ8", "Weight (%)": 5.0},
+                ])
+                st.session_state["portfolio_buckets"] = {"Default Balanced Portfolio": default_df}
+                st.session_state["active_bucket_name"] = "Default Balanced Portfolio"
+
+            # Bucket selection & management controls
+            render_section_header("📁", "Bucket Management", "Create, rename, or switch between saved fund buckets")
+            col_m1, col_m2 = st.columns(2)
+            with col_m1:
+                bucket_options = list(st.session_state["portfolio_buckets"].keys())
+                active_bucket = st.selectbox(
+                    "Select Active Bucket", 
+                    bucket_options, 
+                    index=bucket_options.index(st.session_state["active_bucket_name"])
+                )
+                st.session_state["active_bucket_name"] = active_bucket
+                
+            with col_m2:
+                new_bucket_name = st.text_input("New Bucket Name", placeholder="e.g. My Conservative Portfolio")
+                c_add, c_del = st.columns(2)
+                with c_add:
+                    if st.button("Create New Bucket", use_container_width=True):
+                        if new_bucket_name.strip() and new_bucket_name not in st.session_state["portfolio_buckets"]:
+                            curr_df = st.session_state["portfolio_buckets"][st.session_state["active_bucket_name"]].copy()
+                            st.session_state["portfolio_buckets"][new_bucket_name] = curr_df
+                            st.session_state["active_bucket_name"] = new_bucket_name
+                            st.rerun()
+                with c_del:
+                    if st.button("Delete Active Bucket", use_container_width=True, type="secondary"):
+                        if len(st.session_state["portfolio_buckets"]) > 1:
+                            del st.session_state["portfolio_buckets"][st.session_state["active_bucket_name"]]
+                            st.session_state["active_bucket_name"] = list(st.session_state["portfolio_buckets"].keys())[0]
+                            st.rerun()
+                        else:
+                            st.warning("Cannot delete the last remaining bucket.")
+
+            st.markdown('<hr class="panel-divider">', unsafe_allow_html=True)
+            
+            # 2. Date Range
+            render_section_header("📅", "Simulation Date Range")
+            default_end = datetime.today().date()
+            default_start = (datetime.today() - timedelta(days=90)).date()
+            col_a, col_b = st.columns(2)
+            with col_a:
+                start_date = st.date_input("Start Date", value=default_start)
+            with col_b:
+                end_date = st.date_input("End Date", value=default_end)
+                
+            # 3. Parameters
+            render_section_header("🎛️", "Simulation Parameters")
+            col_p1, col_p2 = st.columns(2)
+            with col_p1:
+                initial_amount = st.number_input("Initial Investment Amount (₹)", value=100000.0, min_value=100.0, step=1000.0)
+            with col_p2:
+                skip_sunday = st.checkbox("Skip Sundays in tracking", value=True)
+
+            st.markdown('<hr class="panel-divider">', unsafe_allow_html=True)
+            
+            # 4. Bucket Composition Editor
+            render_section_header("📋", "Bucket Composition", f"Edit mutual fund weights or copy-paste directly from Excel for '{st.session_state['active_bucket_name']}'")
+            
+            uploaded_file = st.file_uploader("Upload Bucket composition (Excel/CSV with ISIN and Weights)", type=["xlsx", "xls", "csv"])
+            
+            current_bucket_df = st.session_state["portfolio_buckets"][st.session_state["active_bucket_name"]]
+            if uploaded_file is not None:
+                parsed_df = parse_bucket_input(uploaded_file=uploaded_file)
+                if not parsed_df.empty:
+                    st.session_state["portfolio_buckets"][st.session_state["active_bucket_name"]] = parsed_df
+                    current_bucket_df = parsed_df
+                    st.success("Successfully loaded bucket from file!")
+                    
+            edited_df = st.data_editor(
+                current_bucket_df,
+                column_config={
+                    "Scheme Name": st.column_config.TextColumn("Scheme Name", width="large", help="Optional name for display"),
+                    "ISIN": st.column_config.TextColumn("ISIN", required=True, help="Mutual Fund ISIN (Growth or Reinvestment)"),
+                    "Weight (%)": st.column_config.NumberColumn("Weight (%)", min_value=0.0, max_value=100.0, format="%.2f%%", required=True, help="Percentage weight in portfolio")
+                },
+                num_rows="dynamic",
+                use_container_width=True
+            )
+            
+            if edited_df is not None:
+                st.session_state["portfolio_buckets"][st.session_state["active_bucket_name"]] = edited_df
+                
+            weight_sum = edited_df["Weight (%)"].sum() if not edited_df.empty else 0
+            if weight_sum != 100.0:
+                st.info(f"⚖️ Current weights sum to **{weight_sum:.2f}%**. Weights will be automatically normalized to 100% for the backtest calculation.")
+            else:
+                st.success("⚖️ Weights sum to exactly **100%**!")
+
+            st.markdown('<hr class="panel-divider">', unsafe_allow_html=True)
+            
+            run_btn = st.button("Run Portfolio Simulation", type="primary", use_container_width=True)
+            
+            if run_btn:
+                if start_date > end_date:
+                    st.error("Start Date must be before or equal to End Date.")
+                else:
+                    with st.spinner("Running historical backtest simulation…"):
+                        res, err = run_portfolio_simulation(
+                            edited_df,
+                            start_date,
+                            end_date,
+                            initial_amount,
+                            skip_sunday
+                        )
+                        
+                        if err:
+                            st.error(err)
+                        else:
+                            render_section_header("📊", "Performance Summary")
+                            met = res["metrics"]
+                            
+                            gain_sign = "+" if met["Gain/Loss"] >= 0 else ""
+                            ret_sign = "+" if met["Absolute Return (%)"] >= 0 else ""
+                            
+                            st.markdown(
+                                f"""
+                                <div class="metrics-grid">
+                                    <div class="metric-card">
+                                        <span class="metric-label">Initial Capital</span>
+                                        <span class="metric-value">₹{met['Initial Value']:,.2f}</span>
+                                    </div>
+                                    <div class="metric-card">
+                                        <span class="metric-label">Ending Value</span>
+                                        <span class="metric-value">₹{met['Final Value']:,.2f}</span>
+                                    </div>
+                                    <div class="metric-card">
+                                        <span class="metric-label">Gain / Loss</span>
+                                        <span class="metric-value accent">{gain_sign}₹{met['Gain/Loss']:,.2f} ({ret_sign}{met['Absolute Return (%)']:.2f}%)</span>
+                                    </div>
+                                    <div class="metric-card">
+                                        <span class="metric-label">Max Drawdown</span>
+                                        <span class="metric-value" style="color: #ff4b4b;">{met['Max Drawdown (%)']:.2f}%</span>
+                                    </div>
+                                </div>
+                                """,
+                                unsafe_allow_html=True
+                            )
+                            
+                            st.markdown(
+                                f"""
+                                <div class="stat-row" style="margin-top: 15px;">
+                                    <span class="stat-chip">📈 Best Day: {met['Best Day Return (%)']:.2f}%</span>
+                                    <span class="stat-chip">📉 Worst Day: {met['Worst Day Return (%)']:.2f}%</span>
+                                </div>
+                                """,
+                                unsafe_allow_html=True
+                            )
+                            
+                            render_section_header("📈", "Portfolio Value Over Time")
+                            chart_df = res["tracker"].copy()
+                            chart_df["Date_dt"] = pd.to_datetime(chart_df["Date"], format="%d-%m-%Y")
+                            chart_df = chart_df.set_index("Date_dt")
+                            
+                            st.line_chart(chart_df["Total Portfolio Value (₹)"])
+                            
+                            render_section_header("👁️", "Daily Valuation Tracker")
+                            df_disp = res["tracker"].copy()
+                            st.dataframe(
+                                df_disp,
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "Daily Return (%)": st.column_config.NumberColumn("Daily Return (%)", format="%.2f%%"),
+                                    "Cumulative Return (%)": st.column_config.NumberColumn("Cumulative Return (%)", format="%.2f%%")
+                                }
+                            )
+                            
+                            render_section_header("📥", "Export Portfolio Report")
+                            with st.spinner("Generating Excel report…"):
+                                excel_bytes = style_portfolio_excel(res)
+                                
+                            st.download_button(
+                                label="Download Portfolio Report (.xlsx)",
+                                data=excel_bytes,
+                                file_name=f"portfolio_report_{st.session_state['active_bucket_name']}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                use_container_width=True
+                            )
+        elif search_mode == "Historical ISIN Export":
             render_section_header("📋", "Historical ISIN Export", "Pivoted NAV/AUM reports with corporate Excel styling")
             render_info_card(
                 "<strong>Historical NAV Extractor:</strong> Specify a date range and target ISINs to generate "
@@ -1156,10 +1397,8 @@ def main() -> None:
                                     axis=1)
                                 df_raw = populate_actual_aum(df_raw, df_port)
                                 if not df_raw.empty:
-                                    # Parse dates robustly
-                                    parsed_dates = pd.to_datetime(df_raw["Date"], format="%d-%b-%Y", errors="coerce")
-                                    if parsed_dates.isna().all():
-                                        parsed_dates = pd.to_datetime(df_raw["Date"], errors="coerce")
+                                    # Parse dates robustly (locale-independent)
+                                    parsed_dates = parse_amfi_date_series(df_raw["Date"])
                                     df_raw["Date_parsed"] = parsed_dates
                                     df_raw["Date"] = parsed_dates.dt.strftime("%d-%m-%Y")
                                     # Sort by scheme + parsed date so shift() gives the correct previous trading day
@@ -1313,14 +1552,10 @@ def main() -> None:
                                 if vertical_rows:
                                     df_final = pd.DataFrame(vertical_rows)
                                     if "NAV Date" in df_final.columns:
-                                        parsed = pd.to_datetime(df_final["NAV Date"], format="%d-%m-%Y", errors="coerce")
-                                        if parsed.isna().all():
-                                            parsed = pd.to_datetime(df_final["NAV Date"], errors="coerce")
+                                        parsed = parse_amfi_date_series(df_final["NAV Date"])
                                         df_final["NAV Date"] = parsed.dt.strftime("%d-%m-%Y")
                                     if "AUM Date" in df_final.columns:
-                                        parsed = pd.to_datetime(df_final["AUM Date"], format="%d-%m-%Y", errors="coerce")
-                                        if parsed.isna().all():
-                                            parsed = pd.to_datetime(df_final["AUM Date"], errors="coerce")
+                                        parsed = parse_amfi_date_series(df_final["AUM Date"])
                                         df_final["AUM Date"] = parsed.dt.strftime("%d-%m-%Y")
                                     df_final = df_final[ordered_cols]
                                     df_final = df_final.sort_values(by=["Asset Class", "Scheme Name"]).reset_index(drop=True)
