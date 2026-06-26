@@ -438,6 +438,106 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
     return df_res
 
 
+def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list) -> pd.DataFrame:
+    """Calculate the flows format columns for a vertical Mutual Fund DataFrame."""
+    df = df.copy()
+    
+    # Standardize columns
+    if "NAV" not in df.columns and "NAVs" in df.columns:
+        df = df.rename(columns={"NAVs": "NAV"})
+    if "NAV" not in df.columns:
+        df["NAV"] = None
+    if "AUM" not in df.columns:
+        df["AUM"] = None
+        
+    df["NAV"] = pd.to_numeric(df["NAV"], errors="coerce")
+    df["AUM"] = pd.to_numeric(df["AUM"], errors="coerce")
+    
+    # Standardize date column to 'NAV Date'
+    date_col = None
+    for c in ["NAV Date", "AUM Date", "Date"]:
+        if c in df.columns:
+            date_col = c
+            break
+            
+    if date_col and date_col != "NAV Date":
+        df = df.rename(columns={date_col: "NAV Date"})
+        
+    if "NAV Date" not in df.columns:
+        df["NAV Date"] = None
+        
+    df["NAV Date_parsed"] = pd.to_datetime(df["NAV Date"], format="%d-%m-%Y", errors="coerce")
+    if df["NAV Date_parsed"].isna().all():
+        df["NAV Date_parsed"] = pd.to_datetime(df["NAV Date"], errors="coerce")
+        
+    df = df.sort_values(by=["Scheme Code", "NAV Date_parsed"]).reset_index(drop=True)
+    
+    df["Closing AUM as on previous day"] = None
+    df["Actual AUM as on current date"] = df["AUM"]
+    df["Daily return"] = None
+    df["Derived AUM as on curent day"] = None
+    df["Net flows on current day"] = None
+    
+    for scheme_code, group in df.groupby("Scheme Code"):
+        indices = group.index
+        for idx_in_group, idx in enumerate(indices):
+            if idx_in_group == 0:
+                continue
+            prev_idx = indices[idx_in_group - 1]
+            
+            nav_curr = df.at[idx, "NAV"]
+            nav_prev = df.at[prev_idx, "NAV"]
+            aum_prev = df.at[prev_idx, "AUM"]
+            aum_curr = df.at[idx, "AUM"]
+            
+            df.at[idx, "Closing AUM as on previous day"] = aum_prev
+            
+            if pd.notna(nav_curr) and pd.notna(nav_prev) and nav_prev != 0:
+                daily_return = (nav_curr - nav_prev) / nav_prev
+                df.at[idx, "Daily return"] = daily_return
+            else:
+                daily_return = None
+                
+            if pd.notna(aum_prev) and daily_return is not None:
+                derived_aum = aum_prev * (1 + daily_return)
+                df.at[idx, "Derived AUM as on curent day"] = derived_aum
+            else:
+                derived_aum = None
+                
+            if pd.notna(aum_curr) and derived_aum is not None:
+                df.at[idx, "Net flows on current day"] = aum_curr - derived_aum
+                
+    # Filter only target dates
+    start_date_ts = pd.to_datetime(start_date)
+    df = df[df["NAV Date_parsed"] >= start_date_ts].reset_index(drop=True)
+    df = df.drop(columns=["NAV Date_parsed"])
+    
+    df = df.rename(columns={"NAV": "NAVs"})
+    
+    flow_cols = [
+        "NAV Date",
+        "NAVs",
+        "Closing AUM as on previous day",
+        "Actual AUM as on current date",
+        "Daily return",
+        "Derived AUM as on curent day",
+        "Net flows on current day"
+    ]
+    
+    if "NAV Date" in df.columns:
+        parsed = pd.to_datetime(df["NAV Date"], format="%d-%m-%Y", errors="coerce")
+        if parsed.isna().all():
+            parsed = pd.to_datetime(df["NAV Date"], errors="coerce")
+        df["NAV Date"] = parsed.dt.strftime("%d-%m-%Y")
+        
+    final_cols = list(meta_cols) + flow_cols
+    for col in final_cols:
+        if col not in df.columns:
+            df[col] = None
+            
+    return df[final_cols].sort_values(by=["Asset Class", "Scheme Name", "NAV Date"]).reset_index(drop=True)
+
+
 # ─── Project helpers ─────────────────────────────────────────────────────────
 sys.path.append(str(Path(__file__).parent))
 from amfi_nav import classify_option_type, classify_plan_type
@@ -774,13 +874,25 @@ def style_excel(df: pd.DataFrame, date_cols: List[str], is_aum_only: bool = Fals
                         if cell.value is None or cell.value == "":
                             cell.value = "—"
                         cell.alignment = Alignment(horizontal="center", vertical="center")
-                    elif col_name == "NAV":
+                    elif col_name in ("NAV", "NAVs"):
                         if cell.value is not None and cell.value != "":
-                            cell.number_format = "0.0000"
+                            cell.number_format = "0.00" if col_name == "NAVs" else "0.0000"
                         else:
                             cell.value = "—"
                         cell.alignment = Alignment(horizontal="right", vertical="center")
-                    elif col_name == "AUM":
+                    elif col_name == "Daily return":
+                        if cell.value is not None and cell.value != "":
+                            cell.number_format = "0.00%"
+                        else:
+                            cell.value = "—"
+                        cell.alignment = Alignment(horizontal="right", vertical="center")
+                    elif col_name in (
+                        "Closing AUM as on previous day", 
+                        "Actual AUM as on current date", 
+                        "Derived AUM as on curent day", 
+                        "Net flows on current day",
+                        "AUM"
+                    ):
                         if cell.value is not None and cell.value != "":
                             cell.number_format = "0.00"
                         else:
@@ -998,14 +1110,17 @@ def main():
     with c3:
         pivot_dates = st.checkbox("Pivot: one column per date", value=True)
 
-    col_c1, col_c2 = st.columns(2)
+    col_c1, col_c2, col_c3 = st.columns(3)
     with col_c1:
         want_nav = st.checkbox("Want NAV", value=True)
     with col_c2:
         want_aum = st.checkbox("Want AUM", value=True)
-        fetch_live_aum = False
-        if want_aum:
-            fetch_live_aum = st.checkbox("Fetch live daily AUM (slower)", value=False)
+    with col_c3:
+        want_flows = st.checkbox("Want Flows", value=False)
+
+    fetch_live_aum = False
+    if want_aum or want_flows:
+        fetch_live_aum = st.checkbox("Fetch live daily AUM (slower)", value=False)
 
     fetch_btn = st.button("Fetch data", type="primary", use_container_width=True)
 
@@ -1014,8 +1129,8 @@ def main():
         return
 
     # ── Validation ────────────────────────────────────────────────────────────
-    if not want_nav and not want_aum:
-        st.error("Please select at least one data type (NAV or AUM) to export.")
+    if not want_nav and not want_aum and not want_flows:
+        st.error("Please select at least one data type (NAV, AUM, or Flows) to export.")
         return
     if start_date > end_date:
         st.error("Start Date must be before or equal to End Date.")
@@ -1032,12 +1147,21 @@ def main():
         )
         return
 
+    if want_flows:
+        want_nav = True
+        want_aum = True
+        pivot_dates = True
+
     frmdt_str = start_date.strftime("%d-%b-%Y")
     todt_str = end_date.strftime("%d-%b-%Y")
 
-    with st.spinner(f"Contacting AMFI India for {frmdt_str} → {todt_str} …"):
+    fetch_start_date = start_date
+    if want_flows:
+        fetch_start_date = start_date - timedelta(days=10)
+
+    with st.spinner(f"Contacting AMFI India for {fetch_start_date.strftime('%d-%b-%Y')} → {todt_str} …"):
         try:
-            df_raw = fetch_amfi_data_chunked(start_date, end_date, isin_list if isin_mode else None)
+            df_raw = fetch_amfi_data_chunked(fetch_start_date, end_date, isin_list if isin_mode else None)
         except Exception as exc:
             st.error(f"Failed to fetch data: {exc}")
             return
@@ -1065,7 +1189,7 @@ def main():
     df_filtered = populate_actual_aum(df_filtered, df_port, want_aum=want_aum, fetch_live_aum=fetch_live_aum)
 
     # ── Build target date columns ─────────────────────────────────────────────
-    date_cols = build_date_cols(start_date, end_date, skip_sunday)
+    date_cols = build_date_cols(fetch_start_date, end_date, skip_sunday)
 
     # ── Stats ─────────────────────────────────────────────────────────────────
     total_schemes = df_filtered["Scheme Code"].nunique()
@@ -1213,6 +1337,11 @@ def main():
         df_display["NAV Date"] = df_display["NAV Date"].dt.strftime("%d-%m-%Y")
         display_date_cols = []  # no date pivot columns for long format
         is_aum_only = want_aum and not want_nav
+
+    if want_flows:
+        meta_cols_list = ["Asset Class", "Scheme Code", "ISIN Div Payout / ISIN Growth", "ISIN Div Reinvestment", "Scheme Name", "Plan Type", "Option Type"]
+        df_display = calculate_flows_for_dataframe(df_display, start_date, meta_cols_list)
+        is_aum_only = False
 
     render_section_header("👁️", "Data Preview")
     st.dataframe(df_display, use_container_width=True, hide_index=True)

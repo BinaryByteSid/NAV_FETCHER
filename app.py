@@ -417,6 +417,106 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame) -> pd.DataFrame
     return df_res
 
 
+def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list) -> pd.DataFrame:
+    """Calculate the flows format columns for a vertical Mutual Fund DataFrame."""
+    df = df.copy()
+    
+    # Standardize columns
+    if "NAV" not in df.columns and "NAVs" in df.columns:
+        df = df.rename(columns={"NAVs": "NAV"})
+    if "NAV" not in df.columns:
+        df["NAV"] = None
+    if "AUM" not in df.columns:
+        df["AUM"] = None
+        
+    df["NAV"] = pd.to_numeric(df["NAV"], errors="coerce")
+    df["AUM"] = pd.to_numeric(df["AUM"], errors="coerce")
+    
+    # Standardize date column to 'NAV Date'
+    date_col = None
+    for c in ["NAV Date", "AUM Date", "Date"]:
+        if c in df.columns:
+            date_col = c
+            break
+            
+    if date_col and date_col != "NAV Date":
+        df = df.rename(columns={date_col: "NAV Date"})
+        
+    if "NAV Date" not in df.columns:
+        df["NAV Date"] = None
+        
+    df["NAV Date_parsed"] = pd.to_datetime(df["NAV Date"], format="%d-%m-%Y", errors="coerce")
+    if df["NAV Date_parsed"].isna().all():
+        df["NAV Date_parsed"] = pd.to_datetime(df["NAV Date"], errors="coerce")
+        
+    df = df.sort_values(by=["Scheme Code", "NAV Date_parsed"]).reset_index(drop=True)
+    
+    df["Closing AUM as on previous day"] = None
+    df["Actual AUM as on current date"] = df["AUM"]
+    df["Daily return"] = None
+    df["Derived AUM as on curent day"] = None
+    df["Net flows on current day"] = None
+    
+    for scheme_code, group in df.groupby("Scheme Code"):
+        indices = group.index
+        for idx_in_group, idx in enumerate(indices):
+            if idx_in_group == 0:
+                continue
+            prev_idx = indices[idx_in_group - 1]
+            
+            nav_curr = df.at[idx, "NAV"]
+            nav_prev = df.at[prev_idx, "NAV"]
+            aum_prev = df.at[prev_idx, "AUM"]
+            aum_curr = df.at[idx, "AUM"]
+            
+            df.at[idx, "Closing AUM as on previous day"] = aum_prev
+            
+            if pd.notna(nav_curr) and pd.notna(nav_prev) and nav_prev != 0:
+                daily_return = (nav_curr - nav_prev) / nav_prev
+                df.at[idx, "Daily return"] = daily_return
+            else:
+                daily_return = None
+                
+            if pd.notna(aum_prev) and daily_return is not None:
+                derived_aum = aum_prev * (1 + daily_return)
+                df.at[idx, "Derived AUM as on curent day"] = derived_aum
+            else:
+                derived_aum = None
+                
+            if pd.notna(aum_curr) and derived_aum is not None:
+                df.at[idx, "Net flows on current day"] = aum_curr - derived_aum
+                
+    # Filter only target dates
+    start_date_ts = pd.to_datetime(start_date)
+    df = df[df["NAV Date_parsed"] >= start_date_ts].reset_index(drop=True)
+    df = df.drop(columns=["NAV Date_parsed"])
+    
+    df = df.rename(columns={"NAV": "NAVs"})
+    
+    flow_cols = [
+        "NAV Date",
+        "NAVs",
+        "Closing AUM as on previous day",
+        "Actual AUM as on current date",
+        "Daily return",
+        "Derived AUM as on curent day",
+        "Net flows on current day"
+    ]
+    
+    if "NAV Date" in df.columns:
+        parsed = pd.to_datetime(df["NAV Date"], format="%d-%m-%Y", errors="coerce")
+        if parsed.isna().all():
+            parsed = pd.to_datetime(df["NAV Date"], errors="coerce")
+        df["NAV Date"] = parsed.dt.strftime("%d-%m-%Y")
+        
+    final_cols = list(meta_cols) + flow_cols
+    for col in final_cols:
+        if col not in df.columns:
+            df[col] = None
+            
+    return df[final_cols].sort_values(by=["Asset Class", "Scheme Name", "NAV Date"]).reset_index(drop=True)
+
+
 def generate_historical_excel(df_final: pd.DataFrame, target_dates: List[str], is_aum_only: bool = False) -> bytes:
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
@@ -453,7 +553,13 @@ def generate_historical_excel(df_final: pd.DataFrame, target_dates: List[str], i
             "NAV Date": Alignment(horizontal="center", vertical="center"),
             "AUM Date": Alignment(horizontal="center", vertical="center"),
             "NAV": Alignment(horizontal="right", vertical="center"),
+            "NAVs": Alignment(horizontal="right", vertical="center"),
             "AUM": Alignment(horizontal="right", vertical="center"),
+            "Closing AUM as on previous day": Alignment(horizontal="right", vertical="center"),
+            "Actual AUM as on current date": Alignment(horizontal="right", vertical="center"),
+            "Daily return": Alignment(horizontal="right", vertical="center"),
+            "Derived AUM as on curent day": Alignment(horizontal="right", vertical="center"),
+            "Net flows on current day": Alignment(horizontal="right", vertical="center"),
         }
             
         worksheet.row_dimensions[1].height = 28
@@ -475,13 +581,25 @@ def generate_historical_excel(df_final: pd.DataFrame, target_dates: List[str], i
                 cell.border = thin_border
                 
                 val = cell.value
-                if col_name == "NAV":
+                if col_name in ("NAV", "NAVs"):
                     if val is not None and val != "":
-                        cell.number_format = "0.0000"
+                        cell.number_format = "0.00" if col_name == "NAVs" else "0.0000"
                     else:
                         cell.value = "-"
                         cell.alignment = Alignment(horizontal="center", vertical="center")
-                elif col_name == "AUM":
+                elif col_name == "Daily return":
+                    if val is not None and val != "":
+                        cell.number_format = "0.00%"
+                    else:
+                        cell.value = "-"
+                        cell.alignment = Alignment(horizontal="center", vertical="center")
+                elif col_name in (
+                    "Closing AUM as on previous day", 
+                    "Actual AUM as on current date", 
+                    "Derived AUM as on curent day", 
+                    "Net flows on current day",
+                    "AUM"
+                ):
                     if val is not None and val != "":
                         cell.number_format = "0.00"
                     else:
@@ -897,26 +1015,36 @@ def main() -> None:
             with c2:
                 skip_sundays = st.checkbox("Skip Sundays", value=True)
 
-            col_c1, col_c2 = st.columns(2)
+            col_c1, col_c2, col_c3 = st.columns(3)
             with col_c1:
                 want_nav = st.checkbox("Want NAV", value=True)
             with col_c2:
                 want_aum = st.checkbox("Want AUM", value=True)
+            with col_c3:
+                want_flows = st.checkbox("Want Flows", value=False)
 
             if st.button("Fetch & generate Excel", type="primary", use_container_width=True):
                 parsed_isins = [x.strip() for x in re.split(r"[,\n\s]+", isin_input) if x.strip()]
-                if not want_nav and not want_aum:
-                    st.error("Please select at least one data type (NAV or AUM) to export.")
+                if not want_nav and not want_aum and not want_flows:
+                    st.error("Please select at least one data type (NAV, AUM, or Flows) to export.")
                 elif not parsed_isins:
                     st.error("Please enter at least one valid ISIN.")
                 elif start_date > end_date:
                     st.error("Start Date cannot be after End Date.")
                 else:
+                    if want_flows:
+                        want_nav = True
+                        want_aum = True
+                        
+                    fetch_start_date = start_date
+                    if want_flows:
+                        fetch_start_date = start_date - timedelta(days=10)
+                        
                     with st.spinner("Connecting to AMFI India and fetching historical data..."):
                         try:
-                            frmdt_str = start_date.strftime("%d-%b-%Y")
+                            frmdt_str = fetch_start_date.strftime("%d-%b-%Y")
                             todt_str = end_date.strftime("%d-%b-%Y")
-                        
+                            
                             url = f"https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx?frmdt={frmdt_str}&todt={todt_str}"
                             import time
                             max_retries = 3
@@ -999,7 +1127,7 @@ def main() -> None:
                             
                                 df_raw = populate_actual_aum(df_raw, df_port)
                             
-                                all_dates = pd.date_range(start=start_date, end=end_date)
+                                all_dates = pd.date_range(start=fetch_start_date, end=end_date)
                             
                                 target_dates = []
                                 for dt in all_dates:
@@ -1133,6 +1261,9 @@ def main() -> None:
                                         df_final["AUM Date"] = pd.to_datetime(df_final["AUM Date"], format="%d-%b-%Y", errors="coerce").dt.strftime("%d-%m-%Y")
                                     df_final = df_final[ordered_cols]
                                     df_final = df_final.sort_values(by=["Asset Class", "Scheme Name"]).reset_index(drop=True)
+                                    if want_flows:
+                                        df_final = calculate_flows_for_dataframe(df_final, start_date, ["Asset Class", "Scheme Code", "ISIN Div Payout / ISIN Growth", "ISIN Div Reinvestment", "Scheme Name", "Plan Type", "Option Type"])
+                                        is_aum_only = False
                                 else:
                                     df_final = pd.DataFrame(columns=ordered_cols)
                             

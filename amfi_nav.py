@@ -441,6 +441,7 @@ def load_historical_snapshots(family_key: str) -> pd.DataFrame:
 
     history = pd.concat(snapshots, ignore_index=True)
     history = history.sort_values(["NAV Date", "Plan Type", "Option Type"], ascending=[True, True, True])
+    history = adjust_dataframe_splits(history)
     return history.reset_index(drop=True)
 
 
@@ -490,6 +491,7 @@ def load_all_historical_snapshots() -> pd.DataFrame:
     history = pd.concat(snapshots, ignore_index=True)
     if "NAV Date" in history.columns:
         history = history.sort_values(["NAV Date", "Plan Type", "Option Type"], ascending=[True, True, True])
+    history = adjust_dataframe_splits(history)
     return history.reset_index(drop=True)
 
 
@@ -536,3 +538,26 @@ def benchmark_delta(nav_values: pd.Series, benchmark_annual_return_pct: float) -
         "benchmark_change_pct": round(float(benchmark_change), 2),
         "delta_pct": round(float(observed_change - benchmark_change), 2),
     }
+
+
+def adjust_df_group_splits(grp: pd.DataFrame) -> pd.DataFrame:
+    if grp.empty or "NAV" not in grp.columns:
+        return grp
+    grp = grp.sort_values("NAV Date").copy()
+    navs = grp["NAV"].values.astype(float)
+    n = len(navs)
+    for i in range(1, n):
+        prev_nav = navs[i-1]
+        curr_nav = navs[i]
+        if prev_nav > 1.0 and curr_nav > 1.0:
+            ratio = curr_nav / prev_nav
+            if 0.01 <= ratio <= 0.65:
+                # Scale all previous NAV values in this group by ratio
+                navs[:i] *= ratio
+    grp["NAV"] = navs
+    return grp
+
+def adjust_dataframe_splits(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "Scheme Code" not in df.columns:
+        return df
+    return df.groupby("Scheme Code", group_keys=False).apply(adjust_df_group_splits)
