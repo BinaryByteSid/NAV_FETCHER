@@ -514,7 +514,14 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
         if col not in df.columns:
             df[col] = None
             
-    return df[final_cols].sort_values(by=["Asset Class", "Scheme Name", "NAV Date"]).reset_index(drop=True)
+    df["NAV Date_parsed"] = pd.to_datetime(df["NAV Date"], format="%d-%m-%Y", errors="coerce")
+    if df["NAV Date_parsed"].isna().all():
+        df["NAV Date_parsed"] = pd.to_datetime(df["NAV Date"], errors="coerce")
+    df = df.sort_values(by=["Asset Class", "Scheme Name", "NAV Date_parsed"]).reset_index(drop=True)
+    df = df.drop(columns=["NAV Date_parsed"])
+    
+    return df[final_cols]
+
 
 
 def generate_historical_excel(df_final: pd.DataFrame, target_dates: List[str], is_aum_only: bool = False) -> bytes:
@@ -1126,6 +1133,11 @@ def main() -> None:
                                 df_raw["Option Type"] = df_raw["Scheme Name"].apply(classify_option_type)
                             
                                 df_raw = populate_actual_aum(df_raw, df_port)
+                                if not df_raw.empty:
+                                    parsed_dates = pd.to_datetime(df_raw["Date"], format="%d-%b-%Y", errors="coerce")
+                                    if parsed_dates.isna().all():
+                                        parsed_dates = pd.to_datetime(df_raw["Date"], errors="coerce")
+                                    df_raw["Date"] = parsed_dates.dt.strftime("%d-%m-%Y")
                             
                                 all_dates = pd.date_range(start=fetch_start_date, end=end_date)
                             
@@ -1133,7 +1145,7 @@ def main() -> None:
                                 for dt in all_dates:
                                     if skip_sundays and dt.weekday() == 6:
                                         continue
-                                    target_dates.append(dt.strftime("%d-%b-%Y"))
+                                    target_dates.append(dt.strftime("%d-%m-%Y"))
                                 
                                 fund_metadata = df_raw[[
                                     "Asset Class", 
@@ -1256,9 +1268,15 @@ def main() -> None:
                                 if vertical_rows:
                                     df_final = pd.DataFrame(vertical_rows)
                                     if "NAV Date" in df_final.columns:
-                                        df_final["NAV Date"] = pd.to_datetime(df_final["NAV Date"], format="%d-%b-%Y", errors="coerce").dt.strftime("%d-%m-%Y")
+                                        parsed = pd.to_datetime(df_final["NAV Date"], format="%d-%m-%Y", errors="coerce")
+                                        if parsed.isna().all():
+                                            parsed = pd.to_datetime(df_final["NAV Date"], errors="coerce")
+                                        df_final["NAV Date"] = parsed.dt.strftime("%d-%m-%Y")
                                     if "AUM Date" in df_final.columns:
-                                        df_final["AUM Date"] = pd.to_datetime(df_final["AUM Date"], format="%d-%b-%Y", errors="coerce").dt.strftime("%d-%m-%Y")
+                                        parsed = pd.to_datetime(df_final["AUM Date"], format="%d-%m-%Y", errors="coerce")
+                                        if parsed.isna().all():
+                                            parsed = pd.to_datetime(df_final["AUM Date"], errors="coerce")
+                                        df_final["AUM Date"] = parsed.dt.strftime("%d-%m-%Y")
                                     df_final = df_final[ordered_cols]
                                     df_final = df_final.sort_values(by=["Asset Class", "Scheme Name"]).reset_index(drop=True)
                                     if want_flows:

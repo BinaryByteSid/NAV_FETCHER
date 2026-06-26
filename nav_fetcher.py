@@ -535,7 +535,13 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
         if col not in df.columns:
             df[col] = None
             
-    return df[final_cols].sort_values(by=["Asset Class", "Scheme Name", "NAV Date"]).reset_index(drop=True)
+    df["NAV Date_parsed"] = pd.to_datetime(df["NAV Date"], format="%d-%m-%Y", errors="coerce")
+    if df["NAV Date_parsed"].isna().all():
+        df["NAV Date_parsed"] = pd.to_datetime(df["NAV Date"], errors="coerce")
+    df = df.sort_values(by=["Asset Class", "Scheme Name", "NAV Date_parsed"]).reset_index(drop=True)
+    df = df.drop(columns=["NAV Date_parsed"])
+    
+    return df[final_cols]
 
 
 # ─── Project helpers ─────────────────────────────────────────────────────────
