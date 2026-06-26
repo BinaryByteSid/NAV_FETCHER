@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO, StringIO
 from typing import List
 
@@ -1132,12 +1132,41 @@ def main() -> None:
                                 df_raw["Plan Type"] = df_raw["Scheme Name"].apply(classify_plan_type)
                                 df_raw["Option Type"] = df_raw["Scheme Name"].apply(classify_option_type)
                             
+                                # Infer proper Asset Class for rows where the Asset Class is a fund family name
+                                known_sections = ["Open Ended", "Closed Ended", "Interval Fund Schemes"]
+                                def infer_section_from_name(name: str) -> str:
+                                    lowered = name.lower()
+                                    if "flexi" in lowered:
+                                        return "Open Ended Schemes (Equity Scheme - Flexi Cap Fund)"
+                                    if "mid" in lowered:
+                                        return "Open Ended Schemes (Equity Scheme - Mid Cap Fund)"
+                                    if "small" in lowered:
+                                        return "Open Ended Schemes (Equity Scheme - Small Cap Fund)"
+                                    if "large" in lowered:
+                                        return "Open Ended Schemes (Equity Scheme - Large Cap Fund)"
+                                    if "focused" in lowered or "focus" in lowered:
+                                        return "Open Ended Schemes (Equity Scheme - Focused Fund)"
+                                    return "Open Ended Schemes (Equity Scheme - Large Cap Fund)"
+                                df_raw["Asset Class"] = df_raw.apply(
+                                    lambda row: row["Asset Class"] if any(row["Asset Class"].startswith(s) for s in known_sections) else infer_section_from_name(row["Scheme Name"]),
+                                    axis=1)
                                 df_raw = populate_actual_aum(df_raw, df_port)
                                 if not df_raw.empty:
+                                    # Parse dates
                                     parsed_dates = pd.to_datetime(df_raw["Date"], format="%d-%b-%Y", errors="coerce")
                                     if parsed_dates.isna().all():
                                         parsed_dates = pd.to_datetime(df_raw["Date"], errors="coerce")
                                     df_raw["Date"] = parsed_dates.dt.strftime("%d-%m-%Y")
+                                    # Compute daily return % and flows
+                                    df_raw.sort_values(["Scheme Code", "Date"], inplace=True)
+                                    df_raw["Prev NAV"] = df_raw.groupby("Scheme Code")["NAV"].shift(1)
+                                    df_raw["Daily Return %"] = df_raw.apply(
+                                        lambda r: ((r["NAV"] - r["Prev NAV"]) / r["Prev NAV"] * 100) if r["Prev NAV"] and r["Prev NAV"] != 0 else None,
+                                        axis=1)
+                                    df_raw["Flows"] = df_raw.apply(
+                                        lambda r: (r["Daily Return %"] * r["AUM"] / 100) if (r["Daily Return %"] is not None and pd.notnull(r.get("AUM"))) else None,
+                                        axis=1)
+                                    df_raw.drop(columns=["Prev NAV"], inplace=True)
                             
                                 all_dates = pd.date_range(start=fetch_start_date, end=end_date)
                             
@@ -1166,21 +1195,26 @@ def main() -> None:
                                     display_date_cols = target_dates
                                     is_aum_only = True
                                 else:
+                                    # Pivot NAV, AUM, and Flows
                                     df_pivot_nav = df_raw.pivot(index="Scheme Code", columns="Date", values="NAV").reset_index()
                                     df_pivot_aum = df_raw.pivot(index="Scheme Code", columns="Date", values="AUM").reset_index()
-                                
+                                    df_pivot_flow = df_raw.pivot(index="Scheme Code", columns="Date", values="Flows").reset_index()
+                                    # Rename columns with appropriate suffixes
                                     nav_cols_map = {d: f"{d} (NAV)" for d in target_dates if d in df_pivot_nav.columns}
                                     aum_cols_map = {d: f"{d} (AUM)" for d in target_dates if d in df_pivot_aum.columns}
-                                
+                                    flow_cols_map = {d: f"{d} (Flows)" for d in target_dates if d in df_pivot_flow.columns}
                                     df_pivot_nav = df_pivot_nav.rename(columns=nav_cols_map)
                                     df_pivot_aum = df_pivot_aum.rename(columns=aum_cols_map)
-                                
+                                    df_pivot_flow = df_pivot_flow.rename(columns=flow_cols_map)
+                                    # Merge all three dataframes
                                     df_pivot = pd.merge(df_pivot_nav, df_pivot_aum, on="Scheme Code", how="left")
-                                
+                                    df_pivot = pd.merge(df_pivot, df_pivot_flow, on="Scheme Code", how="left")
+                                    # Build interleaved display columns including Flows
                                     interleaved_dates = []
                                     for d in target_dates:
                                         interleaved_dates.append(f"{d} (NAV)")
                                         interleaved_dates.append(f"{d} (AUM)")
+                                        interleaved_dates.append(f"{d} (Flows)")
                                     display_date_cols = interleaved_dates
                                     is_aum_only = False
                             
@@ -1191,8 +1225,8 @@ def main() -> None:
                                         df_final[date_col] = None
                                     
                                 if carry_forward and len(target_dates) > 1:
-                                    date_objs = sorted([datetime.strptime(d, "%d-%b-%Y") for d in target_dates])
-                                    sorted_date_cols = [d.strftime("%d-%b-%Y") for d in date_objs]
+                                    date_objs = sorted([datetime.strptime(d, "%d-%m-%Y") for d in target_dates])
+                                    sorted_date_cols = [d.strftime("%d-%m-%Y") for d in date_objs]
                                 
                                     for i in range(1, len(sorted_date_cols)):
                                         prev_col = sorted_date_cols[i-1]
@@ -1205,6 +1239,7 @@ def main() -> None:
                                         else:
                                             df_final[f"{curr_col} (NAV)"] = df_final[f"{curr_col} (NAV)"].fillna(df_final[f"{prev_col} (NAV)"])
                                             df_final[f"{curr_col} (AUM)"] = df_final[f"{curr_col} (AUM)"].fillna(df_final[f"{prev_col} (AUM)"])
+                                            df_final[f"{curr_col} (Flows)"] = df_final[f"{curr_col} (Flows)"].fillna(df_final[f"{prev_col} (Flows)"])
                                         
                                 # Fill any remaining NaNs in AUM columns with fallback values
                                 if want_aum:
