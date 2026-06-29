@@ -1020,8 +1020,26 @@ def main() -> None:
                     date_str = report_date.strftime("%d-%b-%Y")
                     perf_rows = fetch_performance_data_from_api(date_str, maturity_id, cat_id, sub_id)
                     if not perf_rows:
-                        st.warning("No performance data returned for the selected criteria.")
-                    else:
+                        # Auto-fallback: search backwards for a date that has data
+                        found_date = None
+                        with st.spinner("Checking latest available date on AMFI..."):
+                            for i in range(1, 15):
+                                check_date = report_date - timedelta(days=i)
+                                check_str = check_date.strftime("%d-%b-%Y")
+                                check_rows = fetch_performance_data_from_api(check_str, maturity_id, cat_id, sub_id)
+                                if check_rows:
+                                    found_date = check_date
+                                    perf_rows = check_rows
+                                    break
+                        if found_date:
+                            st.warning(f"⚠️ No performance data is available for {report_date.strftime('%d-%b-%Y')}. "
+                                       f"AMFI updates performance data weekly. Showing the latest available report from **{found_date.strftime('%A, %d-%b-%Y')}**.")
+                            report_date = found_date
+                            date_str = found_date.strftime("%d-%b-%Y")
+                        else:
+                            st.warning(f"⚠️ No performance data returned for the selected criteria on {report_date.strftime('%d-%b-%Y')} or the last 14 days.")
+                    
+                    if perf_rows:
                         df_perf = pd.DataFrame(perf_rows)
                         
                         horizon_map = {
