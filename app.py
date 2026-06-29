@@ -633,31 +633,31 @@ def generate_historical_excel(df_final: pd.DataFrame, target_dates: List[str], i
                 cell.border = thin_border
                 
                 val = cell.value
-                if col_name in ("NAV", "NAVs"):
+                if "NAV" in col_name:
                     if val is not None and val != "":
-                        cell.number_format = "0.00" if col_name == "NAVs" else "0.0000"
+                        cell.number_format = "0.00" if "NAVs" in col_name else "0.0000"
                     else:
                         cell.value = "-"
                         cell.alignment = Alignment(horizontal="center", vertical="center")
-                elif col_name == "Daily return":
+                elif "Return" in col_name or "return" in col_name:
                     if val is not None and val != "":
                         cell.number_format = '0.00"%"'
                     else:
                         cell.value = "-"
                         cell.alignment = Alignment(horizontal="center", vertical="center")
-                elif col_name in (
-                    "Closing AUM as on previous day", 
-                    "Actual AUM as on current date", 
-                    "Derived AUM as on curent day", 
-                    "Net flows on current day",
-                    "AUM"
-                ):
+                elif "AUM" in col_name or "flows" in col_name or "AUM" in col_name:
                     if val is not None and val != "":
-                        cell.number_format = "0.00"
+                        cell.number_format = "#,##0.00"
                     else:
                         cell.value = "-"
                         cell.alignment = Alignment(horizontal="center", vertical="center")
-                elif col_name in ("NAV Date", "AUM Date"):
+                elif "Info Ratio" in col_name:
+                    if val is not None and val != "":
+                        cell.number_format = "0.0000"
+                    else:
+                        cell.value = "-"
+                        cell.alignment = Alignment(horizontal="center", vertical="center")
+                elif "Date" in col_name:
                     if val is None or val == "":
                         cell.value = "-"
                 
@@ -873,7 +873,7 @@ def main() -> None:
         render_section_header("🔍", "Fund Discovery", "Search single funds, run batch lookups, or generate historical ISIN reports")
         search_mode = st.radio(
             "Search mode",
-            ["Single Fund", "Batch Search", "Historical ISIN Export", "Category Performance Export", "Portfolio Bucket Tracker"],
+            ["Single Fund", "Batch Search", "Historical ISIN Export", "Fund Performance", "Portfolio Bucket Tracker"],
             horizontal=True,
             index=0,
             label_visibility="collapsed",
@@ -980,8 +980,8 @@ def main() -> None:
                 else:
                     st.warning("No matching funds found for the batch search.")
 
-        elif search_mode == "Category Performance Export":
-            # UI for category performance export
+        elif search_mode == "Fund Performance":
+            # UI for Fund Performance dashboard matching the client's design
             maturity_type = st.selectbox("Maturity Type", ["Open Ended", "Close Ended", "Interval"], index=0)
             category = st.selectbox("Category", ["Equity", "Debt", "Hybrid", "Solution Oriented", "Other"], index=0)
             maturity_id_map = {"Open Ended": 1, "Close Ended": 2, "Interval": 2}
@@ -989,7 +989,7 @@ def main() -> None:
             maturity_id = maturity_id_map[maturity_type]
             cat_id = cat_id_map[category]
 
-            # Fetch subcategories
+            # Fetch subcategories using the correct keys 'name' and 'id'
             subcategories = []
             with st.spinner("Fetching subcategories..."):
                 try:
@@ -1001,15 +1001,21 @@ def main() -> None:
                     )
                     if sub_resp.status_code == 200:
                         sub_data = sub_resp.json()
-                        subcategories = [(item.get("subCategory"), item.get("subCategoryId")) for item in sub_data.get("data", [])]
+                        subcategories = [(item.get("name"), item.get("id")) for item in sub_data.get("data", []) if item.get("name")]
                 except Exception as e:
                     st.error(f"Failed to fetch subcategories: {e}")
 
             subcategory_name = st.selectbox("Subcategory", [name for name, _ in subcategories] or ["All"], index=0)
             sub_id = dict(subcategories).get(subcategory_name, 0)
 
-            report_date = st.date_input("Report Date", value=datetime.today().date())
-            if st.button("Fetch Performance", type="primary"):
+            # Return Period selector and date picker
+            col_d1, col_d2 = st.columns(2)
+            with col_d1:
+                horizon = st.selectbox("Return Horizon", ["1-Year", "3-Year", "5-Year", "10-Year", "Since Inception"], index=2)
+            with col_d2:
+                report_date = st.date_input("Report Date", value=datetime.today().date())
+
+            if st.button("Go", type="primary", use_container_width=True):
                 with st.spinner("Fetching performance data..."):
                     date_str = report_date.strftime("%d-%b-%Y")
                     perf_rows = fetch_performance_data_from_api(date_str, maturity_id, cat_id, sub_id)
@@ -1017,22 +1023,78 @@ def main() -> None:
                         st.warning("No performance data returned for the selected criteria.")
                     else:
                         df_perf = pd.DataFrame(perf_rows)
-                        rename_map = {
-                            "schemeName": "Scheme Name",
-                            "nav": "NAV",
-                            "dailyAUM": "AUM",
-                            "return1YearRegular": "1Y Return",
-                            "return3MonthRegular": "3M Return",
-                            "return1MonthRegular": "1M Return",
-                            "return7DayRegular": "7D Return",
+                        
+                        horizon_map = {
+                            "1-Year": ("return1YearRegular", "return1YearDirect", "return1YearBenchmark", "ir1YrRegular", "ir1YrDirect", "1-Year"),
+                            "3-Year": ("return3YearRegular", "return3YearDirect", "return3YearBenchmark", "ir3YrRegular", "ir3YrDirect", "3-Year"),
+                            "5-Year": ("return5YearRegular", "return5YearDirect", "return5YearBenchmark", "ir5YrRegular", "ir5YrDirect", "5-Year"),
+                            "10-Year": ("return10YearRegular", "return10YearDirect", "return10YearBenchmark", "ir10YrRegular", "ir10YrDirect", "10-Year"),
+                            "Since Inception": ("returnSinceLaunchRegular", "returnSinceLaunchDirect", "returnSinceLaunchBenchmarkRegular", None, None, "Since Inception")
                         }
-                        df_perf = df_perf.rename(columns=rename_map)
-                        st.dataframe(df_perf, use_container_width=True)
-                        excel_bytes = generate_historical_excel(df_perf, [], is_aum_only=False)
+                        reg_ret, dir_ret, bench_ret, reg_ir, dir_ir, label = horizon_map[horizon]
+                        
+                        # Build formatted DataFrame for display
+                        rename_dict = {
+                            "schemeName": "Scheme Name",
+                            "benchmark": "Benchmark Name",
+                            "riskometerScheme": "Riskometer (Scheme)",
+                            "riskometerBenchmark": "Riskometer (Benchmark)",
+                            "navRegular": "Latest NAV (Regular)",
+                            "navDirect": "Latest NAV (Direct)",
+                            reg_ret: f"{label} Return (Regular)",
+                            dir_ret: f"{label} Return (Direct)",
+                            bench_ret: f"{label} Return (Benchmark)",
+                        }
+                        if reg_ir and reg_ir in df_perf.columns:
+                            rename_dict[reg_ir] = f"{label} Info Ratio (Regular)"
+                        if dir_ir and dir_ir in df_perf.columns:
+                            rename_dict[dir_ir] = f"{label} Info Ratio (Direct)"
+                        rename_dict["dailyAUM"] = "Daily AUM (Cr.)"
+                        
+                        existing_renames = {k: v for k, v in rename_dict.items() if k in df_perf.columns}
+                        df_display = df_perf[list(existing_renames.keys())].rename(columns=existing_renames)
+                        
+                        # Color coding riskometer scheme/benchmark
+                        def highlight_riskometer(val):
+                            if val == "Very High":
+                                return "background-color: #fca5a5; color: #991b1b; font-weight: bold; text-align: center;"
+                            elif val == "High":
+                                return "background-color: #fed7aa; color: #9a3412; font-weight: bold; text-align: center;"
+                            elif val == "Moderate":
+                                return "background-color: #fef08a; color: #854d0e; font-weight: bold; text-align: center;"
+                            elif val == "Low to Moderate":
+                                return "background-color: #d9f99d; color: #3f6212; font-weight: bold; text-align: center;"
+                            elif val == "Low":
+                                return "background-color: #bbf7d0; color: #166534; font-weight: bold; text-align: center;"
+                            return ""
+
+                        styled_df = df_display.style.applymap(
+                            highlight_riskometer, 
+                            subset=[col for col in ["Riskometer (Scheme)", "Riskometer (Benchmark)"] if col in df_display.columns]
+                        )
+                        
+                        # Display the beautiful interactive styled table
+                        st.dataframe(
+                            styled_df,
+                            use_container_width=True,
+                            column_config={
+                                "Latest NAV (Regular)": st.column_config.NumberColumn(format="₹%.4f"),
+                                "Latest NAV (Direct)": st.column_config.NumberColumn(format="₹%.4f"),
+                                f"{label} Return (Regular)": st.column_config.NumberColumn(format="%.2f%%"),
+                                f"{label} Return (Direct)": st.column_config.NumberColumn(format="%.2f%%"),
+                                f"{label} Return (Benchmark)": st.column_config.NumberColumn(format="%.2f%%"),
+                                f"{label} Info Ratio (Regular)": st.column_config.NumberColumn(format="%.4f"),
+                                f"{label} Info Ratio (Direct)": st.column_config.NumberColumn(format="%.4f"),
+                                "Daily AUM (Cr.)": st.column_config.NumberColumn(format="₹%,.2f Cr"),
+                            }
+                        )
+                        
+                        # Styled excel report
+                        excel_bytes = generate_historical_excel(df_display, [], is_aum_only=False)
                         st.download_button(
                             label="📥 Download Styled Excel (.xlsx)",
                             data=excel_bytes,
-                            file_name=f"category_performance_{date_str}.xlsx",
+                            file_name=f"fund_performance_{subcategory_name}_{date_str}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True,
                         )
