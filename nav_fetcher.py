@@ -658,8 +658,64 @@ def parse_bucket_input(uploaded_file=None, data_editor_df=None) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def run_portfolio_simulation(bucket_df: pd.DataFrame, start_date, end_date, initial_amount: float, skip_sunday: bool):
-    """Run a daily valuation backtest for the specified mutual fund bucket and date range."""
+def fetch_latest_navs(isin_list: List[str]) -> dict:
+    """Fetch the latest (today's) NAV for each ISIN from AMFI's live NAVAll.txt feed.
+
+    Returns dict: {ISIN_upper: {"nav": float, "date": str, "scheme_name": str}}
+    """
+    isin_set = {i.strip().upper() for i in isin_list if i.strip()}
+    if not isin_set:
+        return {}
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    try:
+        resp = requests.get(AMFI_LATEST_URL, headers=headers, timeout=30)
+        resp.raise_for_status()
+    except Exception:
+        return {}
+
+    result = {}
+    for line_bytes in resp.text.splitlines():
+        line = line_bytes.strip()
+        if ";" not in line or line.startswith("Scheme Code"):
+            continue
+        parts = line.split(";")
+        if len(parts) < 8:
+            continue
+
+        isin_g = parts[2].strip().upper() if parts[2].strip() != "-" else ""
+        isin_r = parts[3].strip().upper() if parts[3].strip() != "-" else ""
+        matched_isin = None
+        if isin_g in isin_set:
+            matched_isin = isin_g
+        elif isin_r in isin_set:
+            matched_isin = isin_r
+        else:
+            continue
+
+        nav_val = pd.to_numeric(parts[4].strip().replace(",", ""), errors="coerce")
+        nav_date = parts[7].strip()  # e.g. "27-Jun-2026"
+        scheme_name = parts[1].strip()
+
+        if pd.notna(nav_val) and matched_isin:
+            result[matched_isin] = {
+                "nav": float(nav_val),
+                "date": nav_date,
+                "scheme_name": scheme_name,
+            }
+    return result
+
+
+def run_live_portfolio(bucket_df: pd.DataFrame, start_date, initial_amount: float, skip_sunday: bool):
+    """Run a live portfolio tracker from start_date to today.
+
+    Fetches historical NAVs from AMFI history API, then overlays the latest
+    real-time NAV from NAVAll.txt so the portfolio value is always current.
+    """
+    end_date = datetime.today().date()
+
     if bucket_df.empty:
         return None, "Bucket composition is empty."
         
@@ -732,6 +788,35 @@ def run_portfolio_simulation(bucket_df: pd.DataFrame, start_date, end_date, init
     if len(df_sim) < len(bucket):
         missing_isins = set(bucket["ISIN_upper"]) - set(df_sim["ISIN_upper"])
         return None, f"Could not find historical NAV data for ISIN(s): {', '.join(missing_isins)}. Please check the ISINs and date range."
+    
+    # ── Overlay latest live NAVs from NAVAll.txt ──────────────────────────────
+    latest_navs = fetch_latest_navs(isin_list)
+    latest_nav_date_str = None
+    if latest_navs:
+        # Find the latest date from the live feed
+        for info in latest_navs.values():
+            latest_nav_date_str = info["date"]  # e.g. "27-Jun-2026"
+            break
+        # Convert to dd-mm-YYYY for column matching
+        if latest_nav_date_str:
+            parsed_live = _parse_amfi_date_str(latest_nav_date_str)
+            if parsed_live:
+                live_dt = datetime.strptime(parsed_live, "%Y-%m-%d")
+                live_col = live_dt.strftime("%d-%m-%Y")
+                # Add column if not already present
+                if live_col not in df_sim.columns:
+                    df_sim[live_col] = None
+                    if live_col not in target_date_cols:
+                        target_date_cols.append(live_col)
+                # Inject live NAVs
+                for idx, row in df_sim.iterrows():
+                    isin_upper = row["ISIN_upper"]
+                    if isin_upper in latest_navs:
+                        df_sim.at[idx, live_col] = latest_navs[isin_upper]["nav"]
+                # Carry forward into live column for any missing ISINs
+                if len(sorted_cols) > 0:
+                    last_hist = sorted_cols[-1]
+                    df_sim[live_col] = df_sim[live_col].fillna(df_sim[last_hist])
         
     df_sim["Initial_Allocation"] = initial_amount * df_sim["Weight_Normalized"]
     df_sim["Units"] = df_sim["Initial_Allocation"] / df_sim[t0]
@@ -773,14 +858,25 @@ def run_portfolio_simulation(bucket_df: pd.DataFrame, start_date, end_date, init
     best_day = df_tracker["Daily Return (%)"].max()
     worst_day = df_tracker["Daily Return (%)"].min()
     
+    # Today's change (last row vs second-to-last)
+    todays_change = 0.0
+    todays_change_pct = 0.0
+    if len(df_tracker) >= 2:
+        yesterday_val = df_tracker.iloc[-2]["Total Portfolio Value (₹)"]
+        todays_change = final_val - yesterday_val
+        todays_change_pct = (todays_change / yesterday_val) * 100 if yesterday_val else 0.0
+    
     metrics = {
         "Initial Value": initial_amount,
-        "Final Value": final_val,
-        "Gain/Loss": abs_gain,
-        "Absolute Return (%)": abs_return,
+        "Current Value": final_val,
+        "Total Gain/Loss": abs_gain,
+        "Total Return (%)": abs_return,
+        "Today's Change": todays_change,
+        "Today's Change (%)": todays_change_pct,
         "Max Drawdown (%)": max_dd,
         "Best Day Return (%)": best_day,
         "Worst Day Return (%)": worst_day,
+        "NAV Date": latest_nav_date_str or "N/A",
     }
     
     comp_stats = []
@@ -798,10 +894,10 @@ def run_portfolio_simulation(bucket_df: pd.DataFrame, start_date, end_date, init
             "ISIN": isin,
             "Weight (%)": weight,
             "Initial Allocation (₹)": round(initial_alloc, 2),
-            "Units Purchased": round(units, 4),
-            "Initial NAV (₹)": round(row[t0], 4),
-            "Final NAV (₹)": round(final_nav, 4),
-            "Final Value (₹)": round(final_val_fund, 2),
+            "Units": round(units, 4),
+            "Buy NAV (₹)": round(row[t0], 4),
+            "Current NAV (₹)": round(final_nav, 4),
+            "Current Value (₹)": round(final_val_fund, 2),
             "Return (%)": round(fund_return, 2)
         })
         
@@ -810,7 +906,8 @@ def run_portfolio_simulation(bucket_df: pd.DataFrame, start_date, end_date, init
     return {
         "tracker": df_tracker,
         "metrics": metrics,
-        "composition": df_comp_stats
+        "composition": df_comp_stats,
+        "latest_nav_date": latest_nav_date_str,
     }, None
 
 
@@ -1445,17 +1542,16 @@ def main():
     render_section_header("⚙️", "Fetch Configuration", "Choose mode, dates, and export options")
     mode = st.radio(
         "Fetch mode",
-        ["By ISIN + Date Range", "By Date Range Only (all funds)", "Portfolio Bucket Simulator"],
+        ["By ISIN + Date Range", "By Date Range Only (all funds)", "Portfolio Bucket Tracker"],
         horizontal=True,
         label_visibility="collapsed",
     )
 
-    if mode == "Portfolio Bucket Simulator":
+    if mode == "Portfolio Bucket Tracker":
         st.markdown('<hr class="panel-divider">', unsafe_allow_html=True)
         
         # 1. Initialize session state buckets if they don't exist
         if "portfolio_buckets" not in st.session_state:
-            # Prepopulate with a default balanced portfolio
             default_df = pd.DataFrame([
                 {"Scheme Name": "Quant Large Cap Fund-Reg(G)", "ISIN": "INF966L01AW4", "Weight (%)": 10.0},
                 {"Scheme Name": "DSP Equity Opportunities Fund-Reg(G)", "ISIN": "INF740K01094", "Weight (%)": 9.0},
@@ -1476,7 +1572,7 @@ def main():
             st.session_state["active_bucket_name"] = "Default Balanced Portfolio"
 
         # Bucket selection & management controls
-        render_section_header("📁", "Bucket Management", "Create, rename, or switch between saved fund buckets")
+        render_section_header("📁", "Bucket Management", "Create, switch, or delete fund buckets")
         col_m1, col_m2 = st.columns(2)
         with col_m1:
             bucket_options = list(st.session_state["portfolio_buckets"].keys())
@@ -1508,30 +1604,22 @@ def main():
 
         st.markdown('<hr class="panel-divider">', unsafe_allow_html=True)
         
-        # 2. Date Range
-        render_section_header("📅", "Simulation Date Range")
-        default_end = datetime.today().date()
-        default_start = (datetime.today() - timedelta(days=90)).date()
-        col_a, col_b = st.columns(2)
+        # 2. Investment Start Date & Amount (no end date — always tracks to today)
+        render_section_header("📅", "Investment Setup", "Pick when you started investing — the tracker runs to today automatically")
+        col_a, col_b, col_c = st.columns(3)
         with col_a:
-            start_date = st.date_input("Start Date", value=default_start)
+            start_date = st.date_input("Investment Start Date", value=(datetime.today() - timedelta(days=90)).date())
         with col_b:
-            end_date = st.date_input("End Date", value=default_end)
-            
-        # 3. Parameters
-        render_section_header("🎛️", "Simulation Parameters")
-        col_p1, col_p2 = st.columns(2)
-        with col_p1:
-            initial_amount = st.number_input("Initial Investment Amount (₹)", value=100000.0, min_value=100.0, step=1000.0)
-        with col_p2:
-            skip_sunday = st.checkbox("Skip Sundays in tracking", value=True)
+            initial_amount = st.number_input("Investment Amount (₹)", value=100000.0, min_value=100.0, step=1000.0)
+        with col_c:
+            skip_sunday = st.checkbox("Skip Sundays", value=True)
 
         st.markdown('<hr class="panel-divider">', unsafe_allow_html=True)
         
-        # 4. Bucket Composition Editor
-        render_section_header("📋", "Bucket Composition", f"Edit mutual fund weights or copy-paste directly from Excel for '{st.session_state['active_bucket_name']}'")
+        # 3. Bucket Composition Editor
+        render_section_header("📋", "Bucket Composition", f"Add/remove funds and set weights for '{st.session_state['active_bucket_name']}'")
         
-        uploaded_file = st.file_uploader("Upload Bucket composition (Excel/CSV with ISIN and Weights)", type=["xlsx", "xls", "csv"])
+        uploaded_file = st.file_uploader("Upload Bucket (Excel/CSV with ISIN and Weights)", type=["xlsx", "xls", "csv"])
         
         current_bucket_df = st.session_state["portfolio_buckets"][st.session_state["active_bucket_name"]]
         if uploaded_file is not None:
@@ -1557,102 +1645,115 @@ def main():
             
         weight_sum = edited_df["Weight (%)"].sum() if not edited_df.empty else 0
         if weight_sum != 100.0:
-            st.info(f"⚖️ Current weights sum to **{weight_sum:.2f}%**. Weights will be automatically normalized to 100% for the backtest calculation.")
+            st.info(f"⚖️ Current weights sum to **{weight_sum:.2f}%**. Weights will be automatically normalized to 100%.")
         else:
             st.success("⚖️ Weights sum to exactly **100%**!")
 
         st.markdown('<hr class="panel-divider">', unsafe_allow_html=True)
         
-        run_btn = st.button("Run Portfolio Simulation", type="primary", use_container_width=True)
+        # 4. Track / Refresh buttons
+        col_btn1, col_btn2 = st.columns([3, 1])
+        with col_btn1:
+            track_btn = st.button("📊 Track Portfolio", type="primary", use_container_width=True)
+        with col_btn2:
+            refresh_btn = st.button("🔄 Refresh", use_container_width=True)
         
-        if run_btn:
-            if start_date > end_date:
-                st.error("Start Date must be before or equal to End Date.")
-                return
-                
-            with st.spinner("Running historical backtest simulation…"):
-                res, err = run_portfolio_simulation(
-                    edited_df,
-                    start_date,
-                    end_date,
-                    initial_amount,
-                    skip_sunday
-                )
-                
+        should_run = track_btn or refresh_btn
+        
+        if should_run:
+            if start_date > datetime.today().date():
+                st.error("Start Date cannot be in the future.")
+            else:
+                with st.spinner("Fetching latest NAVs from AMFI..."):
+                    res, err = run_live_portfolio(
+                        edited_df,
+                        start_date,
+                        initial_amount,
+                        skip_sunday
+                    )
+                    
                 if err:
                     st.error(err)
-                    return
+                else:
+                    met = res["metrics"]
+                    nav_date_display = met.get("NAV Date", "N/A")
                     
-                render_section_header("📊", "Performance Summary")
-                met = res["metrics"]
-                
-                gain_sign = "+" if met["Gain/Loss"] >= 0 else ""
-                ret_sign = "+" if met["Absolute Return (%)"] >= 0 else ""
-                
-                st.markdown(
-                    f"""
-                    <div class="metrics-grid">
-                        <div class="metric-card">
-                            <span class="metric-label">Initial Capital</span>
-                            <span class="metric-value">₹{met['Initial Value']:,.2f}</span>
-                        </div>
-                        <div class="metric-card">
-                            <span class="metric-label">Ending Value</span>
-                            <span class="metric-value">₹{met['Final Value']:,.2f}</span>
-                        </div>
-                        <div class="metric-card">
-                            <span class="metric-label">Gain / Loss</span>
-                            <span class="metric-value accent">{gain_sign}₹{met['Gain/Loss']:,.2f} ({ret_sign}{met['Absolute Return (%)']:.2f}%)</span>
-                        </div>
-                        <div class="metric-card">
-                            <span class="metric-label">Max Drawdown</span>
-                            <span class="metric-value" style="color: #ff4b4b;">{met['Max Drawdown (%)']:.2f}%</span>
-                        </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-                
-                st.markdown(
-                    f"""
-                    <div class="stat-row" style="margin-top: 15px;">
-                        <span class="stat-chip">📈 Best Day: {met['Best Day Return (%)']:.2f}%</span>
-                        <span class="stat-chip">📉 Worst Day: {met['Worst Day Return (%)']:.2f}%</span>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-                
-                render_section_header("📈", "Portfolio Value Over Time")
-                chart_df = res["tracker"].copy()
-                chart_df["Date_dt"] = pd.to_datetime(chart_df["Date"], format="%d-%m-%Y")
-                chart_df = chart_df.set_index("Date_dt")
-                
-                st.line_chart(chart_df["Total Portfolio Value (₹)"])
-                
-                render_section_header("👁️", "Daily Valuation Tracker")
-                df_disp = res["tracker"].copy()
-                st.dataframe(
-                    df_disp,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Daily Return (%)": st.column_config.NumberColumn("Daily Return (%)", format="%.2f%%"),
-                        "Cumulative Return (%)": st.column_config.NumberColumn("Cumulative Return (%)", format="%.2f%%")
-                    }
-                )
-                
-                render_section_header("📥", "Export Portfolio Report")
-                with st.spinner("Generating Excel report…"):
-                    excel_bytes = style_portfolio_excel(res)
+                    # ── Prominent LIVE current value ──────────────────────────
+                    gain_color = "#10b981" if met["Total Gain/Loss"] >= 0 else "#ef4444"
+                    today_color = "#10b981" if met["Today's Change"] >= 0 else "#ef4444"
+                    gain_sign = "+" if met["Total Gain/Loss"] >= 0 else ""
+                    today_sign = "+" if met["Today's Change"] >= 0 else ""
                     
-                st.download_button(
-                    label="Download Portfolio Report (.xlsx)",
-                    data=excel_bytes,
-                    file_name=f"portfolio_report_{st.session_state['active_bucket_name']}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
+                    st.markdown(
+                        f"""
+                        <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); border-radius: 16px; padding: 28px 32px; margin-bottom: 20px; border: 1px solid rgba(212,175,55,0.3);">
+                            <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 16px;">
+                                <div>
+                                    <div style="color: #94a3b8; font-size: 13px; text-transform: uppercase; letter-spacing: 1px;">Current Portfolio Value</div>
+                                    <div style="color: #f8fafc; font-size: 36px; font-weight: 700; margin: 4px 0;">₹{met['Current Value']:,.2f}</div>
+                                    <div style="color: {gain_color}; font-size: 16px; font-weight: 600;">{gain_sign}₹{met['Total Gain/Loss']:,.2f} ({gain_sign}{met['Total Return (%)']:.2f}%) total</div>
+                                </div>
+                                <div style="text-align: right;">
+                                    <div style="color: #94a3b8; font-size: 13px; text-transform: uppercase; letter-spacing: 1px;">Today's Change</div>
+                                    <div style="color: {today_color}; font-size: 24px; font-weight: 700; margin: 4px 0;">{today_sign}₹{met["Today's Change"]:,.2f}</div>
+                                    <div style="color: {today_color}; font-size: 14px;">{today_sign}{met["Today's Change (%)"]:.2f}%</div>
+                                    <div style="color: #64748b; font-size: 12px; margin-top: 6px;">NAV as of {nav_date_display}</div>
+                                </div>
+                            </div>
+                            <div style="display: flex; gap: 24px; margin-top: 16px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.1);">
+                                <div><span style="color: #64748b; font-size: 12px;">Invested</span><br><span style="color: #e2e8f0; font-weight: 600;">₹{met['Initial Value']:,.2f}</span></div>
+                                <div><span style="color: #64748b; font-size: 12px;">Max Drawdown</span><br><span style="color: #ef4444; font-weight: 600;">{met['Max Drawdown (%)']:.2f}%</span></div>
+                                <div><span style="color: #64748b; font-size: 12px;">Best Day</span><br><span style="color: #10b981; font-weight: 600;">{met['Best Day Return (%)']:.2f}%</span></div>
+                                <div><span style="color: #64748b; font-size: 12px;">Worst Day</span><br><span style="color: #ef4444; font-weight: 600;">{met['Worst Day Return (%)']:.2f}%</span></div>
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+                    
+                    # ── Fund-wise breakdown ───────────────────────────────────
+                    render_section_header("💼", "Fund-wise Holdings")
+                    st.dataframe(
+                        res["composition"],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Weight (%)": st.column_config.NumberColumn("Weight (%)", format="%.2f%%"),
+                            "Return (%)": st.column_config.NumberColumn("Return (%)", format="%.2f%%"),
+                        }
+                    )
+                    
+                    # ── Portfolio Value Chart ─────────────────────────────────
+                    render_section_header("📈", "Portfolio Value Over Time")
+                    chart_df = res["tracker"].copy()
+                    chart_df["Date_dt"] = pd.to_datetime(chart_df["Date"], format="%d-%m-%Y")
+                    chart_df = chart_df.set_index("Date_dt")
+                    st.line_chart(chart_df["Total Portfolio Value (₹)"])
+                    
+                    # ── Daily History ─────────────────────────────────────────
+                    with st.expander("📋 Daily Valuation History", expanded=False):
+                        st.dataframe(
+                            res["tracker"],
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Daily Return (%)": st.column_config.NumberColumn("Daily Return (%)", format="%.2f%%"),
+                                "Cumulative Return (%)": st.column_config.NumberColumn("Cumulative Return (%)", format="%.2f%%")
+                            }
+                        )
+                    
+                    # ── Export ─────────────────────────────────────────────────
+                    render_section_header("📥", "Export Report")
+                    with st.spinner("Generating Excel report..."):
+                        excel_bytes = style_portfolio_excel(res)
+                        
+                    st.download_button(
+                        label="Download Portfolio Report (.xlsx)",
+                        data=excel_bytes,
+                        file_name=f"portfolio_{st.session_state['active_bucket_name']}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
                 
         render_app_footer()
         return
