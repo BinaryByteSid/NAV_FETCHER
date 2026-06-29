@@ -635,8 +635,14 @@ def parse_bucket_input(uploaded_file=None, data_editor_df=None) -> pd.DataFrame:
                 res_df["Scheme Name"] = res_df["ISIN"]
                 
             if weight_col is not None:
-                w_series = df[weight_col].astype(str).str.replace("%", "").str.strip()
-                res_df["Weight (%)"] = pd.to_numeric(w_series, errors="coerce").fillna(0.0)
+                clean_series = df[weight_col].astype(str).str.replace("%", "").str.strip()
+                parsed_vals = pd.to_numeric(clean_series, errors="coerce").fillna(0.0)
+                # If weights are formatted/saved as decimals (e.g. 0.08, 0.089 instead of 8.0, 8.9),
+                # they will have max <= 1.0 and sum <= 1.05. Convert them to percentage format.
+                if parsed_vals.max() <= 1.0 and parsed_vals.sum() <= 1.05 and parsed_vals.sum() > 0:
+                    res_df["Weight (%)"] = parsed_vals * 100.0
+                else:
+                    res_df["Weight (%)"] = parsed_vals
             else:
                 res_df["Weight (%)"] = 100.0 / len(res_df)
                 
