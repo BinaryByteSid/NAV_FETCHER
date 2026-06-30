@@ -1299,7 +1299,12 @@ def main() -> None:
                         chart_df = res["tracker"].copy()
                         chart_df["Date_dt"] = pd.to_datetime(chart_df["Date"], format="%d-%m-%Y")
                         chart_df = chart_df.set_index("Date_dt")
-                        st.line_chart(chart_df["Total Portfolio Value (₹)"])
+                        chart_cols = ["Total Portfolio Value (₹)"]
+                        if "Nifty 50 Valuation (₹)" in chart_df.columns:
+                            chart_cols.append("Nifty 50 Valuation (₹)")
+                        if "Nifty 500 Valuation (₹)" in chart_df.columns:
+                            chart_cols.append("Nifty 500 Valuation (₹)")
+                        st.line_chart(chart_df[chart_cols])
                         
                         # ── Daily History ─────────────────────────────────────────
                         with st.expander("📋 Daily Valuation History", expanded=False):
