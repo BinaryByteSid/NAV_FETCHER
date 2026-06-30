@@ -1141,6 +1141,16 @@ def main() -> None:
                 ])
                 st.session_state["portfolio_buckets"] = {"Default Balanced Portfolio": default_df}
                 st.session_state["active_bucket_name"] = "Default Balanced Portfolio"
+                
+            if "portfolio_results" not in st.session_state:
+                st.session_state["portfolio_results"] = None
+            if "last_active_bucket" not in st.session_state:
+                st.session_state["last_active_bucket"] = st.session_state["active_bucket_name"]
+                
+            # If active bucket changed, reset portfolio results to avoid stale data display
+            if st.session_state["last_active_bucket"] != st.session_state["active_bucket_name"]:
+                st.session_state["portfolio_results"] = None
+                st.session_state["last_active_bucket"] = st.session_state["active_bucket_name"]
 
             # Bucket selection & management controls
             render_section_header("📁", "Bucket Management", "Create, switch, or delete fund buckets")
@@ -1155,20 +1165,23 @@ def main() -> None:
                 st.session_state["active_bucket_name"] = active_bucket
                 
             with col_m2:
-                new_bucket_name = st.text_input("New Bucket Name", placeholder="e.g. My Conservative Portfolio")
+                new_bucket_name_raw = st.text_input("New Bucket Name", placeholder="e.g. My Conservative Portfolio")
+                new_bucket_name = new_bucket_name_raw.strip()
                 c_add, c_del = st.columns(2)
                 with c_add:
                     if st.button("Create New Bucket", use_container_width=True):
-                        if new_bucket_name.strip() and new_bucket_name not in st.session_state["portfolio_buckets"]:
+                        if new_bucket_name and new_bucket_name not in st.session_state["portfolio_buckets"]:
                             curr_df = st.session_state["portfolio_buckets"][st.session_state["active_bucket_name"]].copy()
                             st.session_state["portfolio_buckets"][new_bucket_name] = curr_df
                             st.session_state["active_bucket_name"] = new_bucket_name
+                            st.session_state["portfolio_results"] = None
                             st.rerun()
                 with c_del:
                     if st.button("Delete Active Bucket", use_container_width=True, type="secondary"):
                         if len(st.session_state["portfolio_buckets"]) > 1:
                             del st.session_state["portfolio_buckets"][st.session_state["active_bucket_name"]]
                             st.session_state["active_bucket_name"] = list(st.session_state["portfolio_buckets"].keys())[0]
+                            st.session_state["portfolio_results"] = None
                             st.rerun()
                         else:
                             st.warning("Cannot delete the last remaining bucket.")
@@ -1198,6 +1211,7 @@ def main() -> None:
                 if not parsed_df.empty:
                     st.session_state["portfolio_buckets"][st.session_state["active_bucket_name"]] = parsed_df
                     current_bucket_df = parsed_df
+                    st.session_state["portfolio_results"] = None
                     st.success("Successfully loaded bucket from file!")
                     
             edited_df = st.data_editor(
@@ -1208,7 +1222,8 @@ def main() -> None:
                     "Weight (%)": st.column_config.NumberColumn("Weight (%)", min_value=0.0, max_value=100.0, format="%.2f%%", required=True, help="Percentage weight in portfolio")
                 },
                 num_rows="dynamic",
-                use_container_width=True
+                use_container_width=True,
+                key=f"editor_{st.session_state['active_bucket_name']}"
             )
             
             if edited_df is not None:
@@ -1229,25 +1244,27 @@ def main() -> None:
             with col_btn2:
                 refresh_btn = st.button("🔄 Refresh", use_container_width=True)
             
-            should_run = track_btn or refresh_btn
-            
-            if should_run:
+            if track_btn or refresh_btn:
                 if start_date > datetime.today().date():
                     st.error("Start Date cannot be in the future.")
                 else:
                     with st.spinner("Fetching latest NAVs from AMFI..."):
-                        res, err = run_live_portfolio(
+                        res_temp, err_temp = run_live_portfolio(
                             edited_df,
                             start_date,
                             initial_amount,
                             skip_sunday
                         )
-                        
-                    if err:
-                        st.error(err)
+                    if err_temp:
+                        st.error(err_temp)
+                        st.session_state["portfolio_results"] = None
                     else:
-                        met = res["metrics"]
-                        nav_date_display = met.get("NAV Date", "N/A")
+                        st.session_state["portfolio_results"] = res_temp
+                        
+            if st.session_state["portfolio_results"] is not None:
+                res = st.session_state["portfolio_results"]
+                met = res["metrics"]
+                nav_date_display = met.get("NAV Date", "N/A")
                         
                         # ── Prominent LIVE current value ──────────────────────────
                         gain_color = "#10b981" if met["Total Gain/Loss"] >= 0 else "#ef4444"

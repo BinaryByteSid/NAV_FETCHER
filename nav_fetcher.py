@@ -959,24 +959,30 @@ def run_live_portfolio(bucket_df: pd.DataFrame, start_date, initial_amount: floa
         
     daily_rows = []
     for d in target_date_cols:
-        row_val = {"Date": d}
+        # Calculate daily Nifty index relative valuations
+        n50_c = n50_closes.get(d) or n50_base
+        n500_c = n500_closes.get(d) or n500_base
+        
+        n50_val = round(initial_amount * (n50_c / n50_base), 2)
+        n500_val = round(initial_amount * (n500_c / n500_base), 2)
+        
+        # Calculate fund-wise values
+        fund_vals = {}
         total_val = 0.0
         for idx, row in df_sim.iterrows():
             name = row["Scheme Name"] or row["ISIN"]
             nav_t = row[d]
             val_t = row["Units"] * nav_t
-            row_val[f"{name} (₹)"] = round(val_t, 2)
+            fund_vals[f"{name} (₹)"] = round(val_t, 2)
             total_val += val_t
             
-        row_val["Total Portfolio Value (₹)"] = round(total_val, 2)
-        
-        # Calculate daily Nifty index relative valuations
-        n50_c = n50_closes.get(d) or n50_base
-        n500_c = n500_closes.get(d) or n500_base
-        
-        row_val["Nifty 50 Valuation (₹)"] = round(initial_amount * (n50_c / n50_base), 2)
-        row_val["Nifty 500 Valuation (₹)"] = round(initial_amount * (n500_c / n500_base), 2)
-        
+        row_val = {
+            "Date": d,
+            "Total Portfolio Value (₹)": round(total_val, 2),
+            "Nifty 50 Valuation (₹)": n50_val,
+            "Nifty 500 Valuation (₹)": n500_val,
+        }
+        row_val.update(fund_vals)
         daily_rows.append(row_val)
         
     df_tracker = pd.DataFrame(daily_rows)
