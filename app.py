@@ -1086,10 +1086,12 @@ def main() -> None:
                                 return "background-color: #bbf7d0; color: #166534; font-weight: bold; text-align: center;"
                             return ""
 
-                        styled_df = df_display.style.applymap(
-                            highlight_riskometer, 
-                            subset=[col for col in ["Riskometer (Scheme)", "Riskometer (Benchmark)"] if col in df_display.columns]
-                        )
+                        styled_df = df_display.style
+                        subset_cols = [col for col in ["Riskometer (Scheme)", "Riskometer (Benchmark)"] if col in df_display.columns]
+                        if hasattr(styled_df, "map"):
+                            styled_df = styled_df.map(highlight_riskometer, subset=subset_cols)
+                        else:
+                            styled_df = styled_df.applymap(highlight_riskometer, subset=subset_cols)
                         
                         # Display the beautiful interactive styled table
                         st.dataframe(
