@@ -1146,6 +1146,8 @@ def main() -> None:
                 st.session_state["portfolio_results"] = None
             if "last_active_bucket" not in st.session_state:
                 st.session_state["last_active_bucket"] = st.session_state["active_bucket_name"]
+            if "last_processed_file" not in st.session_state:
+                st.session_state["last_processed_file"] = None
                 
             # If active bucket changed, reset portfolio results to avoid stale data display
             if st.session_state["last_active_bucket"] != st.session_state["active_bucket_name"]:
@@ -1207,19 +1209,24 @@ def main() -> None:
             
             current_bucket_df = st.session_state["portfolio_buckets"][st.session_state["active_bucket_name"]]
             if uploaded_file is not None:
-                parsed_df = parse_bucket_input(uploaded_file=uploaded_file)
-                if not parsed_df.empty:
-                    st.session_state["portfolio_buckets"][st.session_state["active_bucket_name"]] = parsed_df
-                    current_bucket_df = parsed_df
-                    st.session_state["portfolio_results"] = None
-                    st.success("Successfully loaded bucket from file!")
+                file_key = f"processed_{uploaded_file.name}_{uploaded_file.size}"
+                if st.session_state.get("last_processed_file") != file_key:
+                    parsed_df = parse_bucket_input(uploaded_file=uploaded_file)
+                    if not parsed_df.empty:
+                        st.session_state["portfolio_buckets"][st.session_state["active_bucket_name"]] = parsed_df
+                        current_bucket_df = parsed_df
+                        st.session_state["portfolio_results"] = None
+                        st.session_state["last_processed_file"] = file_key
+                        st.success("Successfully loaded bucket from file!")
+            else:
+                st.session_state["last_processed_file"] = None
                     
             edited_df = st.data_editor(
                 current_bucket_df,
                 column_config={
                     "Scheme Name": st.column_config.TextColumn("Scheme Name", width="large", help="Optional name for display"),
                     "ISIN": st.column_config.TextColumn("ISIN", required=True, help="Mutual Fund ISIN (Growth or Reinvestment)"),
-                    "Weight (%)": st.column_config.NumberColumn("Weight (%)", min_value=0.0, max_value=100.0, format="%.10f%%", step=1e-10, required=True, help="Percentage weight in portfolio")
+                    "Weight (%)": st.column_config.NumberColumn("Weight (%)", min_value=0.0, max_value=100.0, format="%.10f", step=1e-10, required=True, help="Percentage weight in portfolio")
                 },
                 num_rows="dynamic",
                 use_container_width=True,
