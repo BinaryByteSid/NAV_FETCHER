@@ -1044,7 +1044,7 @@ def run_live_portfolio(bucket_df: pd.DataFrame, start_date, initial_amount: floa
             "ISIN": isin,
             "Weight (%)": weight,
             "Initial Allocation (₹)": round(initial_alloc, 2),
-            "Units": round(units, 4),
+            "Units": round(units, 10),
             "Buy NAV (₹)": round(row[t0], 4),
             "Current NAV (₹)": round(final_nav, 4),
             "Current Value (₹)": round(final_val_fund, 2),
@@ -1148,10 +1148,13 @@ def style_portfolio_excel(res_dict: dict) -> bytes:
             if col_name in ("Scheme Name", "ISIN"):
                 cell.alignment = left_va
             elif "Weight" in col_name or "Return" in col_name:
-                cell.number_format = '0.00"%"'
+                if "Weight" in col_name:
+                    cell.number_format = '0.0000000000"%"'
+                else:
+                    cell.number_format = '0.00"%"'
                 cell.alignment = right_va
             elif "Units" in col_name:
-                cell.number_format = "0.0000"
+                cell.number_format = "0.0000000000"
                 cell.alignment = right_va
             else:
                 cell.number_format = "0.00"
