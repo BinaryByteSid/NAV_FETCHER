@@ -963,8 +963,8 @@ def run_live_portfolio(bucket_df: pd.DataFrame, start_date, initial_amount: floa
         n50_c = n50_closes.get(d) or n50_base
         n500_c = n500_closes.get(d) or n500_base
         
-        n50_val = round(initial_amount * (n50_c / n50_base), 2)
-        n500_val = round(initial_amount * (n500_c / n500_base), 2)
+        n50_val = round(initial_amount * (n50_c / n50_base), 10)
+        n500_val = round(initial_amount * (n500_c / n500_base), 10)
         
         # Calculate fund-wise values
         fund_vals = {}
@@ -973,12 +973,12 @@ def run_live_portfolio(bucket_df: pd.DataFrame, start_date, initial_amount: floa
             name = row["Scheme Name"] or row["ISIN"]
             nav_t = row[d]
             val_t = row["Units"] * nav_t
-            fund_vals[f"{name} (₹)"] = round(val_t, 2)
+            fund_vals[f"{name} (₹)"] = round(val_t, 10)
             total_val += val_t
             
         row_val = {
             "Date": d,
-            "Total Portfolio Value (₹)": round(total_val, 2),
+            "Total Portfolio Value (₹)": round(total_val, 10),
             "Nifty 50 Valuation (₹)": n50_val,
             "Nifty 500 Valuation (₹)": n500_val,
         }
@@ -1043,11 +1043,11 @@ def run_live_portfolio(bucket_df: pd.DataFrame, start_date, initial_amount: floa
             "Scheme Name": name,
             "ISIN": isin,
             "Weight (%)": weight,
-            "Initial Allocation (₹)": round(initial_alloc, 2),
+            "Initial Allocation (₹)": round(initial_alloc, 10),
             "Units": round(units, 10),
             "Buy NAV (₹)": round(row[t0], 4),
             "Current NAV (₹)": round(final_nav, 4),
-            "Current Value (₹)": round(final_val_fund, 2),
+            "Current Value (₹)": round(final_val_fund, 10),
             "Return (%)": round(fund_return, 2)
         })
         
@@ -1118,7 +1118,7 @@ def style_portfolio_excel(res_dict: dict) -> bytes:
                 cell.number_format = '0.00"%"'
                 cell.alignment = right_va
             else:
-                cell.number_format = "0.00"
+                cell.number_format = "0.0000000000"
                 cell.alignment = right_va
                 
     for col in ws1.columns:
@@ -1157,7 +1157,7 @@ def style_portfolio_excel(res_dict: dict) -> bytes:
                 cell.number_format = "0.0000000000"
                 cell.alignment = right_va
             else:
-                cell.number_format = "0.00"
+                cell.number_format = "0.0000000000"
                 cell.alignment = right_va
                 
     for col in ws2.columns:
