@@ -1226,7 +1226,7 @@ def main() -> None:
                 column_config={
                     "Scheme Name": st.column_config.TextColumn("Scheme Name", width="large", help="Optional name for display"),
                     "ISIN": st.column_config.TextColumn("ISIN", required=True, help="Mutual Fund ISIN (Growth or Reinvestment)"),
-                    "Weight (%)": st.column_config.NumberColumn("Weight (%)", min_value=0.0, max_value=100.0, format="%.10f", step=1e-10, required=True, help="Percentage weight in portfolio")
+                    "Weight (%)": st.column_config.TextColumn("Weight (%)", required=True, help="Percentage weight in portfolio (e.g. 8.9123456789)")
                 },
                 num_rows="dynamic",
                 use_container_width=True,
@@ -1234,6 +1234,12 @@ def main() -> None:
             )
             
             if edited_df is not None:
+                # Convert manual string weight input back to float, replacing invalid text with 0.0
+                if "Weight (%)" in edited_df.columns:
+                    edited_df["Weight (%)"] = pd.to_numeric(
+                        edited_df["Weight (%)"].astype(str).str.replace("%", "").str.strip(), 
+                        errors="coerce"
+                    ).fillna(0.0)
                 st.session_state["portfolio_buckets"][st.session_state["active_bucket_name"]] = edited_df
                 
             weight_sum = edited_df["Weight (%)"].sum() if not edited_df.empty else 0
