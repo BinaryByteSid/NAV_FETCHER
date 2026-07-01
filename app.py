@@ -1229,8 +1229,12 @@ def main() -> None:
             else:
                 st.session_state["last_processed_file"] = None
                     
+            current_bucket_df_editor = current_bucket_df.copy()
+            if "Weight (%)" in current_bucket_df_editor.columns:
+                current_bucket_df_editor["Weight (%)"] = current_bucket_df_editor["Weight (%)"].astype(str)
+                
             edited_df = st.data_editor(
-                current_bucket_df,
+                current_bucket_df_editor,
                 column_config={
                     "Scheme Name": st.column_config.TextColumn("Scheme Name", width="large", help="Optional name for display"),
                     "ISIN": st.column_config.TextColumn("ISIN", required=True, help="Mutual Fund ISIN (Growth or Reinvestment)"),
