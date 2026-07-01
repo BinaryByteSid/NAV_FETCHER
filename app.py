@@ -1219,7 +1219,7 @@ def main() -> None:
                 column_config={
                     "Scheme Name": st.column_config.TextColumn("Scheme Name", width="large", help="Optional name for display"),
                     "ISIN": st.column_config.TextColumn("ISIN", required=True, help="Mutual Fund ISIN (Growth or Reinvestment)"),
-                    "Weight (%)": st.column_config.NumberColumn("Weight (%)", min_value=0.0, max_value=100.0, format="%.10f%%", required=True, help="Percentage weight in portfolio")
+                    "Weight (%)": st.column_config.NumberColumn("Weight (%)", min_value=0.0, max_value=100.0, format="%.10f%%", step=1e-10, required=True, help="Percentage weight in portfolio")
                 },
                 num_rows="dynamic",
                 use_container_width=True,
