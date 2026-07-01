@@ -1196,7 +1196,7 @@ def main() -> None:
             with col_a:
                 start_date = st.date_input("Investment Start Date", value=(datetime.today() - timedelta(days=90)).date())
             with col_b:
-                initial_amount = st.number_input("Investment Amount (₹)", value=100000.0, min_value=100.0, step=1000.0)
+                initial_amount = st.number_input("Investment Amount (₹)", value=100000.0, min_value=0.01, format="%.10f", step=1e-10)
             with col_c:
                 skip_sunday = st.checkbox("Skip Sundays", value=True)
 
