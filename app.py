@@ -4,7 +4,7 @@ import os
 import re
 from datetime import datetime, timedelta
 from io import BytesIO, StringIO
-from typing import List
+from typing import List, Tuple
 
 import pandas as pd
 import requests
@@ -568,6 +568,286 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
     return df[final_cols]
 
 
+def run_historical_export(
+    parsed_isins: List[str],
+    start_date: datetime.date,
+    end_date: datetime.date,
+    carry_forward: bool,
+    skip_sundays: bool,
+    want_nav: bool,
+    want_aum: bool,
+    want_flows: bool
+) -> Tuple[pd.DataFrame, bool, str | None]:
+    if want_flows:
+        want_nav = True
+        want_aum = True
+        
+    fetch_start_date = start_date
+    if want_flows:
+        fetch_start_date = start_date - timedelta(days=10)
+        
+    try:
+        frmdt_str = fetch_start_date.strftime("%d-%b-%Y")
+        todt_str = end_date.strftime("%d-%b-%Y")
+        
+        url = f"https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx?frmdt={frmdt_str}&todt={todt_str}"
+        import time
+        max_retries = 3
+        delay = 2.0
+        response = None
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, stream=True, timeout=300)
+                response.raise_for_status()
+                break
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                if attempt == max_retries - 1:
+                    raise e
+                time.sleep(delay)
+                delay *= 2
+    
+        rows = []
+        current_section = "Unknown"
+    
+        df_port = load_portfolio_aum_data()
+        parsed_isins_set = {x.upper() for x in parsed_isins}
+    
+        for line_bytes in response.iter_lines():
+            if not line_bytes:
+                continue
+            line = line_bytes.decode('utf-8', errors='ignore')
+        
+            # Fast check: AMC and section lines do not contain semicolons
+            if ";" not in line:
+                line_stripped = line.strip()
+                if (
+                    line_stripped.startswith("Open Ended")
+                    or line_stripped.startswith("Closed Ended")
+                    or line_stripped.startswith("Interval Fund Schemes")
+                ):
+                    current_section = line_stripped
+                continue
+        
+            parts = line.split(";")
+            if len(parts) < 8:
+                continue
+            
+            isin_growth = parts[2].strip()
+            isin_reinvestment = parts[3].strip()
+        
+            isin_growth_upper = isin_growth.upper() if isin_growth != "-" else ""
+            isin_reinvest_upper = isin_reinvestment.upper() if isin_reinvestment != "-" else ""
+        
+            g_match = isin_growth_upper and isin_growth_upper in parsed_isins_set
+            r_match = isin_reinvest_upper and isin_reinvest_upper in parsed_isins_set
+        
+            if g_match or r_match:
+                scheme_code = parts[0].strip()
+                scheme_name = parts[1].strip()
+                nav_value = parts[4].strip()
+                nav_date = parts[7].strip()
+            
+                scheme_code = scheme_code if scheme_code != "-" else None
+                isin_growth = isin_growth if isin_growth != "-" else None
+                isin_reinvestment = isin_reinvestment if isin_reinvestment != "-" else None
+            
+                nav = pd.to_numeric(nav_value.replace(",", ""), errors="coerce")
+                rows.append({
+                    "Asset Class": current_section,
+                    "Scheme Code": scheme_code,
+                    "ISIN Div Payout / ISIN Growth": isin_growth,
+                    "ISIN Div Reinvestment": isin_reinvestment,
+                    "Scheme Name": scheme_name,
+                    "NAV": nav,
+                    "Date": nav_date
+                })
+                
+        if not rows:
+            return pd.DataFrame(), False, "No NAV records found matching the specified criteria and date range."
+            
+        df_raw = pd.DataFrame(rows)
+        
+        df_raw["Plan Type"] = df_raw["Scheme Name"].apply(classify_plan_type)
+        df_raw["Option Type"] = df_raw["Scheme Name"].apply(classify_option_type)
+    
+        # Infer proper Asset Class
+        known_sections = ["Open Ended", "Closed Ended", "Interval Fund Schemes"]
+        def infer_section_from_name(name: str) -> str:
+            lowered = name.lower()
+            if "flexi" in lowered:
+                return "Open Ended Schemes (Equity Scheme - Flexi Cap Fund)"
+            if "mid" in lowered:
+                return "Open Ended Schemes (Equity Scheme - Mid Cap Fund)"
+            if "small" in lowered:
+                return "Open Ended Schemes (Equity Scheme - Small Cap Fund)"
+            if "large" in lowered:
+                return "Open Ended Schemes (Equity Scheme - Large Cap Fund)"
+            if "focused" in lowered or "focus" in lowered:
+                return "Open Ended Schemes (Equity Scheme - Focused Fund)"
+            return "Open Ended Schemes (Equity Scheme - Large Cap Fund)"
+        df_raw["Asset Class"] = df_raw.apply(
+            lambda row: row["Asset Class"] if any(row["Asset Class"].startswith(s) for s in known_sections) else infer_section_from_name(row["Scheme Name"]),
+            axis=1)
+        df_raw = populate_actual_aum(df_raw, df_port)
+        if not df_raw.empty:
+            parsed_dates = parse_amfi_date_series(df_raw["Date"])
+            df_raw["Date_parsed"] = parsed_dates
+            df_raw["Date"] = parsed_dates.dt.strftime("%d-%m-%Y")
+            df_raw = df_raw.sort_values(["Scheme Code", "Date_parsed"]).reset_index(drop=True)
+            df_raw["Prev NAV"] = df_raw.groupby("Scheme Code")["NAV"].shift(1)
+            df_raw["Daily Return %"] = (
+                (df_raw["NAV"] - df_raw["Prev NAV"]) / df_raw["Prev NAV"] * 100
+            ).where(df_raw["Prev NAV"].notna() & (df_raw["Prev NAV"] != 0))
+            df_raw["Prev AUM"] = df_raw.groupby("Scheme Code")["AUM"].shift(1)
+            df_raw["Flows"] = (
+                df_raw["Daily Return %"] / 100 * df_raw["Prev AUM"]
+            ).where(df_raw["Daily Return %"].notna() & df_raw["Prev AUM"].notna())
+            df_raw.drop(columns=["Prev NAV", "Prev AUM", "Date_parsed"], inplace=True)
+            
+        all_dates = pd.date_range(start=fetch_start_date, end=end_date)
+    
+        target_dates = []
+        for dt in all_dates:
+            if skip_sundays and dt.weekday() == 6:
+                continue
+            target_dates.append(dt.strftime("%d-%m-%Y"))
+        
+        fund_metadata = df_raw[[
+            "Asset Class", 
+            "Scheme Code", 
+            "ISIN Div Payout / ISIN Growth", 
+            "ISIN Div Reinvestment", 
+            "Scheme Name", 
+            "Plan Type", 
+            "Option Type"
+        ]].drop_duplicates(subset=["Scheme Code"])
+    
+        if want_nav and not want_aum:
+            df_pivot = df_raw.pivot(index="Scheme Code", columns="Date", values="NAV").reset_index()
+            display_date_cols = target_dates
+            is_aum_only = False
+        elif want_aum and not want_nav:
+            df_pivot = df_raw.pivot(index="Scheme Code", columns="Date", values="AUM").reset_index()
+            display_date_cols = target_dates
+            is_aum_only = True
+        else:
+            df_pivot_nav = df_raw.pivot(index="Scheme Code", columns="Date", values="NAV").reset_index()
+            df_pivot_aum = df_raw.pivot(index="Scheme Code", columns="Date", values="AUM").reset_index()
+            df_pivot_flow = df_raw.pivot(index="Scheme Code", columns="Date", values="Flows").reset_index()
+            nav_cols_map = {d: f"{d} (NAV)" for d in target_dates if d in df_pivot_nav.columns}
+            aum_cols_map = {d: f"{d} (AUM)" for d in target_dates if d in df_pivot_aum.columns}
+            flow_cols_map = {d: f"{d} (Flows)" for d in target_dates if d in df_pivot_flow.columns}
+            df_pivot_nav = df_pivot_nav.rename(columns=nav_cols_map)
+            df_pivot_aum = df_pivot_aum.rename(columns=aum_cols_map)
+            df_pivot_flow = df_pivot_flow.rename(columns=flow_cols_map)
+            df_pivot = pd.merge(df_pivot_nav, df_pivot_aum, on="Scheme Code", how="left")
+            df_pivot = pd.merge(df_pivot, df_pivot_flow, on="Scheme Code", how="left")
+            interleaved_dates = []
+            for d in target_dates:
+                interleaved_dates.append(f"{d} (NAV)")
+                interleaved_dates.append(f"{d} (AUM)")
+                interleaved_dates.append(f"{d} (Flows)")
+            display_date_cols = interleaved_dates
+            is_aum_only = False
+    
+        df_final = pd.merge(fund_metadata, df_pivot, on="Scheme Code", how="left")
+    
+        for date_col in display_date_cols:
+            if date_col not in df_final.columns:
+                df_final[date_col] = None
+            
+        if carry_forward and len(target_dates) > 1:
+            date_objs = sorted([datetime.strptime(d, "%d-%m-%Y") for d in target_dates])
+            sorted_date_cols = [d.strftime("%d-%m-%Y") for d in date_objs]
+        
+            for i in range(1, len(sorted_date_cols)):
+                prev_col = sorted_date_cols[i-1]
+                curr_col = sorted_date_cols[i]
+            
+                if want_nav and not want_aum:
+                    df_final[curr_col] = df_final[curr_col].fillna(df_final[prev_col])
+                elif want_aum and not want_nav:
+                    pass
+                else:
+                    df_final[f"{curr_col} (NAV)"] = df_final[f"{curr_col} (NAV)"].fillna(df_final[f"{prev_col} (NAV)"])
+                
+        if want_aum:
+            df_pivot_fallback = df_raw.pivot(index="Scheme Code", columns="Date", values="Fallback_AUM").reset_index()
+            fallback_cols_map = {}
+            for d in target_dates:
+                if want_aum and not want_nav:
+                    fallback_cols_map[d] = f"{d}_fallback_temp"
+                elif want_nav and want_aum:
+                    fallback_cols_map[f"{d} (AUM)"] = f"{d}_fallback_temp"
+                
+            if fallback_cols_map:
+                df_pivot_fallback_renamed = df_pivot_fallback.rename(columns={d: f"{d}_fallback_temp" for d in target_dates if d in df_pivot_fallback.columns})
+                available_temp_cols = [col for col in fallback_cols_map.values() if col in df_pivot_fallback_renamed.columns]
+                df_final_temp = pd.merge(df_final, df_pivot_fallback_renamed[["Scheme Code"] + available_temp_cols], on="Scheme Code", how="left")
+                for main_col, temp_col in fallback_cols_map.items():
+                    if main_col in df_final.columns and temp_col in df_final_temp.columns:
+                        df_final[main_col] = df_final[main_col].fillna(df_final_temp[temp_col])
+            
+        vertical_rows = []
+        for _, row in df_final.iterrows():
+            meta = {
+                "Asset Class": row["Asset Class"],
+                "Scheme Code": row["Scheme Code"],
+                "ISIN Div Payout / ISIN Growth": row["ISIN Div Payout / ISIN Growth"],
+                "ISIN Div Reinvestment": row["ISIN Div Reinvestment"],
+                "Scheme Name": row["Scheme Name"],
+                "Plan Type": row["Plan Type"],
+                "Option Type": row["Option Type"]
+            }
+            for d in target_dates:
+                r_item = meta.copy()
+                if want_nav and not want_aum:
+                    r_item["NAV Date"] = d
+                    r_item["NAV"] = row[d]
+                elif want_aum and not want_nav:
+                    r_item["AUM Date"] = d
+                    r_item["AUM"] = row[d]
+                else:
+                    r_item["NAV Date"] = d
+                    r_item["NAV"] = row[f"{d} (NAV)"]
+                    r_item["AUM Date"] = d
+                    r_item["AUM"] = row[f"{d} (AUM)"]
+                vertical_rows.append(r_item)
+
+        ordered_cols = [
+            "Asset Class", 
+            "Scheme Code", 
+            "ISIN Div Payout / ISIN Growth", 
+            "ISIN Div Reinvestment", 
+            "Scheme Name", 
+            "Plan Type", 
+            "Option Type"
+        ]
+        if want_nav:
+            ordered_cols.extend(["NAV Date", "NAV"])
+        if want_aum:
+            ordered_cols.extend(["AUM Date", "AUM"])
+    
+        if vertical_rows:
+            df_res_final = pd.DataFrame(vertical_rows)
+            if "NAV Date" in df_res_final.columns:
+                parsed = parse_amfi_date_series(df_res_final["NAV Date"])
+                df_res_final["NAV Date"] = parsed.dt.strftime("%d-%m-%Y")
+            if "AUM Date" in df_res_final.columns:
+                parsed = parse_amfi_date_series(df_res_final["AUM Date"])
+                df_res_final["AUM Date"] = parsed.dt.strftime("%d-%m-%Y")
+            df_res_final = df_res_final[ordered_cols]
+            df_res_final = df_res_final.sort_values(by=["Asset Class", "Scheme Name"]).reset_index(drop=True)
+            if want_flows:
+                df_res_final = calculate_flows_for_dataframe(df_res_final, start_date, ["Asset Class", "Scheme Code", "ISIN Div Payout / ISIN Growth", "ISIN Div Reinvestment", "Scheme Name", "Plan Type", "Option Type"])
+                is_aum_only = False
+        else:
+            df_res_final = pd.DataFrame(columns=ordered_cols)
+            
+        return df_res_final, is_aum_only, None
+    except Exception as e:
+        return pd.DataFrame(), False, str(e)
+
 
 def generate_historical_excel(df_final: pd.DataFrame, target_dates: List[str], is_aum_only: bool = False) -> bytes:
     buffer = BytesIO()
@@ -873,115 +1153,99 @@ def main() -> None:
         render_section_header("🔍", "Fund Discovery", "Search single funds, run batch lookups, or generate historical ISIN reports")
         search_mode = st.radio(
             "Search mode",
-            ["Single Fund", "Batch Search", "Historical ISIN Export", "Fund Performance", "Portfolio Bucket Tracker"],
+            ["Historical ISIN Export", "Fund Performance", "Portfolio Bucket Tracker"],
             horizontal=True,
             index=0,
             label_visibility="collapsed",
         )
 
-        selected_rows = pd.DataFrame()
-        batch_export_rows = pd.DataFrame()
-        selected_summary = None
-
-        if search_mode == "Single Fund":
-            query = st.text_input(
-                "Search funds",
-                placeholder="e.g. HDFC Flexi Cap or 120439",
-                help="Fuzzy search by fund name or exact Scheme Code",
-            )
-            c_refresh, c_latest = st.columns([1, 1])
-            with c_refresh:
-                refresh_requested = st.button("Refresh from AMFI", help="Fetch the latest official feed once and update the cache.")
-            with c_latest:
-                st.metric("Latest update", latest_update)
-
-            plan_filters = st.multiselect("Plan filter", ["Regular", "Direct"], default=["Regular", "Direct"])
-            option_filters = st.multiselect("Option filter", ["Growth", "IDCW/Dividend", "Bonus", "Other"], default=["Growth", "IDCW/Dividend"])
-
-            if refresh_requested:
-                try:
-                    nav_data = load_data(force_refresh=True)
-                    summary = summarize_families(nav_data)
-                    latest_update = format_timestamp(nav_data)
-                    st.success("Refreshed AMFI data.")
-                except Exception as exc:
-                    st.error(f"Failed to refresh data: {exc}")
-                    st.stop()
-
-            suggestions: List[str] = []
-            if query.strip():
-                matches = search_fund(nav_data, query, plan_filter=plan_filters, option_filter=option_filters, limit=10)
-                suggestions = matches["Family Name"].tolist() if not matches.empty else []
-
-            selected_name = None
-            if suggestions:
-                selected_name = st.selectbox("Matching results", suggestions, index=0)
-            elif query.strip():
-                st.warning("No fuzzy matches found. Try a broader fund name.")
-
-            if selected_name:
-                matched = search_fund(nav_data, selected_name, plan_filter=plan_filters, option_filter=option_filters, limit=1)
-                if not matched.empty:
-                    selected_summary = matched.iloc[0]
-                    selected_rows = filter_family_rows(nav_data, selected_summary["Family Key"], plan_filter=plan_filters, option_filter=option_filters)
-
-        elif search_mode == "Batch Search":
-            c_refresh, c_latest = st.columns([1, 1])
-            with c_refresh:
-                refresh_requested = st.button("Refresh from AMFI", help="Fetch the latest official feed once and update the cache.")
-            with c_latest:
-                st.metric("Latest update", latest_update)
-
-            plan_filters = st.multiselect("Plan filter", ["Regular", "Direct"], default=["Regular", "Direct"])
-            option_filters = st.multiselect("Option filter", ["Growth", "IDCW/Dividend", "Bonus", "Other"], default=["Growth", "IDCW/Dividend"])
-
-            if refresh_requested:
-                try:
-                    nav_data = load_data(force_refresh=True)
-                    summary = summarize_families(nav_data)
-                    latest_update = format_timestamp(nav_data)
-                    st.success("Refreshed AMFI data.")
-                except Exception as exc:
-                    st.error(f"Failed to refresh data: {exc}")
-                    st.stop()
-
+        if search_mode == "Historical ISIN Export":
+            render_section_header("📋", "Historical ISIN Export", "Pivoted NAV/AUM reports with corporate Excel styling")
             render_info_card(
-                "<strong>Batch mode:</strong> Enter multiple fund names or scheme codes — "
-                "one per line or comma-separated — to search and export results in one go."
+                "<strong>Historical NAV Extractor:</strong> Specify a date range and target ISINs to generate "
+                "a pivoted, corporate-styled Excel sheet. Weekends and holidays can be filled via carry-forward."
             )
-            batch_queries = st.text_area(
-                "Batch search",
-                placeholder="HDFC Equity\nAxis Bluechip\n120439",
-                height=120,
-            )
-            if st.button("Run batch search", type="primary") and batch_queries.strip():
-                query_items = [item.strip() for item in re.split(r"[,\n]+", batch_queries) if item.strip()]
-                batch_matches = []
-                batch_rows = []
-                for query in query_items:
-                    found = search_fund(nav_data, query, plan_filter=plan_filters, option_filter=option_filters, limit=5)
-                    if not found.empty:
-                        found = found.copy()
-                        found.insert(0, "Search Query", query)
-                        batch_matches.append(found)
-                        batch_rows.extend(
-                            filter_family_rows(nav_data, family_key, plan_filter=plan_filters, option_filter=option_filters)
-                            for family_key in found["Family Key"].dropna().tolist()
-                        )
 
-                if batch_matches:
-                    selected_rows = pd.concat(batch_matches, ignore_index=True)
-                    flattened_rows = [row for row in batch_rows if not row.empty]
-                    if flattened_rows:
-                        batch_export_rows = pd.concat(flattened_rows, ignore_index=True).drop_duplicates(
-                            subset=["Family Key", "Scheme Code", "NAV Date", "Plan Type", "Option Type"]
-                        )
-                    st.dataframe(selected_rows, use_container_width=True, hide_index=True)
+            col1, col2 = st.columns(2)
+            with col1:
+                start_date = st.date_input("Start Date", value=datetime(2000, 1, 1).date())
+            with col2:
+                end_date = st.date_input("End Date", value=datetime(2026, 5, 29).date())
+
+            default_isins_str = "\n".join([
+                "INF209K01AJ8", "INF846K01CH7", "INF846K016E3", "INF194K01524", "INF760K01019", 
+                "INF760K01KR2", "INF740K01128", "INF179K01608", "INF179KA1RT1", "INF179K01CR2", 
+                "INF179KA1RZ8", "INF109KA1TX4", "INF109K01BZ4", "INF205KA1189", "INF205K011T7", 
+                "INF174KA1EK3", "INF174K01DS9", "INF174KA1HS9", "INF247L01478", "INF204K01GE7", 
+                "INF204K01562", "INF204K01489", "INF879O01019", "INF966L01457", "INF966L01AW4", 
+                "INF966L01234", "INF200K01370", "INF200K01CT2", "INF200K01297"
+            ])
+        
+            isin_input = st.text_area("Target ISINs (one per line or comma-separated)", value=default_isins_str, height=200)
+        
+            c1, c2 = st.columns(2)
+            with c1:
+                carry_forward = st.checkbox("Carry forward NAV on holidays/weekends", value=True)
+            with c2:
+                skip_sundays = st.checkbox("Skip Sundays", value=True)
+
+            col_c1, col_c2, col_c3 = st.columns(3)
+            with col_c1:
+                want_nav = st.checkbox("Want NAV", value=True)
+            with col_c2:
+                want_aum = st.checkbox("Want AUM", value=True)
+            with col_c3:
+                want_flows = st.checkbox("Want Flows", value=False)
+
+            if st.button("Fetch & generate Excel", type="primary", use_container_width=True):
+                parsed_isins = [x.strip() for x in re.split(r"[,\n\s]+", isin_input) if x.strip()]
+                if not want_nav and not want_aum and not want_flows:
+                    st.error("Please select at least one data type (NAV, AUM, or Flows) to export.")
+                elif not parsed_isins:
+                    st.error("Please enter at least one valid ISIN.")
+                elif start_date > end_date:
+                    st.error("Start Date cannot be after End Date.")
                 else:
-                    st.warning("No matching funds found for the batch search.")
+                    with st.spinner("Connecting to AMFI India and fetching historical data..."):
+                        df_final, is_aum_only, err = run_historical_export(
+                            parsed_isins=parsed_isins,
+                            start_date=start_date,
+                            end_date=end_date,
+                            carry_forward=carry_forward,
+                            skip_sundays=skip_sundays,
+                            want_nav=want_nav,
+                            want_aum=want_aum,
+                            want_flows=want_flows
+                        )
+                        if err:
+                            st.warning(err)
+                        elif df_final.empty:
+                            st.warning("No records found matching the specified criteria.")
+                        else:
+                            st.success(f"Successfully processed {len(df_final)} vertical records!")
+                            
+                            render_section_header("👁️", "Data Preview")
+                            st.dataframe(
+                                df_final,
+                                use_container_width=True,
+                                column_config={
+                                    "Daily return": st.column_config.NumberColumn(
+                                        "Daily return",
+                                        format="%.2f%%"
+                                    )
+                                }
+                            )
+                            
+                            excel_bytes = generate_historical_excel(df_final, [], is_aum_only=is_aum_only)
+                            st.download_button(
+                                label="📥 Download Styled Excel (.xlsx)",
+                                data=excel_bytes,
+                                file_name=f"amfi_nav_export_{start_date}_to_{end_date}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                use_container_width=True
+                            )
 
         elif search_mode == "Fund Performance":
-            # UI for Fund Performance dashboard matching the client's design
             maturity_type = st.selectbox("Maturity Type", ["Open Ended", "Close Ended", "Interval"], index=0)
             category = st.selectbox("Category", ["Equity", "Debt", "Hybrid", "Solution Oriented", "Other"], index=0)
             maturity_id_map = {"Open Ended": 1, "Close Ended": 2, "Interval": 2}
@@ -989,7 +1253,6 @@ def main() -> None:
             maturity_id = maturity_id_map[maturity_type]
             cat_id = cat_id_map[category]
 
-            # Fetch subcategories using the correct keys 'name' and 'id'
             subcategories = []
             with st.spinner("Fetching subcategories..."):
                 try:
@@ -1008,116 +1271,94 @@ def main() -> None:
             subcategory_name = st.selectbox("Subcategory", [name for name, _ in subcategories] or ["All"], index=0)
             sub_id = dict(subcategories).get(subcategory_name, 0)
 
-            # Return Period selector and date picker
             col_d1, col_d2 = st.columns(2)
             with col_d1:
-                horizon = st.selectbox("Return Horizon", ["1-Year", "3-Year", "5-Year", "10-Year", "Since Inception"], index=2)
+                start_date = st.date_input("Start Date", value=datetime(2026, 1, 1).date())
             with col_d2:
-                report_date = st.date_input("Report Date", value=datetime.today().date())
+                end_date = st.date_input("End Date", value=datetime.today().date())
+
+            c1, c2 = st.columns(2)
+            with c1:
+                carry_forward = st.checkbox("Carry forward NAV on holidays/weekends", value=True, key="perf_carry")
+            with c2:
+                skip_sundays = st.checkbox("Skip Sundays", value=True, key="perf_skip")
+
+            col_c1, col_c2, col_c3 = st.columns(3)
+            with col_c1:
+                want_nav = st.checkbox("Want NAV", value=True, key="perf_nav")
+            with col_c2:
+                want_aum = st.checkbox("Want AUM", value=True, key="perf_aum")
+            with col_c3:
+                want_flows = st.checkbox("Want Flows", value=True, key="perf_flows")
 
             if st.button("Go", type="primary", use_container_width=True):
-                with st.spinner("Fetching performance data..."):
-                    date_str = report_date.strftime("%d-%b-%Y")
-                    perf_rows = fetch_performance_data_from_api(date_str, maturity_id, cat_id, sub_id)
-                    if not perf_rows:
-                        # Auto-fallback: search backwards for a date that has data
-                        found_date = None
-                        with st.spinner("Checking latest available date on AMFI..."):
-                            for i in range(1, 15):
-                                check_date = report_date - timedelta(days=i)
-                                check_str = check_date.strftime("%d-%b-%Y")
-                                check_rows = fetch_performance_data_from_api(check_str, maturity_id, cat_id, sub_id)
-                                if check_rows:
-                                    found_date = check_date
-                                    perf_rows = check_rows
-                                    break
-                        if found_date:
-                            st.warning(f"⚠️ No performance data is available for {report_date.strftime('%d-%b-%Y')}. "
-                                       f"AMFI updates performance data weekly. Showing the latest available report from **{found_date.strftime('%A, %d-%b-%Y')}**.")
-                            report_date = found_date
-                            date_str = found_date.strftime("%d-%b-%Y")
-                        else:
-                            st.warning(f"⚠️ No performance data returned for the selected criteria on {report_date.strftime('%d-%b-%Y')} or the last 14 days.")
+                if not want_nav and not want_aum and not want_flows:
+                    st.error("Please select at least one data type (NAV, AUM, or Flows) to export.")
+                elif start_date > end_date:
+                    st.error("Start Date cannot be after End Date.")
+                else:
+                    matched_rows = []
+                    for idx, row in nav_data.iterrows():
+                        ac = row.get("Asset Class", "")
+                        m_id, c_id, s_id = map_section_to_ids(ac)
+                        if m_id == maturity_id and c_id == cat_id and s_id == sub_id:
+                            matched_rows.append(row)
                     
-                    if perf_rows:
-                        df_perf = pd.DataFrame(perf_rows)
+                    df_matched = pd.DataFrame(matched_rows)
+                    if df_matched.empty:
+                        st.warning("No schemes found in current AMFI index matching this subcategory.")
+                    else:
+                        parsed_isins = []
+                        for idx, row in df_matched.iterrows():
+                            isin_g = row.get("ISIN Div Payout/ ISIN Growth") or row.get("ISIN Div Payout / ISIN Growth")
+                            isin_r = row.get("ISIN Div Reinvestment")
+                            if isin_g and pd.notna(isin_g) and str(isin_g).strip() != "-":
+                                parsed_isins.append(str(isin_g).strip().upper())
+                            if isin_r and pd.notna(isin_r) and str(isin_r).strip() != "-":
+                                parsed_isins.append(str(isin_r).strip().upper())
+                        parsed_isins = sorted(list(set(parsed_isins)))
                         
-                        horizon_map = {
-                            "1-Year": ("return1YearRegular", "return1YearDirect", "return1YearBenchmark", "ir1YrRegular", "ir1YrDirect", "1-Year"),
-                            "3-Year": ("return3YearRegular", "return3YearDirect", "return3YearBenchmark", "ir3YrRegular", "ir3YrDirect", "3-Year"),
-                            "5-Year": ("return5YearRegular", "return5YearDirect", "return5YearBenchmark", "ir5YrRegular", "ir5YrDirect", "5-Year"),
-                            "10-Year": ("return10YearRegular", "return10YearDirect", "return10YearBenchmark", "ir10YrRegular", "ir10YrDirect", "10-Year"),
-                            "Since Inception": ("returnSinceLaunchRegular", "returnSinceLaunchDirect", "returnSinceLaunchBenchmarkRegular", None, None, "Since Inception")
-                        }
-                        reg_ret, dir_ret, bench_ret, reg_ir, dir_ir, label = horizon_map[horizon]
-                        
-                        # Build formatted DataFrame for display
-                        rename_dict = {
-                            "schemeName": "Scheme Name",
-                            "benchmark": "Benchmark Name",
-                            "riskometerScheme": "Riskometer (Scheme)",
-                            "riskometerBenchmark": "Riskometer (Benchmark)",
-                            "navRegular": "Latest NAV (Regular)",
-                            "navDirect": "Latest NAV (Direct)",
-                            reg_ret: f"{label} Return (Regular)",
-                            dir_ret: f"{label} Return (Direct)",
-                            bench_ret: f"{label} Return (Benchmark)",
-                        }
-                        if reg_ir and reg_ir in df_perf.columns:
-                            rename_dict[reg_ir] = f"{label} Info Ratio (Regular)"
-                        if dir_ir and dir_ir in df_perf.columns:
-                            rename_dict[dir_ir] = f"{label} Info Ratio (Direct)"
-                        rename_dict["dailyAUM"] = "Daily AUM (Cr.)"
-                        
-                        existing_renames = {k: v for k, v in rename_dict.items() if k in df_perf.columns}
-                        df_display = df_perf[list(existing_renames.keys())].rename(columns=existing_renames)
-                        
-                        # Color coding riskometer scheme/benchmark
-                        def highlight_riskometer(val):
-                            if val == "Very High":
-                                return "background-color: #fca5a5; color: #991b1b; font-weight: bold; text-align: center;"
-                            elif val == "High":
-                                return "background-color: #fed7aa; color: #9a3412; font-weight: bold; text-align: center;"
-                            elif val == "Moderate":
-                                return "background-color: #fef08a; color: #854d0e; font-weight: bold; text-align: center;"
-                            elif val == "Low to Moderate":
-                                return "background-color: #d9f99d; color: #3f6212; font-weight: bold; text-align: center;"
-                            elif val == "Low":
-                                return "background-color: #bbf7d0; color: #166534; font-weight: bold; text-align: center;"
-                            return ""
-
-                        styled_df = df_display.style
-                        subset_cols = [col for col in ["Riskometer (Scheme)", "Riskometer (Benchmark)"] if col in df_display.columns]
-                        if hasattr(styled_df, "map"):
-                            styled_df = styled_df.map(highlight_riskometer, subset=subset_cols)
+                        if not parsed_isins:
+                            st.warning("No valid ISINs found for schemes in this subcategory.")
                         else:
-                            styled_df = styled_df.applymap(highlight_riskometer, subset=subset_cols)
-                        
-                        # Display the beautiful interactive styled table
-                        st.dataframe(
-                            styled_df,
-                            use_container_width=True,
-                            column_config={
-                                "Latest NAV (Regular)": st.column_config.NumberColumn(format="₹%.4f"),
-                                "Latest NAV (Direct)": st.column_config.NumberColumn(format="₹%.4f"),
-                                f"{label} Return (Regular)": st.column_config.NumberColumn(format="%.2f%%"),
-                                f"{label} Return (Direct)": st.column_config.NumberColumn(format="%.2f%%"),
-                                f"{label} Return (Benchmark)": st.column_config.NumberColumn(format="%.2f%%"),
-                                f"{label} Info Ratio (Regular)": st.column_config.NumberColumn(format="%.4f"),
-                                f"{label} Info Ratio (Direct)": st.column_config.NumberColumn(format="%.4f"),
-                                "Daily AUM (Cr.)": st.column_config.NumberColumn(format="₹%,.2f Cr"),
-                            }
-                        )
-                        
-                        # Styled excel report
-                        excel_bytes = generate_historical_excel(df_display, [], is_aum_only=False)
-                        st.download_button(
-                            label="📥 Download Styled Excel (.xlsx)",
-                            data=excel_bytes,
-                            file_name=f"fund_performance_{subcategory_name}_{date_str}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True,
-                        )
+                            with st.spinner("Connecting to AMFI India and fetching historical data..."):
+                                df_final, is_aum_only, err = run_historical_export(
+                                    parsed_isins=parsed_isins,
+                                    start_date=start_date,
+                                    end_date=end_date,
+                                    carry_forward=carry_forward,
+                                    skip_sundays=skip_sundays,
+                                    want_nav=want_nav,
+                                    want_aum=want_aum,
+                                    want_flows=want_flows
+                                )
+                                if err:
+                                    st.warning(err)
+                                elif df_final.empty:
+                                    st.warning("No records found matching the specified criteria.")
+                                else:
+                                    st.success(f"Successfully processed {len(df_final)} vertical records!")
+                                    
+                                    render_section_header("👁️", "Data Preview")
+                                    st.dataframe(
+                                        df_final,
+                                        use_container_width=True,
+                                        column_config={
+                                            "Daily return": st.column_config.NumberColumn(
+                                                "Daily return",
+                                                format="%.2f%%"
+                                            )
+                                        }
+                                    )
+                                    
+                                    excel_bytes = generate_historical_excel(df_final, [], is_aum_only=is_aum_only)
+                                    st.download_button(
+                                        label="📥 Download Styled Excel (.xlsx)",
+                                        data=excel_bytes,
+                                        file_name=f"fund_performance_{subcategory_name}_{start_date}_to_{end_date}.xlsx",
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                        use_container_width=True
+                                    )
         elif search_mode == "Portfolio Bucket Tracker":
             st.markdown('<hr class="panel-divider">', unsafe_allow_html=True)
             
@@ -1374,401 +1615,10 @@ def main() -> None:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
-        elif search_mode == "Historical ISIN Export":
-            render_section_header("📋", "Historical ISIN Export", "Pivoted NAV/AUM reports with corporate Excel styling")
-            render_info_card(
-                "<strong>Historical NAV Extractor:</strong> Specify a date range and target ISINs to generate "
-                "a pivoted, corporate-styled Excel sheet. Weekends and holidays can be filled via carry-forward."
-            )
-
-            col1, col2 = st.columns(2)
-            with col1:
-                start_date = st.date_input("Start Date", value=datetime(2000, 1, 1).date())
-            with col2:
-                end_date = st.date_input("End Date", value=datetime(2026, 5, 29).date())
-
-            default_isins_str = "\n".join([
-                "INF209K01AJ8", "INF846K01CH7", "INF846K016E3", "INF194K01524", "INF760K01019", 
-                "INF760K01KR2", "INF740K01128", "INF179K01608", "INF179KA1RT1", "INF179K01CR2", 
-                "INF179KA1RZ8", "INF109KA1TX4", "INF109K01BZ4", "INF205KA1189", "INF205K011T7", 
-                "INF174KA1EK3", "INF174K01DS9", "INF174KA1HS9", "INF247L01478", "INF204K01GE7", 
-                "INF204K01562", "INF204K01489", "INF879O01019", "INF966L01457", "INF966L01AW4", 
-                "INF966L01234", "INF200K01370", "INF200K01CT2", "INF200K01297"
-            ])
-        
-            isin_input = st.text_area("Target ISINs (one per line or comma-separated)", value=default_isins_str, height=200)
-        
-            c1, c2 = st.columns(2)
-            with c1:
-                carry_forward = st.checkbox("Carry forward NAV on holidays/weekends", value=True)
-            with c2:
-                skip_sundays = st.checkbox("Skip Sundays", value=True)
-
-            col_c1, col_c2, col_c3 = st.columns(3)
-            with col_c1:
-                want_nav = st.checkbox("Want NAV", value=True)
-            with col_c2:
-                want_aum = st.checkbox("Want AUM", value=True)
-            with col_c3:
-                want_flows = st.checkbox("Want Flows", value=False)
-
-            if st.button("Fetch & generate Excel", type="primary", use_container_width=True):
-                parsed_isins = [x.strip() for x in re.split(r"[,\n\s]+", isin_input) if x.strip()]
-                if not want_nav and not want_aum and not want_flows:
-                    st.error("Please select at least one data type (NAV, AUM, or Flows) to export.")
-                elif not parsed_isins:
-                    st.error("Please enter at least one valid ISIN.")
-                elif start_date > end_date:
-                    st.error("Start Date cannot be after End Date.")
-                else:
-                    if want_flows:
-                        want_nav = True
-                        want_aum = True
-                        
-                    fetch_start_date = start_date
-                    if want_flows:
-                        fetch_start_date = start_date - timedelta(days=10)
-                        
-                    with st.spinner("Connecting to AMFI India and fetching historical data..."):
-                        try:
-                            frmdt_str = fetch_start_date.strftime("%d-%b-%Y")
-                            todt_str = end_date.strftime("%d-%b-%Y")
-                            
-                            url = f"https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx?frmdt={frmdt_str}&todt={todt_str}"
-                            import time
-                            max_retries = 3
-                            delay = 2.0
-                            response = None
-                            for attempt in range(max_retries):
-                                try:
-                                    response = requests.get(url, stream=True, timeout=300)
-                                    response.raise_for_status()
-                                    break
-                                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                                    if attempt == max_retries - 1:
-                                        raise e
-                                    time.sleep(delay)
-                                    delay *= 2
-                        
-                            rows = []
-                            current_section = "Unknown"
-                        
-                            df_port = load_portfolio_aum_data()
-                            parsed_isins_set = {x.upper() for x in parsed_isins}
-                        
-                            for line_bytes in response.iter_lines():
-                                if not line_bytes:
-                                    continue
-                                line = line_bytes.decode('utf-8', errors='ignore')
-                            
-                                # Fast check: AMC and section lines do not contain semicolons
-                                if ";" not in line:
-                                    line_stripped = line.strip()
-                                    if (
-                                        line_stripped.startswith("Open Ended")
-                                        or line_stripped.startswith("Closed Ended")
-                                        or line_stripped.startswith("Interval Fund Schemes")
-                                    ):
-                                        current_section = line_stripped
-                                    continue
-                            
-                                parts = line.split(";")
-                                if len(parts) < 8:
-                                    continue
-                                
-                                isin_growth = parts[2].strip()
-                                isin_reinvestment = parts[3].strip()
-                            
-                                isin_growth_upper = isin_growth.upper() if isin_growth != "-" else ""
-                                isin_reinvest_upper = isin_reinvestment.upper() if isin_reinvestment != "-" else ""
-                            
-                                g_match = isin_growth_upper and isin_growth_upper in parsed_isins_set
-                                r_match = isin_reinvest_upper and isin_reinvest_upper in parsed_isins_set
-                            
-                                if g_match or r_match:
-                                    scheme_code = parts[0].strip()
-                                    scheme_name = parts[1].strip()
-                                    nav_value = parts[4].strip()
-                                    nav_date = parts[7].strip()
-                                
-                                    scheme_code = scheme_code if scheme_code != "-" else None
-                                    isin_growth = isin_growth if isin_growth != "-" else None
-                                    isin_reinvestment = isin_reinvestment if isin_reinvestment != "-" else None
-                                
-                                    nav = pd.to_numeric(nav_value.replace(",", ""), errors="coerce")
-                                    rows.append({
-                                        "Asset Class": current_section,
-                                        "Scheme Code": scheme_code,
-                                        "ISIN Div Payout / ISIN Growth": isin_growth,
-                                        "ISIN Div Reinvestment": isin_reinvestment,
-                                        "Scheme Name": scheme_name,
-                                        "NAV": nav,
-                                        "Date": nav_date
-                                    })
-                        
-                            if not rows:
-                                st.warning("No NAV records found matching the specified ISINs and date range.")
-                            else:
-                                df_raw = pd.DataFrame(rows)
-                            
-                                df_raw["Plan Type"] = df_raw["Scheme Name"].apply(classify_plan_type)
-                                df_raw["Option Type"] = df_raw["Scheme Name"].apply(classify_option_type)
-                            
-                                # Infer proper Asset Class for rows where the Asset Class is a fund family name
-                                known_sections = ["Open Ended", "Closed Ended", "Interval Fund Schemes"]
-                                def infer_section_from_name(name: str) -> str:
-                                    lowered = name.lower()
-                                    if "flexi" in lowered:
-                                        return "Open Ended Schemes (Equity Scheme - Flexi Cap Fund)"
-                                    if "mid" in lowered:
-                                        return "Open Ended Schemes (Equity Scheme - Mid Cap Fund)"
-                                    if "small" in lowered:
-                                        return "Open Ended Schemes (Equity Scheme - Small Cap Fund)"
-                                    if "large" in lowered:
-                                        return "Open Ended Schemes (Equity Scheme - Large Cap Fund)"
-                                    if "focused" in lowered or "focus" in lowered:
-                                        return "Open Ended Schemes (Equity Scheme - Focused Fund)"
-                                    return "Open Ended Schemes (Equity Scheme - Large Cap Fund)"
-                                df_raw["Asset Class"] = df_raw.apply(
-                                    lambda row: row["Asset Class"] if any(row["Asset Class"].startswith(s) for s in known_sections) else infer_section_from_name(row["Scheme Name"]),
-                                    axis=1)
-                                df_raw = populate_actual_aum(df_raw, df_port)
-                                if not df_raw.empty:
-                                    # Parse dates robustly (locale-independent)
-                                    parsed_dates = parse_amfi_date_series(df_raw["Date"])
-                                    df_raw["Date_parsed"] = parsed_dates
-                                    df_raw["Date"] = parsed_dates.dt.strftime("%d-%m-%Y")
-                                    # Sort by scheme + parsed date so shift() gives the correct previous trading day
-                                    df_raw = df_raw.sort_values(["Scheme Code", "Date_parsed"]).reset_index(drop=True)
-                                    # Compute daily return %: only where NAV actually changed between real trading days
-                                    df_raw["Prev NAV"] = df_raw.groupby("Scheme Code")["NAV"].shift(1)
-                                    df_raw["Daily Return %"] = (
-                                        (df_raw["NAV"] - df_raw["Prev NAV"]) / df_raw["Prev NAV"] * 100
-                                    ).where(df_raw["Prev NAV"].notna() & (df_raw["Prev NAV"] != 0))
-                                    # Flows = Daily Return % * previous-day AUM / 100
-                                    df_raw["Prev AUM"] = df_raw.groupby("Scheme Code")["AUM"].shift(1)
-                                    df_raw["Flows"] = (
-                                        df_raw["Daily Return %"] / 100 * df_raw["Prev AUM"]
-                                    ).where(df_raw["Daily Return %"].notna() & df_raw["Prev AUM"].notna())
-                                    df_raw.drop(columns=["Prev NAV", "Prev AUM", "Date_parsed"], inplace=True)
-                            
-                                all_dates = pd.date_range(start=fetch_start_date, end=end_date)
-                            
-                                target_dates = []
-                                for dt in all_dates:
-                                    if skip_sundays and dt.weekday() == 6:
-                                        continue
-                                    target_dates.append(dt.strftime("%d-%m-%Y"))
-                                
-                                fund_metadata = df_raw[[
-                                    "Asset Class", 
-                                    "Scheme Code", 
-                                    "ISIN Div Payout / ISIN Growth", 
-                                    "ISIN Div Reinvestment", 
-                                    "Scheme Name", 
-                                    "Plan Type", 
-                                    "Option Type"
-                                ]].drop_duplicates(subset=["Scheme Code"])
-                            
-                                if want_nav and not want_aum:
-                                    df_pivot = df_raw.pivot(index="Scheme Code", columns="Date", values="NAV").reset_index()
-                                    display_date_cols = target_dates
-                                    is_aum_only = False
-                                elif want_aum and not want_nav:
-                                    df_pivot = df_raw.pivot(index="Scheme Code", columns="Date", values="AUM").reset_index()
-                                    display_date_cols = target_dates
-                                    is_aum_only = True
-                                else:
-                                    # Pivot NAV, AUM, and Flows
-                                    df_pivot_nav = df_raw.pivot(index="Scheme Code", columns="Date", values="NAV").reset_index()
-                                    df_pivot_aum = df_raw.pivot(index="Scheme Code", columns="Date", values="AUM").reset_index()
-                                    df_pivot_flow = df_raw.pivot(index="Scheme Code", columns="Date", values="Flows").reset_index()
-                                    # Rename columns with appropriate suffixes
-                                    nav_cols_map = {d: f"{d} (NAV)" for d in target_dates if d in df_pivot_nav.columns}
-                                    aum_cols_map = {d: f"{d} (AUM)" for d in target_dates if d in df_pivot_aum.columns}
-                                    flow_cols_map = {d: f"{d} (Flows)" for d in target_dates if d in df_pivot_flow.columns}
-                                    df_pivot_nav = df_pivot_nav.rename(columns=nav_cols_map)
-                                    df_pivot_aum = df_pivot_aum.rename(columns=aum_cols_map)
-                                    df_pivot_flow = df_pivot_flow.rename(columns=flow_cols_map)
-                                    # Merge all three dataframes
-                                    df_pivot = pd.merge(df_pivot_nav, df_pivot_aum, on="Scheme Code", how="left")
-                                    df_pivot = pd.merge(df_pivot, df_pivot_flow, on="Scheme Code", how="left")
-                                    # Build interleaved display columns including Flows
-                                    interleaved_dates = []
-                                    for d in target_dates:
-                                        interleaved_dates.append(f"{d} (NAV)")
-                                        interleaved_dates.append(f"{d} (AUM)")
-                                        interleaved_dates.append(f"{d} (Flows)")
-                                    display_date_cols = interleaved_dates
-                                    is_aum_only = False
-                            
-                                df_final = pd.merge(fund_metadata, df_pivot, on="Scheme Code", how="left")
-                            
-                                for date_col in display_date_cols:
-                                    if date_col not in df_final.columns:
-                                        df_final[date_col] = None
-                                    
-                                if carry_forward and len(target_dates) > 1:
-                                    date_objs = sorted([datetime.strptime(d, "%d-%m-%Y") for d in target_dates])
-                                    sorted_date_cols = [d.strftime("%d-%m-%Y") for d in date_objs]
-                                
-                                    for i in range(1, len(sorted_date_cols)):
-                                        prev_col = sorted_date_cols[i-1]
-                                        curr_col = sorted_date_cols[i]
-                                    
-                                        if want_nav and not want_aum:
-                                            # Only carry-forward NAV (holidays/weekends have no new NAV)
-                                            df_final[curr_col] = df_final[curr_col].fillna(df_final[prev_col])
-                                        elif want_aum and not want_nav:
-                                            # AUM: do NOT carry forward — each date gets its own Fallback_AUM
-                                            pass
-                                        else:
-                                            # Carry forward NAV only; AUM is already populated per-day via Fallback_AUM
-                                            df_final[f"{curr_col} (NAV)"] = df_final[f"{curr_col} (NAV)"].fillna(df_final[f"{prev_col} (NAV)"])
-                                            # Do NOT carry forward AUM or Flows — they vary per day
-                                        
-                                # Fill any remaining NaNs in AUM columns with fallback values
-                                if want_aum:
-                                    df_pivot_fallback = df_raw.pivot(index="Scheme Code", columns="Date", values="Fallback_AUM").reset_index()
-                                    fallback_cols_map = {}
-                                    for d in target_dates:
-                                        if want_aum and not want_nav:
-                                            fallback_cols_map[d] = f"{d}_fallback_temp"
-                                        elif want_nav and want_aum:
-                                            fallback_cols_map[f"{d} (AUM)"] = f"{d}_fallback_temp"
-                                        
-                                    if fallback_cols_map:
-                                        df_pivot_fallback_renamed = df_pivot_fallback.rename(columns={d: f"{d}_fallback_temp" for d in target_dates if d in df_pivot_fallback.columns})
-                                        available_temp_cols = [col for col in fallback_cols_map.values() if col in df_pivot_fallback_renamed.columns]
-                                        df_final_temp = pd.merge(df_final, df_pivot_fallback_renamed[["Scheme Code"] + available_temp_cols], on="Scheme Code", how="left")
-                                        for main_col, temp_col in fallback_cols_map.items():
-                                            if main_col in df_final.columns and temp_col in df_final_temp.columns:
-                                                df_final[main_col] = df_final[main_col].fillna(df_final_temp[temp_col])
-                                    
-                                # Convert df_final to vertical layout
-                                vertical_rows = []
-                                for _, row in df_final.iterrows():
-                                    meta = {
-                                        "Asset Class": row["Asset Class"],
-                                        "Scheme Code": row["Scheme Code"],
-                                        "ISIN Div Payout / ISIN Growth": row["ISIN Div Payout / ISIN Growth"],
-                                        "ISIN Div Reinvestment": row["ISIN Div Reinvestment"],
-                                        "Scheme Name": row["Scheme Name"],
-                                        "Plan Type": row["Plan Type"],
-                                        "Option Type": row["Option Type"]
-                                    }
-                                    for d in target_dates:
-                                        r_item = meta.copy()
-                                        if want_nav and not want_aum:
-                                            r_item["NAV Date"] = d
-                                            r_item["NAV"] = row[d]
-                                        elif want_aum and not want_nav:
-                                            r_item["AUM Date"] = d
-                                            r_item["AUM"] = row[d]
-                                        else:
-                                            r_item["NAV Date"] = d
-                                            r_item["NAV"] = row[f"{d} (NAV)"]
-                                            r_item["AUM Date"] = d
-                                            r_item["AUM"] = row[f"{d} (AUM)"]
-                                        vertical_rows.append(r_item)
-
-                                ordered_cols = [
-                                    "Asset Class", 
-                                    "Scheme Code", 
-                                    "ISIN Div Payout / ISIN Growth", 
-                                    "ISIN Div Reinvestment", 
-                                    "Scheme Name", 
-                                    "Plan Type", 
-                                    "Option Type"
-                                ]
-                                if want_nav:
-                                    ordered_cols.extend(["NAV Date", "NAV"])
-                                if want_aum:
-                                    ordered_cols.extend(["AUM Date", "AUM"])
-                            
-                                if vertical_rows:
-                                    df_final = pd.DataFrame(vertical_rows)
-                                    if "NAV Date" in df_final.columns:
-                                        parsed = parse_amfi_date_series(df_final["NAV Date"])
-                                        df_final["NAV Date"] = parsed.dt.strftime("%d-%m-%Y")
-                                    if "AUM Date" in df_final.columns:
-                                        parsed = parse_amfi_date_series(df_final["AUM Date"])
-                                        df_final["AUM Date"] = parsed.dt.strftime("%d-%m-%Y")
-                                    df_final = df_final[ordered_cols]
-                                    df_final = df_final.sort_values(by=["Asset Class", "Scheme Name"]).reset_index(drop=True)
-                                    if want_flows:
-                                        df_final = calculate_flows_for_dataframe(df_final, start_date, ["Asset Class", "Scheme Code", "ISIN Div Payout / ISIN Growth", "ISIN Div Reinvestment", "Scheme Name", "Plan Type", "Option Type"])
-                                        is_aum_only = False
-                                else:
-                                    df_final = pd.DataFrame(columns=ordered_cols)
-                            
-                                st.success(f"Successfully processed {len(df_final)} vertical records!")
-                            
-                                render_section_header("👁️", "Data Preview")
-                                st.dataframe(
-                                    df_final,
-                                    use_container_width=True,
-                                    column_config={
-                                        "Daily return": st.column_config.NumberColumn(
-                                            "Daily return",
-                                            format="%.2f%%"
-                                        )
-                                    }
-                                )
-                            
-                                excel_bytes = generate_historical_excel(df_final, [], is_aum_only=is_aum_only)
-                            
-                                st.download_button(
-                                    label="📥 Download Styled Excel (.xlsx)",
-                                    data=excel_bytes,
-                                    file_name=f"amfi_nav_export_{start_date}_to_{end_date}.xlsx",
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                    use_container_width=True
-                                )
-                            
-                        except Exception as e:
-                            st.error(f"Failed to fetch or process data: {e}")
 
 
-    if selected_summary is not None and not selected_rows.empty:
-        with finance_panel("Fund Analysis"):
-            render_result_card(selected_summary, selected_rows)
-            render_section_header("📑", "Latest NAV Table")
-            latest_rows = selected_rows[["Scheme Name", "Scheme Code", "AMC Name", "Plan Type", "Option Type", "NAV", "NAV Date"]].copy()
-            latest_rows["NAV Date"] = pd.to_datetime(latest_rows["NAV Date"], errors="coerce").dt.strftime("%d-%m-%Y")
-            st.dataframe(latest_rows, use_container_width=True, hide_index=True)
 
-            export_frame = build_export_frame(selected_rows)
-            c1, c2 = st.columns(2)
-            with c1:
-                st.download_button(
-                    "Download CSV",
-                    data=frame_to_csv_bytes(export_frame),
-                    file_name="mutual_fund_nav_results.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
-            with c2:
-                st.download_button(
-                    "Download Excel",
-                    data=frame_to_excel_bytes(export_frame),
-                    file_name="mutual_fund_nav_results.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
 
-            render_history(selected_summary)
-            render_sip_calculator(float(selected_summary.get("Latest NAV", 0)) if pd.notna(selected_summary.get("Latest NAV")) else None)
-
-    elif search_mode == "Batch Search" and not batch_export_rows.empty:
-        export_frame = build_export_frame(batch_export_rows)
-        st.download_button(
-            "Download batch CSV",
-            data=frame_to_csv_bytes(export_frame),
-            file_name="mutual_fund_batch_results.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
 
     with finance_panel("Market Snapshot"):
         with st.expander("Browse latest market snapshot", expanded=False):
