@@ -383,7 +383,7 @@ def find_matching_perf_row(nav_name: str, perf_rows: list) -> dict | None:
     return None
 
 
-def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame) -> pd.DataFrame:
+def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum: bool = False) -> pd.DataFrame:
     if df.empty:
         return df.copy()
         
@@ -403,6 +403,10 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame) -> pd.DataFrame
     mean_navs = mean_navs.fillna(1.0).replace(0.0, 1.0)
     df_res["Fallback_AUM"] = (df_res["Monthly_AUM"] * (df_res["NAV"] / mean_navs)).round(4)
     
+    if not fetch_live_aum:
+        df_res["AUM"] = df_res["Fallback_AUM"]
+        return df_res
+        
     # Initialize AUM with the fallback so every row already has a value.
     # Rows where the live API succeeds will get overwritten below.
     # Initialize AUM as NaN; we'll fill only where real API values are available.
@@ -576,7 +580,8 @@ def run_historical_export(
     skip_sundays: bool,
     want_nav: bool,
     want_aum: bool,
-    want_flows: bool
+    want_flows: bool,
+    fetch_live_aum: bool = False
 ) -> Tuple[pd.DataFrame, bool, str | None]:
     if want_flows:
         want_nav = True
@@ -688,7 +693,7 @@ def run_historical_export(
         df_raw["Asset Class"] = df_raw.apply(
             lambda row: row["Asset Class"] if any(row["Asset Class"].startswith(s) for s in known_sections) else infer_section_from_name(row["Scheme Name"]),
             axis=1)
-        df_raw = populate_actual_aum(df_raw, df_port)
+        df_raw = populate_actual_aum(df_raw, df_port, fetch_live_aum=fetch_live_aum)
         if not df_raw.empty:
             parsed_dates = parse_amfi_date_series(df_raw["Date"])
             df_raw["Date_parsed"] = parsed_dates
@@ -1197,6 +1202,8 @@ def main() -> None:
             with col_c3:
                 want_flows = st.checkbox("Want Flows", value=False)
 
+            fetch_live_aum = st.checkbox("Fetch actual daily AUM from AMFI (slower)", value=False, key="hist_live_aum")
+
             if st.button("Fetch & generate Excel", type="primary", use_container_width=True):
                 parsed_isins = [x.strip() for x in re.split(r"[,\n\s]+", isin_input) if x.strip()]
                 if not want_nav and not want_aum and not want_flows:
@@ -1215,7 +1222,8 @@ def main() -> None:
                             skip_sundays=skip_sundays,
                             want_nav=want_nav,
                             want_aum=want_aum,
-                            want_flows=want_flows
+                            want_flows=want_flows,
+                            fetch_live_aum=fetch_live_aum
                         )
                         if err:
                             st.warning(err)
@@ -1291,6 +1299,8 @@ def main() -> None:
             with col_c3:
                 want_flows = st.checkbox("Want Flows", value=True, key="perf_flows")
 
+            fetch_live_aum = st.checkbox("Fetch actual daily AUM from AMFI (slower)", value=False, key="perf_live_aum")
+
             if st.button("Go", type="primary", use_container_width=True):
                 if not want_nav and not want_aum and not want_flows:
                     st.error("Please select at least one data type (NAV, AUM, or Flows) to export.")
@@ -1330,7 +1340,8 @@ def main() -> None:
                                     skip_sundays=skip_sundays,
                                     want_nav=want_nav,
                                     want_aum=want_aum,
-                                    want_flows=want_flows
+                                    want_flows=want_flows,
+                                    fetch_live_aum=fetch_live_aum
                                 )
                                 if err:
                                     st.warning(err)
