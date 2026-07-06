@@ -1208,7 +1208,7 @@ def main() -> None:
             with col1:
                 start_date = st.date_input(
                     "Start Date", 
-                    value=datetime(2000, 1, 1).date(),
+                    value=datetime(2026, 1, 1).date(),
                     min_value=datetime(2000, 1, 1).date(),
                     max_value=datetime.today().date()
                 )
