@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import re
 from datetime import datetime, timedelta
 from io import BytesIO, StringIO
@@ -68,11 +69,38 @@ def get_fund_seed(name: str) -> int:
     return abs(hash_val) % 100
 
 
+# Persistent session for NAV chunk downloads (connection reuse / keep-alive)
+_nav_session = None
+_nav_session_lock = threading.Lock()
+
+def _get_nav_session():
+    global _nav_session
+    if _nav_session is None:
+        with _nav_session_lock:
+            if _nav_session is None:
+                s = requests.Session()
+                adapter = requests.adapters.HTTPAdapter(
+                    pool_connections=8,
+                    pool_maxsize=8,
+                    max_retries=requests.adapters.Retry(
+                        total=3,
+                        backoff_factor=1.0,
+                        status_forcelist=[500, 502, 503, 504],
+                    ),
+                )
+                s.mount("https://", adapter)
+                s.mount("http://", adapter)
+                s.headers.update({
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                })
+                _nav_session = s
+    return _nav_session
+
+
 def fetch_amfi_chunk_with_cache(c_start, c_end) -> str:
-    """Fetch AMFI chunk data with local file-based caching."""
+    """Fetch AMFI chunk data with local file-based caching and persistent sessions."""
     import os
     import time
-    import requests
     from datetime import date as dt_date
     
     # Define cache directory
@@ -88,43 +116,53 @@ def fetch_amfi_chunk_with_cache(c_start, c_end) -> str:
     cache_path = os.path.join(cache_dir, f"{cache_key}.txt")
     
     # Check if we can use the cached file
-    use_cache = False
     if os.path.exists(cache_path):
-        # If the chunk is entirely in the past (before yesterday), it never changes, so reuse cache
         yesterday = dt_date.today() - timedelta(days=1)
         if c_end < yesterday:
-            use_cache = True
+            try:
+                with open(cache_path, "r", encoding="utf-8", errors="ignore") as f:
+                    return f.read()
+            except Exception:
+                pass
         else:
-            # Otherwise, check file age (TTL of 1 hour for recent data)
             file_age = time.time() - os.path.getmtime(cache_path)
             if file_age < 3600:
-                use_cache = True
-                
-    if use_cache:
-        try:
-            with open(cache_path, "r", encoding="utf-8", errors="ignore") as f:
-                return f.read()
-        except Exception:
-            pass
-            
-    # Otherwise, download from AMFI
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
+                try:
+                    with open(cache_path, "r", encoding="utf-8", errors="ignore") as f:
+                        return f.read()
+                except Exception:
+                    pass
     
-    max_retries = 3
+    # Download from AMFI using persistent session
+    session = _get_nav_session()
+    
+    max_retries = 5
     delay = 2.0
     response = None
     for attempt in range(max_retries):
         try:
-            response = requests.get(url, headers=headers, timeout=300)
-            response.raise_for_status()
-            break
-        except requests.exceptions.RequestException as e:
+            response = session.get(url, timeout=120)
+            # Check for HTML loader page (AMFI returns this on overload)
+            if response.status_code == 200:
+                text = response.text
+                if text.strip().startswith("<") or "<html" in text[:500].lower():
+                    # Got HTML instead of CSV — retry after backoff
+                    response = None
+                    time.sleep(delay)
+                    delay = min(delay * 2, 30)
+                    continue
+                break
+            elif response.status_code == 503:
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+                continue
+            else:
+                response.raise_for_status()
+        except requests.exceptions.RequestException:
             if attempt == max_retries - 1:
-                raise e
+                return ""
             time.sleep(delay)
-            delay *= 2
+            delay = min(delay * 2, 30)
             
     if response is not None:
         content_text = response.text
@@ -369,10 +407,7 @@ def clean_name(name: str) -> str:
     return " ".join(cleaned_tokens)
 
 
-import os
-import threading
-import requests
-from datetime import datetime, timedelta
+# (os, threading, requests already imported at top)
 
 # Create local thread-safe requests session to enable connection reuse
 _thread_local = threading.local()
@@ -740,11 +775,12 @@ def run_historical_export(
         except ImportError:
             pass
 
-        # Split target date range into chunks of up to 30 days to avoid AMFI's limit (503 error / HTML loader page)
+        # Split target date range into chunks of up to 90 days
+        # (AMFI portal reliably returns CSV for 90-day windows)
         chunks = []
         curr_start = fetch_start_date
         while curr_start <= end_date:
-            curr_end = min(curr_start + timedelta(days=30), end_date)
+            curr_end = min(curr_start + timedelta(days=90), end_date)
             chunks.append((curr_start, curr_end))
             curr_start = curr_end + timedelta(days=1)
 
@@ -755,19 +791,39 @@ def run_historical_export(
         if in_streamlit:
             progress_bar = st.progress(0.0, text=f"Fetching historical data (0/{len(chunks)} chunks)...")
 
+        # ── Concurrent chunk fetching ──────────────────────────────────
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         import time
-        for chunk_idx, (c_start, c_end) in enumerate(chunks):
-            frmdt_str = c_start.strftime("%d-%b-%Y")
-            todt_str = c_end.strftime("%d-%b-%Y")
 
-            if in_streamlit:
-                progress_bar.progress(chunk_idx / len(chunks), text=f"Fetching historical data ({chunk_idx}/{len(chunks)} chunks): {frmdt_str} to {todt_str}...")
+        chunk_results = {}  # idx -> content_text
 
+        def _download_chunk(idx, c_start, c_end):
             try:
-                content_text = fetch_amfi_chunk_with_cache(c_start, c_end)
-            except Exception as e:
-                if chunk_idx == len(chunks) - 1 and not rows:
-                    raise e
+                return idx, fetch_amfi_chunk_with_cache(c_start, c_end)
+            except Exception:
+                return idx, ""
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {
+                executor.submit(_download_chunk, idx, c_start, c_end): idx
+                for idx, (c_start, c_end) in enumerate(chunks)
+            }
+            completed = 0
+            for future in as_completed(futures):
+                completed += 1
+                idx, content = future.result()
+                chunk_results[idx] = content
+                if in_streamlit:
+                    c_s, c_e = chunks[idx]
+                    progress_bar.progress(
+                        completed / len(chunks),
+                        text=f"Fetching historical data ({completed}/{len(chunks)} chunks): {c_s.strftime('%d-%b-%Y')} to {c_e.strftime('%d-%b-%Y')}..."
+                    )
+
+        # Process results in order so section tracking is correct
+        for chunk_idx in range(len(chunks)):
+            content_text = chunk_results.get(chunk_idx, "")
+            if not content_text:
                 continue
 
             current_section = "Unknown"
@@ -819,9 +875,6 @@ def run_historical_export(
                         "NAV": nav,
                         "Date": nav_date
                     })
-
-            if chunk_idx < len(chunks) - 1:
-                time.sleep(0.05)  # Avoid hitting rate limits
 
         if in_streamlit:
             progress_bar.progress(1.0, text="Fetching complete!")
