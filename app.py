@@ -68,6 +68,78 @@ def get_fund_seed(name: str) -> int:
     return abs(hash_val) % 100
 
 
+def fetch_amfi_chunk_with_cache(c_start, c_end) -> str:
+    """Fetch AMFI chunk data with local file-based caching."""
+    import os
+    import time
+    import requests
+    from datetime import date as dt_date
+    
+    # Define cache directory
+    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "amfi_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    frmdt_str = c_start.strftime("%d-%b-%Y")
+    todt_str = c_end.strftime("%d-%b-%Y")
+    url = f"https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx?frmdt={frmdt_str}&todt={todt_str}"
+    
+    # Cache key based on date range
+    cache_key = f"amfi_{c_start.strftime('%Y%m%d')}_{c_end.strftime('%Y%m%d')}"
+    cache_path = os.path.join(cache_dir, f"{cache_key}.txt")
+    
+    # Check if we can use the cached file
+    use_cache = False
+    if os.path.exists(cache_path):
+        # If the chunk is entirely in the past (before yesterday), it never changes, so reuse cache
+        yesterday = dt_date.today() - timedelta(days=1)
+        if c_end < yesterday:
+            use_cache = True
+        else:
+            # Otherwise, check file age (TTL of 1 hour for recent data)
+            file_age = time.time() - os.path.getmtime(cache_path)
+            if file_age < 3600:
+                use_cache = True
+                
+    if use_cache:
+        try:
+            with open(cache_path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+        except Exception:
+            pass
+            
+    # Otherwise, download from AMFI
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    max_retries = 3
+    delay = 2.0
+    response = None
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, headers=headers, timeout=300)
+            response.raise_for_status()
+            break
+        except requests.exceptions.RequestException as e:
+            if attempt == max_retries - 1:
+                raise e
+            time.sleep(delay)
+            delay *= 2
+            
+    if response is not None:
+        content_text = response.text
+        # Only cache if it contains actual NAV data (not the HTML wait page)
+        if ";" in content_text and not content_text.strip().startswith("<"):
+            try:
+                with open(cache_path, "w", encoding="utf-8", errors="ignore") as f:
+                    f.write(content_text)
+            except Exception:
+                pass
+        return content_text
+        
+    return ""
+
+
 def load_portfolio_aum_data() -> pd.DataFrame:
     paths = [
         "../portfolio last 6 months.xlsx",
@@ -618,33 +690,21 @@ def run_historical_export(
         for chunk_idx, (c_start, c_end) in enumerate(chunks):
             frmdt_str = c_start.strftime("%d-%b-%Y")
             todt_str = c_end.strftime("%d-%b-%Y")
-            url = f"https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx?frmdt={frmdt_str}&todt={todt_str}"
 
             if in_streamlit:
                 progress_bar.progress(chunk_idx / len(chunks), text=f"Fetching historical data ({chunk_idx}/{len(chunks)} chunks): {frmdt_str} to {todt_str}...")
 
-            max_retries = 3
-            delay = 2.0
-            response = None
-            for attempt in range(max_retries):
-                try:
-                    response = requests.get(url, stream=True, timeout=300)
-                    response.raise_for_status()
-                    break
-                except requests.exceptions.RequestException as e:
-                    if attempt == max_retries - 1:
-                        raise e
-                    time.sleep(delay)
-                    delay *= 2
-
-            if response is None:
+            try:
+                content_text = fetch_amfi_chunk_with_cache(c_start, c_end)
+            except Exception as e:
+                if chunk_idx == len(chunks) - 1 and not rows:
+                    raise e
                 continue
 
             current_section = "Unknown"
-            for line_bytes in response.iter_lines():
-                if not line_bytes:
+            for line in content_text.splitlines():
+                if not line:
                     continue
-                line = line_bytes.decode('utf-8', errors='ignore')
 
                 # Fast check: AMC and section lines do not contain semicolons
                 if ";" not in line:
@@ -692,7 +752,7 @@ def run_historical_export(
                     })
 
             if chunk_idx < len(chunks) - 1:
-                time.sleep(0.2)  # Avoid hitting rate limits
+                time.sleep(0.05)  # Avoid hitting rate limits
 
         if in_streamlit:
             progress_bar.progress(1.0, text="Fetching complete!")
