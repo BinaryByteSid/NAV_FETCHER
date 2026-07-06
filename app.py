@@ -592,81 +592,114 @@ def run_historical_export(
         fetch_start_date = start_date - timedelta(days=10)
         
     try:
-        frmdt_str = fetch_start_date.strftime("%d-%b-%Y")
-        todt_str = end_date.strftime("%d-%b-%Y")
-        
-        url = f"https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx?frmdt={frmdt_str}&todt={todt_str}"
-        import time
-        max_retries = 3
-        delay = 2.0
-        response = None
-        for attempt in range(max_retries):
-            try:
-                response = requests.get(url, stream=True, timeout=300)
-                response.raise_for_status()
-                break
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                if attempt == max_retries - 1:
-                    raise e
-                time.sleep(delay)
-                delay *= 2
-    
+        # Determine if running inside Streamlit context
+        in_streamlit = False
+        try:
+            from streamlit.runtime import exists as runtime_exists
+            in_streamlit = runtime_exists()
+        except ImportError:
+            pass
+
+        # Split target date range into chunks of up to 90 days to avoid AMFI's limit (503 error)
+        chunks = []
+        curr_start = fetch_start_date
+        while curr_start <= end_date:
+            curr_end = min(curr_start + timedelta(days=90), end_date)
+            chunks.append((curr_start, curr_end))
+            curr_start = curr_end + timedelta(days=1)
+
         rows = []
-        current_section = "Unknown"
-    
         df_port = load_portfolio_aum_data()
         parsed_isins_set = {x.upper() for x in parsed_isins}
-    
-        for line_bytes in response.iter_lines():
-            if not line_bytes:
+
+        if in_streamlit:
+            progress_bar = st.progress(0.0, text=f"Fetching historical data (0/{len(chunks)} chunks)...")
+
+        import time
+        for chunk_idx, (c_start, c_end) in enumerate(chunks):
+            frmdt_str = c_start.strftime("%d-%b-%Y")
+            todt_str = c_end.strftime("%d-%b-%Y")
+            url = f"https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx?frmdt={frmdt_str}&todt={todt_str}"
+
+            if in_streamlit:
+                progress_bar.progress(chunk_idx / len(chunks), text=f"Fetching historical data ({chunk_idx}/{len(chunks)} chunks): {frmdt_str} to {todt_str}...")
+
+            max_retries = 3
+            delay = 2.0
+            response = None
+            for attempt in range(max_retries):
+                try:
+                    response = requests.get(url, stream=True, timeout=300)
+                    response.raise_for_status()
+                    break
+                except requests.exceptions.RequestException as e:
+                    if attempt == max_retries - 1:
+                        raise e
+                    time.sleep(delay)
+                    delay *= 2
+
+            if response is None:
                 continue
-            line = line_bytes.decode('utf-8', errors='ignore')
-        
-            # Fast check: AMC and section lines do not contain semicolons
-            if ";" not in line:
-                line_stripped = line.strip()
-                if (
-                    line_stripped.startswith("Open Ended")
-                    or line_stripped.startswith("Closed Ended")
-                    or line_stripped.startswith("Interval Fund Schemes")
-                ):
-                    current_section = line_stripped
-                continue
-        
-            parts = line.split(";")
-            if len(parts) < 8:
-                continue
-            
-            isin_growth = parts[2].strip()
-            isin_reinvestment = parts[3].strip()
-        
-            isin_growth_upper = isin_growth.upper() if isin_growth != "-" else ""
-            isin_reinvest_upper = isin_reinvestment.upper() if isin_reinvestment != "-" else ""
-        
-            g_match = isin_growth_upper and isin_growth_upper in parsed_isins_set
-            r_match = isin_reinvest_upper and isin_reinvest_upper in parsed_isins_set
-        
-            if g_match or r_match:
-                scheme_code = parts[0].strip()
-                scheme_name = parts[1].strip()
-                nav_value = parts[4].strip()
-                nav_date = parts[7].strip()
-            
-                scheme_code = scheme_code if scheme_code != "-" else None
-                isin_growth = isin_growth if isin_growth != "-" else None
-                isin_reinvestment = isin_reinvestment if isin_reinvestment != "-" else None
-            
-                nav = pd.to_numeric(nav_value.replace(",", ""), errors="coerce")
-                rows.append({
-                    "Asset Class": current_section,
-                    "Scheme Code": scheme_code,
-                    "ISIN Div Payout / ISIN Growth": isin_growth,
-                    "ISIN Div Reinvestment": isin_reinvestment,
-                    "Scheme Name": scheme_name,
-                    "NAV": nav,
-                    "Date": nav_date
-                })
-                
+
+            current_section = "Unknown"
+            for line_bytes in response.iter_lines():
+                if not line_bytes:
+                    continue
+                line = line_bytes.decode('utf-8', errors='ignore')
+
+                # Fast check: AMC and section lines do not contain semicolons
+                if ";" not in line:
+                    line_stripped = line.strip()
+                    if (
+                        line_stripped.startswith("Open Ended")
+                        or line_stripped.startswith("Closed Ended")
+                        or line_stripped.startswith("Interval Fund Schemes")
+                    ):
+                        current_section = line_stripped
+                    continue
+
+                parts = line.split(";")
+                if len(parts) < 8:
+                    continue
+
+                isin_growth = parts[2].strip()
+                isin_reinvestment = parts[3].strip()
+
+                isin_growth_upper = isin_growth.upper() if isin_growth != "-" else ""
+                isin_reinvest_upper = isin_reinvestment.upper() if isin_reinvestment != "-" else ""
+
+                g_match = isin_growth_upper and isin_growth_upper in parsed_isins_set
+                r_match = isin_reinvest_upper and isin_reinvest_upper in parsed_isins_set
+
+                if g_match or r_match:
+                    scheme_code = parts[0].strip()
+                    scheme_name = parts[1].strip()
+                    nav_value = parts[4].strip()
+                    nav_date = parts[7].strip()
+
+                    scheme_code = scheme_code if scheme_code != "-" else None
+                    isin_growth = isin_growth if isin_growth != "-" else None
+                    isin_reinvestment = isin_reinvestment if isin_reinvestment != "-" else None
+
+                    nav = pd.to_numeric(nav_value.replace(",", ""), errors="coerce")
+                    rows.append({
+                        "Asset Class": current_section,
+                        "Scheme Code": scheme_code,
+                        "ISIN Div Payout / ISIN Growth": isin_growth,
+                        "ISIN Div Reinvestment": isin_reinvestment,
+                        "Scheme Name": scheme_name,
+                        "NAV": nav,
+                        "Date": nav_date
+                    })
+
+            if chunk_idx < len(chunks) - 1:
+                time.sleep(0.2)  # Avoid hitting rate limits
+
+        if in_streamlit:
+            progress_bar.progress(1.0, text="Fetching complete!")
+            time.sleep(0.5)
+            progress_bar.empty()
+
         if not rows:
             return pd.DataFrame(), False, "No NAV records found matching the specified criteria and date range."
             
@@ -1173,9 +1206,19 @@ def main() -> None:
 
             col1, col2 = st.columns(2)
             with col1:
-                start_date = st.date_input("Start Date", value=datetime(2000, 1, 1).date())
+                start_date = st.date_input(
+                    "Start Date", 
+                    value=datetime(2000, 1, 1).date(),
+                    min_value=datetime(2000, 1, 1).date(),
+                    max_value=datetime.today().date()
+                )
             with col2:
-                end_date = st.date_input("End Date", value=datetime(2026, 5, 29).date())
+                end_date = st.date_input(
+                    "End Date", 
+                    value=datetime.today().date(),
+                    min_value=datetime(2000, 1, 1).date(),
+                    max_value=datetime.today().date()
+                )
 
             default_isins_str = "\n".join([
                 "INF209K01AJ8", "INF846K01CH7", "INF846K016E3", "INF194K01524", "INF760K01019", 
@@ -1281,9 +1324,19 @@ def main() -> None:
 
             col_d1, col_d2 = st.columns(2)
             with col_d1:
-                start_date = st.date_input("Start Date", value=datetime(2026, 1, 1).date())
+                start_date = st.date_input(
+                    "Start Date", 
+                    value=datetime(2026, 1, 1).date(),
+                    min_value=datetime(2000, 1, 1).date(),
+                    max_value=datetime.today().date()
+                )
             with col_d2:
-                end_date = st.date_input("End Date", value=datetime.today().date())
+                end_date = st.date_input(
+                    "End Date", 
+                    value=datetime.today().date(),
+                    min_value=datetime(2000, 1, 1).date(),
+                    max_value=datetime.today().date()
+                )
 
             c1, c2 = st.columns(2)
             with c1:
@@ -1446,7 +1499,12 @@ def main() -> None:
             render_section_header("📅", "Investment Setup", "Pick when you started investing — the tracker runs to today automatically")
             col_a, col_b, col_c = st.columns(3)
             with col_a:
-                start_date = st.date_input("Investment Start Date", value=(datetime.today() - timedelta(days=90)).date())
+                start_date = st.date_input(
+                    "Investment Start Date", 
+                    value=(datetime.today() - timedelta(days=90)).date(),
+                    min_value=datetime(2000, 1, 1).date(),
+                    max_value=datetime.today().date()
+                )
             with col_b:
                 initial_amount_str = st.text_input("Investment Amount (₹)", value="100000")
                 try:
