@@ -550,13 +550,87 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum:
         
     # 1. Calculate the fallback AUM (NAV-scaled monthly AUM) for every row.
     # This ensures we always have a meaningful, date-varying AUM estimate.
-    raw_rows = []
-    for idx, r_dict in df.iterrows():
-        r_copy = r_dict.copy()
-        m_aum = calculate_aum_for_row(r_copy.to_dict(), df_port)
-        r_copy["Monthly_AUM"] = m_aum
-        raw_rows.append(r_copy)
-    df_res = pd.DataFrame(raw_rows)
+    # Pre-build dictionary lookup for target ISINs
+    parsed_isins_set = set()
+    col_growth = "ISIN Div Payout / ISIN Growth" if "ISIN Div Payout / ISIN Growth" in df.columns else "ISIN Div Payout/ ISIN Growth"
+    if col_growth in df.columns:
+        parsed_isins_set.update(df[col_growth].dropna().astype(str).str.strip().str.upper())
+    if "ISIN Div Reinvestment" in df.columns:
+        parsed_isins_set.update(df["ISIN Div Reinvestment"].dropna().astype(str).str.strip().str.upper())
+        
+    aum_lookup = {}
+    if not df_port.empty:
+        for _, row in df_port.iterrows():
+            isin = row.get('SD_Scheme ISIN')
+            m_end = row.get('PD_Month End')
+            aum = row.get('PD_Scheme AUM')
+            if pd.notna(isin) and pd.notna(m_end) and pd.notna(aum):
+                isin_str = str(isin).strip().upper()
+                if isin_str in parsed_isins_set:
+                    if isin_str not in aum_lookup:
+                        aum_lookup[isin_str] = []
+                    aum_lookup[isin_str].append((int(m_end), float(aum)))
+
+        for isin_str in aum_lookup:
+            aum_lookup[isin_str].sort(key=lambda x: x[0], reverse=True)
+
+    def get_aum_from_lookup(isin_growth, isin_reinvestment, m_val, scheme_name, year, month):
+        for isin in [isin_growth, isin_reinvestment]:
+            if isin and isin != "-":
+                isin_upper = str(isin).strip().upper()
+                records = aum_lookup.get(isin_upper)
+                if records:
+                    for m_end, aum in records:
+                        if m_end == m_val:
+                            return aum
+                    return records[0][1]
+                    
+        seed = get_fund_seed(scheme_name)
+        base_aum = (seed % 35 + 15) * 1000 + (seed % 97) + 0.56
+        month_offset = (2026 - year) * 12 + (4 - month)
+        aum_multiplier = 1.0 - (month_offset * 0.012) + ((seed + month) % 5 - 2) * 0.002
+        return round(base_aum * aum_multiplier, 4)
+
+    df_res = df.copy()
+    scheme_names = df_res["Scheme Name"].tolist()
+    isin_growths = df_res[col_growth].tolist()
+    isin_reinvs = df_res["ISIN Div Reinvestment"].tolist()
+    dates = (df_res["NAV Date"] if "NAV Date" in df_res.columns else df_res["Date"]).tolist()
+
+    month_map = {
+        "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+        "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12
+    }
+
+    monthly_aums = []
+    for i in range(len(df_res)):
+        scheme_name = scheme_names[i]
+        isin_g = isin_growths[i]
+        isin_r = isin_reinvs[i]
+        date_val = dates[i]
+        
+        try:
+            if isinstance(date_val, pd.Timestamp):
+                year = date_val.year
+                month = date_val.month
+            else:
+                parts = str(date_val).split("-")
+                if len(parts) == 3:
+                    month_str = parts[1]
+                    year = int(parts[2][:4])
+                    month = month_map.get(month_str[:3], 4)
+                else:
+                    parsed_dt = pd.to_datetime(date_val)
+                    year = parsed_dt.year
+                    month = parsed_dt.month
+        except Exception:
+            year = 2026
+            month = 4
+            
+        m_val = year * 100 + month
+        monthly_aums.append(get_aum_from_lookup(isin_g, isin_r, m_val, scheme_name, year, month))
+
+    df_res["Monthly_AUM"] = monthly_aums
     
     # Scale the monthly AUM by each day's NAV relative to the scheme mean NAV
     # so that AUM varies day-to-day proportional to NAV movement.
@@ -640,21 +714,47 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum:
     if in_streamlit:
         status_text.empty()
             
-    # Overwrite AUM with real API values where a match is found.
-    for idx, row in df_res.iterrows():
-        asset_class = row["Asset Class"]
-        date_str = row["Date_Str_Temp"]
-        scheme_name = row["Scheme Name"]
+    # Pre-compute the scheme-to-performance-scheme matching
+    unique_schemes = df_res[["Scheme Name", "Asset Class"]].drop_duplicates()
+    scheme_match_cache = {}  # (scheme_name, asset_class) -> matched_perf_schemeName
+    
+    for _, row in unique_schemes.iterrows():
+        s_name = row["Scheme Name"]
+        a_class = row["Asset Class"]
+        matched_perf_name = None
+        for key, p_rows in perf_lookup.items():
+            if key[1] == a_class and p_rows:
+                match_row = find_matching_perf_row(s_name, p_rows)
+                if match_row:
+                    matched_perf_name = match_row.get("schemeName")
+                    break
+        scheme_match_cache[(s_name, a_class)] = matched_perf_name
+
+    # Overwrite AUM with real API values using fast lookup
+    a_classes = df_res["Asset Class"].tolist()
+    d_strs = df_res["Date_Str_Temp"].tolist()
+    s_names = df_res["Scheme Name"].tolist()
+    aums = df_res["AUM"].tolist()
+    
+    for i in range(len(df_res)):
+        asset_class = a_classes[i]
+        date_str = d_strs[i]
+        scheme_name = s_names[i]
         
-        perf_rows = perf_lookup.get((date_str, asset_class), [])
-        match = find_matching_perf_row(scheme_name, perf_rows)
-        if match:
-            daily_aum = match.get("dailyAUM")
-            if daily_aum is not None and daily_aum != "":
-                try:
-                    df_res.at[idx, "AUM"] = float(daily_aum)
-                except Exception:
-                    pass
+        perf_name = scheme_match_cache.get((scheme_name, asset_class))
+        if perf_name:
+            perf_rows = perf_lookup.get((date_str, asset_class), [])
+            for p_row in perf_rows:
+                if p_row.get("schemeName") == perf_name:
+                    daily_aum = p_row.get("dailyAUM")
+                    if daily_aum is not None and daily_aum != "":
+                        try:
+                            aums[i] = float(daily_aum)
+                        except Exception:
+                            pass
+                    break
+                    
+    df_res["AUM"] = aums
                     
     df_res = df_res.drop(columns=["Date_Str_Temp"])
     return df_res
@@ -932,57 +1032,61 @@ def run_historical_export(
             "Option Type"
         ]].drop_duplicates(subset=["Scheme Code"])
     
+        # Determine sorted date columns chronologically
+        sorted_date_cols = target_dates
+        if carry_forward and len(target_dates) > 1:
+            try:
+                date_objs = sorted([datetime.strptime(d, "%d-%m-%Y") for d in target_dates])
+                sorted_date_cols = [d.strftime("%d-%m-%Y") for d in date_objs]
+            except Exception:
+                pass
+
         if want_nav and not want_aum:
             df_pivot = df_raw.pivot(index="Scheme Code", columns="Date", values="NAV").reset_index()
-            display_date_cols = target_dates
+            df_pivot = df_pivot.reindex(columns=["Scheme Code"] + sorted_date_cols)
+            if carry_forward and len(sorted_date_cols) > 1:
+                df_pivot[sorted_date_cols] = df_pivot[sorted_date_cols].T.ffill().T
+            display_date_cols = sorted_date_cols
             is_aum_only = False
         elif want_aum and not want_nav:
             df_pivot = df_raw.pivot(index="Scheme Code", columns="Date", values="AUM").reset_index()
-            display_date_cols = target_dates
+            df_pivot = df_pivot.reindex(columns=["Scheme Code"] + sorted_date_cols)
+            if carry_forward and len(sorted_date_cols) > 1:
+                df_pivot[sorted_date_cols] = df_pivot[sorted_date_cols].T.ffill().T
+            display_date_cols = sorted_date_cols
             is_aum_only = True
         else:
             df_pivot_nav = df_raw.pivot(index="Scheme Code", columns="Date", values="NAV").reset_index()
             df_pivot_aum = df_raw.pivot(index="Scheme Code", columns="Date", values="AUM").reset_index()
             df_pivot_flow = df_raw.pivot(index="Scheme Code", columns="Date", values="Flows").reset_index()
-            nav_cols_map = {d: f"{d} (NAV)" for d in target_dates if d in df_pivot_nav.columns}
-            aum_cols_map = {d: f"{d} (AUM)" for d in target_dates if d in df_pivot_aum.columns}
-            flow_cols_map = {d: f"{d} (Flows)" for d in target_dates if d in df_pivot_flow.columns}
+            
+            df_pivot_nav = df_pivot_nav.reindex(columns=["Scheme Code"] + sorted_date_cols)
+            df_pivot_aum = df_pivot_aum.reindex(columns=["Scheme Code"] + sorted_date_cols)
+            df_pivot_flow = df_pivot_flow.reindex(columns=["Scheme Code"] + sorted_date_cols)
+            
+            if carry_forward and len(sorted_date_cols) > 1:
+                df_pivot_nav[sorted_date_cols] = df_pivot_nav[sorted_date_cols].T.ffill().T
+                df_pivot_aum[sorted_date_cols] = df_pivot_aum[sorted_date_cols].T.ffill().T
+                
+            nav_cols_map = {d: f"{d} (NAV)" for d in sorted_date_cols}
+            aum_cols_map = {d: f"{d} (AUM)" for d in sorted_date_cols}
+            flow_cols_map = {d: f"{d} (Flows)" for d in sorted_date_cols}
             df_pivot_nav = df_pivot_nav.rename(columns=nav_cols_map)
             df_pivot_aum = df_pivot_aum.rename(columns=aum_cols_map)
             df_pivot_flow = df_pivot_flow.rename(columns=flow_cols_map)
+            
             df_pivot = pd.merge(df_pivot_nav, df_pivot_aum, on="Scheme Code", how="left")
             df_pivot = pd.merge(df_pivot, df_pivot_flow, on="Scheme Code", how="left")
+            
             interleaved_dates = []
-            for d in target_dates:
+            for d in sorted_date_cols:
                 interleaved_dates.append(f"{d} (NAV)")
                 interleaved_dates.append(f"{d} (AUM)")
                 interleaved_dates.append(f"{d} (Flows)")
             display_date_cols = interleaved_dates
             is_aum_only = False
-    
+            
         df_final = pd.merge(fund_metadata, df_pivot, on="Scheme Code", how="left")
-    
-        # Add any missing date columns in bulk to avoid DataFrame fragmentation
-        missing_cols = [c for c in display_date_cols if c not in df_final.columns]
-        if missing_cols:
-            missing_df = pd.DataFrame({c: pd.array([None] * len(df_final)) for c in missing_cols})
-            df_final = pd.concat([df_final, missing_df], axis=1)
-            
-        if carry_forward and len(target_dates) > 1:
-            date_objs = sorted([datetime.strptime(d, "%d-%m-%Y") for d in target_dates])
-            sorted_date_cols = [d.strftime("%d-%m-%Y") for d in date_objs]
-        
-            for i in range(1, len(sorted_date_cols)):
-                prev_col = sorted_date_cols[i-1]
-                curr_col = sorted_date_cols[i]
-            
-                if want_nav and not want_aum:
-                    df_final[curr_col] = df_final[curr_col].fillna(df_final[prev_col])
-                elif want_aum and not want_nav:
-                    df_final[curr_col] = df_final[curr_col].fillna(df_final[prev_col])
-                else:
-                    df_final[f"{curr_col} (NAV)"] = df_final[f"{curr_col} (NAV)"].fillna(df_final[f"{prev_col} (NAV)"])
-                    df_final[f"{curr_col} (AUM)"] = df_final[f"{curr_col} (AUM)"].fillna(df_final[f"{prev_col} (AUM)"])
                 
         if want_aum:
             df_pivot_fallback = df_raw.pivot(index="Scheme Code", columns="Date", values="Fallback_AUM").reset_index()
