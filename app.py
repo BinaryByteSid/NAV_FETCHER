@@ -600,11 +600,11 @@ def run_historical_export(
         except ImportError:
             pass
 
-        # Split target date range into chunks of up to 90 days to avoid AMFI's limit (503 error)
+        # Split target date range into chunks of up to 30 days to avoid AMFI's limit (503 error / HTML loader page)
         chunks = []
         curr_start = fetch_start_date
         while curr_start <= end_date:
-            curr_end = min(curr_start + timedelta(days=90), end_date)
+            curr_end = min(curr_start + timedelta(days=30), end_date)
             chunks.append((curr_start, curr_end))
             curr_start = curr_end + timedelta(days=1)
 
