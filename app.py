@@ -191,6 +191,7 @@ def fetch_amfi_chunk_with_cache(c_start, c_end) -> str:
     return ""
 
 
+
 def load_portfolio_aum_data() -> pd.DataFrame:
     paths = [
         "../portfolio last 6 months.xlsx",
@@ -420,7 +421,7 @@ def clean_name(name: str) -> str:
     return " ".join(cleaned_tokens)
 
 
-# (os, threading, requests already imported at top)
+# (os, threading already imported at top)
 
 # Create local thread-safe requests session to enable connection reuse
 _thread_local = threading.local()
@@ -447,7 +448,7 @@ def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id
             return []
     except Exception:
         pass
-    
+
     key_str = f"{date_str}_{maturity_id}_{category_id}_{subcategory_id}"
     cache_path = os.path.join(API_CACHE_DIR, f"{key_str}.json")
     
@@ -730,7 +731,16 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum:
                     break
         scheme_match_cache[(s_name, a_class)] = matched_perf_name
 
-    # Overwrite AUM with real API values using fast lookup
+    # Build a flat O(1) lookup: (date_str, asset_class, perf_name) -> daily_aum
+    # This eliminates the inner per-row scan that was O(n_perf_rows) per data row.
+    flat_perf_lookup = {}
+    for (date_str, asset_class), p_rows in perf_lookup.items():
+        for p_row in p_rows:
+            p_name = p_row.get("schemeName")
+            if p_name:
+                flat_perf_lookup[(date_str, asset_class, p_name)] = p_row.get("dailyAUM")
+
+    # Overwrite AUM with real API values using flat O(1) lookup
     a_classes = df_res["Asset Class"].tolist()
     d_strs = df_res["Date_Str_Temp"].tolist()
     s_names = df_res["Scheme Name"].tolist()
@@ -743,16 +753,12 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum:
         
         perf_name = scheme_match_cache.get((scheme_name, asset_class))
         if perf_name:
-            perf_rows = perf_lookup.get((date_str, asset_class), [])
-            for p_row in perf_rows:
-                if p_row.get("schemeName") == perf_name:
-                    daily_aum = p_row.get("dailyAUM")
-                    if daily_aum is not None and daily_aum != "":
-                        try:
-                            aums[i] = float(daily_aum)
-                        except Exception:
-                            pass
-                    break
+            daily_aum = flat_perf_lookup.get((date_str, asset_class, perf_name))
+            if daily_aum is not None and daily_aum != "":
+                try:
+                    aums[i] = float(daily_aum)
+                except Exception:
+                    pass
                     
     df_res["AUM"] = aums
                     
@@ -946,7 +952,7 @@ def run_historical_export(
             except Exception:
                 return idx, []
 
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        with ThreadPoolExecutor(max_workers=min(12, len(chunks))) as executor:
             futures = {
                 executor.submit(_download_and_parse_chunk, idx, c_start, c_end, parsed_isins_set): idx
                 for idx, (c_start, c_end) in enumerate(chunks)
