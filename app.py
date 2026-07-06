@@ -369,14 +369,38 @@ def clean_name(name: str) -> str:
     return " ".join(cleaned_tokens)
 
 
-API_CACHE = {}
+import os
+from datetime import datetime, timedelta
 
+# API Caching to disk to avoid repeat calls
+API_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api_cache")
+os.makedirs(API_CACHE_DIR, exist_ok=True)
 
 def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id: int, subcategory_id: int) -> list:
-    key = (date_str, maturity_id, category_id, subcategory_id)
-    if key in API_CACHE:
-        return API_CACHE[key]
-        
+    import json
+    import os
+    import time
+    
+    key_str = f"{date_str}_{maturity_id}_{category_id}_{subcategory_id}"
+    cache_path = os.path.join(API_CACHE_DIR, f"{key_str}.json")
+    
+    # Check if we can use the cached file
+    if os.path.exists(cache_path):
+        try:
+            parsed_date = datetime.strptime(date_str, "%d-%b-%Y")
+            yesterday = datetime.today() - timedelta(days=1)
+            if parsed_date < yesterday:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            else:
+                # 1 hour TTL for recent dates
+                file_age = time.time() - os.path.getmtime(cache_path)
+                if file_age < 3600:
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        return json.load(f)
+        except Exception:
+            pass
+            
     url = "https://www.amfiindia.com/gateway/pollingsebi/api/amfi/fundperformance"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -390,9 +414,8 @@ def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id
         "reportDate": date_str
     }
     
-    import time
     max_retries = 3
-    backoff = 1.0
+    delay = 1.0
     
     for attempt in range(max_retries):
         try:
@@ -401,21 +424,18 @@ def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id
                 res_data = resp.json()
                 if res_data.get("validationMsg") == "SUCCESS":
                     rows = res_data.get("data", [])
-                    API_CACHE[key] = rows
+                    try:
+                        with open(cache_path, "w", encoding="utf-8") as f:
+                            json.dump(rows, f)
+                    except Exception:
+                        pass
                     return rows
-                else:
-                    # Log validation error
-                    print(f"AMFI API Validation failed for {key}: {res_data.get('validationMsg')}")
-            else:
-                print(f"AMFI API returned HTTP code {resp.status_code} for {key}")
-        except Exception as e:
-            print(f"Attempt {attempt+1} failed for {key} with error: {e}")
-        
-        if attempt < max_retries - 1:
-            time.sleep(backoff)
-            backoff *= 2
+            time.sleep(delay)
+            delay *= 2
+        except Exception:
+            time.sleep(delay)
+            delay *= 2
             
-    API_CACHE[key] = []
     return []
 
 
@@ -506,22 +526,50 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum:
     unique_groups = df_res[["Asset Class", "Date_Str_Temp"]].drop_duplicates()
     
     perf_lookup = {}
-    import time
     
-    for i, (_, grp) in enumerate(unique_groups.iterrows()):
-        asset_class = grp["Asset Class"]
-        date_str = grp["Date_Str_Temp"]
-        if not asset_class or not date_str:
-            continue
-            
+    # Run API calls in parallel using ThreadPoolExecutor for high performance fetching
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    # Determine if running inside Streamlit context to show status
+    in_streamlit = False
+    try:
+        from streamlit.runtime import exists as runtime_exists
+        in_streamlit = runtime_exists()
+    except ImportError:
+        pass
+
+    if in_streamlit:
+        status_text = st.empty()
+        status_text.text("Fetching daily AUM from AMFI fund performance website...")
+
+    def fetch_task(asset_class, date_str):
         m_id, c_id, s_id = map_section_to_ids(asset_class)
-        
-        if i > 0:
-            time.sleep(0.5)  # rate-limit
-            
-        perf_rows = fetch_performance_data_from_api(date_str, m_id, c_id, s_id)
-        if perf_rows:
-            perf_lookup[(date_str, asset_class)] = perf_rows
+        rows = fetch_performance_data_from_api(date_str, m_id, c_id, s_id)
+        return (date_str, asset_class), rows
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = []
+        for _, grp in unique_groups.iterrows():
+            asset_class = grp["Asset Class"]
+            date_str = grp["Date_Str_Temp"]
+            if asset_class and date_str:
+                futures.append(executor.submit(fetch_task, asset_class, date_str))
+                
+        completed_count = 0
+        total_count = len(futures)
+        for future in as_completed(futures):
+            try:
+                key, rows = future.result()
+                if rows:
+                    perf_lookup[key] = rows
+            except Exception:
+                pass
+            completed_count += 1
+            if in_streamlit and completed_count % 10 == 0:
+                status_text.text(f"Fetching daily AUM from AMFI fund performance website ({completed_count}/{total_count})...")
+
+    if in_streamlit:
+        status_text.empty()
             
     # Overwrite AUM with real API values where a match is found.
     for idx, row in df_res.iterrows():
@@ -1305,7 +1353,7 @@ def main() -> None:
             with col_c3:
                 want_flows = st.checkbox("Want Flows", value=False)
 
-            fetch_live_aum = st.checkbox("Fetch actual daily AUM from AMFI (slower)", value=False, key="hist_live_aum")
+            fetch_live_aum = st.checkbox("Fetch actual daily AUM from AMFI (slower)", value=True, key="hist_live_aum")
 
             if st.button("Fetch & generate Excel", type="primary", use_container_width=True):
                 parsed_isins = [x.strip() for x in re.split(r"[,\n\s]+", isin_input) if x.strip()]
@@ -1412,7 +1460,7 @@ def main() -> None:
             with col_c3:
                 want_flows = st.checkbox("Want Flows", value=True, key="perf_flows")
 
-            fetch_live_aum = st.checkbox("Fetch actual daily AUM from AMFI (slower)", value=False, key="perf_live_aum")
+            fetch_live_aum = st.checkbox("Fetch actual daily AUM from AMFI (slower)", value=True, key="perf_live_aum")
 
             if st.button("Go", type="primary", use_container_width=True):
                 if not want_nav and not want_aum and not want_flows:
