@@ -103,6 +103,15 @@ def fetch_amfi_chunk_with_cache(c_start, c_end) -> str:
     import time
     from datetime import date as dt_date
     
+    # 1. Skip querying dates before 2006-04-01 (AMFI's historical NAV CSV database starts in April 2006)
+    # This prevents dozens of useless requests that return HTML and block the thread pool.
+    try:
+        chk_date = c_end.date() if hasattr(c_end, "date") else c_end
+        if chk_date < dt_date(2006, 4, 1):
+            return ""
+    except Exception:
+        pass
+
     # Define cache directory
     cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "amfi_cache")
     os.makedirs(cache_dir, exist_ok=True)
@@ -115,8 +124,8 @@ def fetch_amfi_chunk_with_cache(c_start, c_end) -> str:
     cache_key = f"amfi_{c_start.strftime('%Y%m%d')}_{c_end.strftime('%Y%m%d')}"
     cache_path = os.path.join(cache_dir, f"{cache_key}.txt")
     
-    # Check if we can use the cached file
-    if os.path.exists(cache_path):
+    # Check if we can use the cached file (must be non-empty and contain NAV data)
+    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 100:
         yesterday = dt_date.today() - timedelta(days=1)
         if c_end < yesterday:
             try:
@@ -141,7 +150,9 @@ def fetch_amfi_chunk_with_cache(c_start, c_end) -> str:
     response = None
     for attempt in range(max_retries):
         try:
-            response = session.get(url, timeout=120)
+            # Use tuple timeout: (connect_timeout, read_timeout)
+            # Short connect timeout prevents hanging on unresponsive server
+            response = session.get(url, timeout=(10, 60))
             # Check for HTML loader page (AMFI returns this on overload)
             if response.status_code == 200:
                 text = response.text
@@ -152,13 +163,15 @@ def fetch_amfi_chunk_with_cache(c_start, c_end) -> str:
                     delay = min(delay * 2, 30)
                     continue
                 break
-            elif response.status_code == 503:
+            elif response.status_code in (503, 429):
                 time.sleep(delay)
                 delay = min(delay * 2, 30)
+                response = None
                 continue
             else:
                 response.raise_for_status()
         except requests.exceptions.RequestException:
+            response = None
             if attempt == max_retries - 1:
                 return ""
             time.sleep(delay)
@@ -167,7 +180,7 @@ def fetch_amfi_chunk_with_cache(c_start, c_end) -> str:
     if response is not None:
         content_text = response.text
         # Only cache if it contains actual NAV data (not the HTML wait page)
-        if ";" in content_text and not content_text.strip().startswith("<"):
+        if ";" in content_text and len(content_text) > 100 and not content_text.strip().startswith("<"):
             try:
                 with open(cache_path, "w", encoding="utf-8", errors="ignore") as f:
                     f.write(content_text)
@@ -679,40 +692,19 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
         
     df = df.sort_values(by=["Scheme Code", "NAV Date_parsed"]).reset_index(drop=True)
     
-    df["Closing AUM as on previous day"] = None
+    df["Closing AUM as on previous day"] = df.groupby("Scheme Code")["AUM"].shift(1)
     df["Actual AUM as on current date"] = df["AUM"]
-    df["Daily return"] = None
-    df["Derived AUM as on curent day"] = None
-    df["Net flows on current day"] = None
     
-    for scheme_code, group in df.groupby("Scheme Code"):
-        indices = group.index
-        for idx_in_group, idx in enumerate(indices):
-            if idx_in_group == 0:
-                continue
-            prev_idx = indices[idx_in_group - 1]
-            
-            nav_curr = df.at[idx, "NAV"]
-            nav_prev = df.at[prev_idx, "NAV"]
-            aum_prev = df.at[prev_idx, "AUM"]
-            aum_curr = df.at[idx, "AUM"]
-            
-            df.at[idx, "Closing AUM as on previous day"] = aum_prev
-            
-            if pd.notna(nav_curr) and pd.notna(nav_prev) and nav_prev != 0:
-                daily_return = (nav_curr - nav_prev) / nav_prev
-                df.at[idx, "Daily return"] = daily_return * 100
-            else:
-                daily_return = None
-                
-            if pd.notna(aum_prev) and daily_return is not None:
-                derived_aum = aum_prev * (1 + daily_return)
-                df.at[idx, "Derived AUM as on curent day"] = derived_aum
-            else:
-                derived_aum = None
-                
-            if pd.notna(aum_curr) and derived_aum is not None:
-                df.at[idx, "Net flows on current day"] = aum_curr - derived_aum
+    prev_nav = df.groupby("Scheme Code")["NAV"].shift(1)
+    
+    # Calculate daily return: (NAV - prev_nav) / prev_nav * 100
+    df["Daily return"] = ((df["NAV"] - prev_nav) / prev_nav * 100).where(prev_nav.notna() & (prev_nav != 0))
+    
+    # Calculate derived AUM: AUM_prev * (1 + daily_return / 100)
+    df["Derived AUM as on curent day"] = df["Closing AUM as on previous day"] * (1 + df["Daily return"] / 100)
+    
+    # Calculate net flows: AUM_curr - Derived_AUM
+    df["Net flows on current day"] = df["Actual AUM as on current date"] - df["Derived AUM as on curent day"]
                 
     # Filter only target dates
     start_date_ts = pd.to_datetime(start_date)
@@ -791,28 +783,79 @@ def run_historical_export(
         if in_streamlit:
             progress_bar = st.progress(0.0, text=f"Fetching historical data (0/{len(chunks)} chunks)...")
 
-        # ── Concurrent chunk fetching ──────────────────────────────────
+        # ── Concurrent chunk fetching & parsing ────────────────────────
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import time
 
-        chunk_results = {}  # idx -> content_text
+        chunk_results = {}  # idx -> parsed rows list
 
-        def _download_chunk(idx, c_start, c_end):
+        def _download_and_parse_chunk(idx, c_start, c_end, isins_set):
             try:
-                return idx, fetch_amfi_chunk_with_cache(c_start, c_end)
+                content_text = fetch_amfi_chunk_with_cache(c_start, c_end)
+                if not content_text:
+                    return idx, []
+                
+                chunk_rows = []
+                current_section = "Unknown"
+                for line in content_text.splitlines():
+                    if not line:
+                        continue
+                    if ";" not in line:
+                        line_stripped = line.strip()
+                        if (
+                            line_stripped.startswith("Open Ended")
+                            or line_stripped.startswith("Closed Ended")
+                            or line_stripped.startswith("Interval Fund Schemes")
+                        ):
+                            current_section = line_stripped
+                        continue
+                    
+                    parts = line.split(";")
+                    if len(parts) < 8:
+                        continue
+                        
+                    isin_growth = parts[2].strip()
+                    isin_reinvestment = parts[3].strip()
+                    isin_growth_upper = isin_growth.upper() if isin_growth != "-" else ""
+                    isin_reinvest_upper = isin_reinvestment.upper() if isin_reinvestment != "-" else ""
+                    
+                    g_match = isin_growth_upper and isin_growth_upper in isins_set
+                    r_match = isin_reinvest_upper and isin_reinvest_upper in isins_set
+                    
+                    if g_match or r_match:
+                        scheme_code = parts[0].strip()
+                        scheme_name = parts[1].strip()
+                        nav_value = parts[4].strip()
+                        nav_date = parts[7].strip()
+                        
+                        scheme_code = scheme_code if scheme_code != "-" else None
+                        isin_growth = isin_growth if isin_growth != "-" else None
+                        isin_reinvestment = isin_reinvestment if isin_reinvestment != "-" else None
+                        
+                        nav = pd.to_numeric(nav_value.replace(",", ""), errors="coerce")
+                        chunk_rows.append({
+                            "Asset Class": current_section,
+                            "Scheme Code": scheme_code,
+                            "ISIN Div Payout / ISIN Growth": isin_growth,
+                            "ISIN Div Reinvestment": isin_reinvestment,
+                            "Scheme Name": scheme_name,
+                            "NAV": nav,
+                            "Date": nav_date
+                        })
+                return idx, chunk_rows
             except Exception:
-                return idx, ""
+                return idx, []
 
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = {
-                executor.submit(_download_chunk, idx, c_start, c_end): idx
+                executor.submit(_download_and_parse_chunk, idx, c_start, c_end, parsed_isins_set): idx
                 for idx, (c_start, c_end) in enumerate(chunks)
             }
             completed = 0
             for future in as_completed(futures):
                 completed += 1
-                idx, content = future.result()
-                chunk_results[idx] = content
+                idx, chunk_rows = future.result()
+                chunk_results[idx] = chunk_rows
                 if in_streamlit:
                     c_s, c_e = chunks[idx]
                     progress_bar.progress(
@@ -820,61 +863,9 @@ def run_historical_export(
                         text=f"Fetching historical data ({completed}/{len(chunks)} chunks): {c_s.strftime('%d-%b-%Y')} to {c_e.strftime('%d-%b-%Y')}..."
                     )
 
-        # Process results in order so section tracking is correct
+        # Assemble results in chronological order
         for chunk_idx in range(len(chunks)):
-            content_text = chunk_results.get(chunk_idx, "")
-            if not content_text:
-                continue
-
-            current_section = "Unknown"
-            for line in content_text.splitlines():
-                if not line:
-                    continue
-
-                # Fast check: AMC and section lines do not contain semicolons
-                if ";" not in line:
-                    line_stripped = line.strip()
-                    if (
-                        line_stripped.startswith("Open Ended")
-                        or line_stripped.startswith("Closed Ended")
-                        or line_stripped.startswith("Interval Fund Schemes")
-                    ):
-                        current_section = line_stripped
-                    continue
-
-                parts = line.split(";")
-                if len(parts) < 8:
-                    continue
-
-                isin_growth = parts[2].strip()
-                isin_reinvestment = parts[3].strip()
-
-                isin_growth_upper = isin_growth.upper() if isin_growth != "-" else ""
-                isin_reinvest_upper = isin_reinvestment.upper() if isin_reinvestment != "-" else ""
-
-                g_match = isin_growth_upper and isin_growth_upper in parsed_isins_set
-                r_match = isin_reinvest_upper and isin_reinvest_upper in parsed_isins_set
-
-                if g_match or r_match:
-                    scheme_code = parts[0].strip()
-                    scheme_name = parts[1].strip()
-                    nav_value = parts[4].strip()
-                    nav_date = parts[7].strip()
-
-                    scheme_code = scheme_code if scheme_code != "-" else None
-                    isin_growth = isin_growth if isin_growth != "-" else None
-                    isin_reinvestment = isin_reinvestment if isin_reinvestment != "-" else None
-
-                    nav = pd.to_numeric(nav_value.replace(",", ""), errors="coerce")
-                    rows.append({
-                        "Asset Class": current_section,
-                        "Scheme Code": scheme_code,
-                        "ISIN Div Payout / ISIN Growth": isin_growth,
-                        "ISIN Div Reinvestment": isin_reinvestment,
-                        "Scheme Name": scheme_name,
-                        "NAV": nav,
-                        "Date": nav_date
-                    })
+            rows.extend(chunk_results.get(chunk_idx, []))
 
         if in_streamlit:
             progress_bar.progress(1.0, text="Fetching complete!")
@@ -971,9 +962,11 @@ def run_historical_export(
     
         df_final = pd.merge(fund_metadata, df_pivot, on="Scheme Code", how="left")
     
-        for date_col in display_date_cols:
-            if date_col not in df_final.columns:
-                df_final[date_col] = None
+        # Add any missing date columns in bulk to avoid DataFrame fragmentation
+        missing_cols = [c for c in display_date_cols if c not in df_final.columns]
+        if missing_cols:
+            missing_df = pd.DataFrame({c: pd.array([None] * len(df_final)) for c in missing_cols})
+            df_final = pd.concat([df_final, missing_df], axis=1)
             
         if carry_forward and len(target_dates) > 1:
             date_objs = sorted([datetime.strptime(d, "%d-%m-%Y") for d in target_dates])
