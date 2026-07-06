@@ -112,35 +112,41 @@ def fetch_amfi_chunk_with_cache(c_start, c_end) -> str:
     except Exception:
         pass
 
-    # Define cache directory
-    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "amfi_cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    
     frmdt_str = c_start.strftime("%d-%b-%Y")
     todt_str = c_end.strftime("%d-%b-%Y")
     url = f"https://portal.amfiindia.com/DownloadNAVHistoryReport_Po.aspx?frmdt={frmdt_str}&todt={todt_str}"
     
-    # Cache key based on date range
-    cache_key = f"amfi_{c_start.strftime('%Y%m%d')}_{c_end.strftime('%Y%m%d')}"
-    cache_path = os.path.join(cache_dir, f"{cache_key}.txt")
+    # Only use file cache on non-Cloud environments (Streamlit Cloud has ephemeral FS
+    # and filling it with large text files causes OOM).  Detect Cloud by the absence
+    # of a writable local amfi_cache directory outside /tmp.
+    _is_cloud = os.environ.get("STREAMLIT_SHARING_MODE") or not os.path.exists(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "amfi_cache")
+    )
     
-    # Check if we can use the cached file (must be non-empty and contain NAV data)
-    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 100:
-        yesterday = dt_date.today() - timedelta(days=1)
-        if c_end < yesterday:
-            try:
-                with open(cache_path, "r", encoding="utf-8", errors="ignore") as f:
-                    return f.read()
-            except Exception:
-                pass
-        else:
-            file_age = time.time() - os.path.getmtime(cache_path)
-            if file_age < 3600:
+    if not _is_cloud:
+        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "amfi_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_key = f"amfi_{c_start.strftime('%Y%m%d')}_{c_end.strftime('%Y%m%d')}"
+        cache_path = os.path.join(cache_dir, f"{cache_key}.txt")
+        
+        if os.path.exists(cache_path) and os.path.getsize(cache_path) > 100:
+            yesterday = dt_date.today() - timedelta(days=1)
+            if c_end < yesterday:
                 try:
                     with open(cache_path, "r", encoding="utf-8", errors="ignore") as f:
                         return f.read()
                 except Exception:
                     pass
+            else:
+                file_age = time.time() - os.path.getmtime(cache_path)
+                if file_age < 3600:
+                    try:
+                        with open(cache_path, "r", encoding="utf-8", errors="ignore") as f:
+                            return f.read()
+                    except Exception:
+                        pass
+    else:
+        cache_path = None
     
     # Download from AMFI using persistent session
     session = _get_nav_session()
@@ -150,14 +156,10 @@ def fetch_amfi_chunk_with_cache(c_start, c_end) -> str:
     response = None
     for attempt in range(max_retries):
         try:
-            # Use tuple timeout: (connect_timeout, read_timeout)
-            # Short connect timeout prevents hanging on unresponsive server
             response = session.get(url, timeout=(10, 60))
-            # Check for HTML loader page (AMFI returns this on overload)
             if response.status_code == 200:
                 text = response.text
                 if text.strip().startswith("<") or "<html" in text[:500].lower():
-                    # Got HTML instead of CSV — retry after backoff
                     response = None
                     time.sleep(delay)
                     delay = min(delay * 2, 30)
@@ -179,13 +181,13 @@ def fetch_amfi_chunk_with_cache(c_start, c_end) -> str:
             
     if response is not None:
         content_text = response.text
-        # Only cache if it contains actual NAV data (not the HTML wait page)
         if ";" in content_text and len(content_text) > 100 and not content_text.strip().startswith("<"):
-            try:
-                with open(cache_path, "w", encoding="utf-8", errors="ignore") as f:
-                    f.write(content_text)
-            except Exception:
-                pass
+            if not _is_cloud and cache_path:
+                try:
+                    with open(cache_path, "w", encoding="utf-8", errors="ignore") as f:
+                        f.write(content_text)
+                except Exception:
+                    pass
         return content_text
         
     return ""
@@ -732,13 +734,16 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum:
         scheme_match_cache[(s_name, a_class)] = matched_perf_name
 
     # Build a flat O(1) lookup: (date_str, asset_class, perf_name) -> daily_aum
-    # This eliminates the inner per-row scan that was O(n_perf_rows) per data row.
+    # Only store AUMs for schemes we actually matched — this keeps the dict small.
+    needed_perf_names = set(v for v in scheme_match_cache.values() if v)
     flat_perf_lookup = {}
     for (date_str, asset_class), p_rows in perf_lookup.items():
         for p_row in p_rows:
             p_name = p_row.get("schemeName")
-            if p_name:
+            if p_name and p_name in needed_perf_names:
                 flat_perf_lookup[(date_str, asset_class, p_name)] = p_row.get("dailyAUM")
+    # Free the large perf_lookup dict — flat_perf_lookup is far smaller
+    del perf_lookup
 
     # Overwrite AUM with real API values using flat O(1) lookup
     a_classes = df_res["Asset Class"].tolist()
@@ -759,7 +764,8 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum:
                     aums[i] = float(daily_aum)
                 except Exception:
                     pass
-                    
+    
+    del flat_perf_lookup, scheme_match_cache
     df_res["AUM"] = aums
                     
     df_res = df_res.drop(columns=["Date_Str_Temp"])
@@ -952,7 +958,10 @@ def run_historical_export(
             except Exception:
                 return idx, []
 
-        with ThreadPoolExecutor(max_workers=min(12, len(chunks))) as executor:
+        # Use at most 3 concurrent workers to cap peak RAM (each AMFI chunk is ~5 MB of
+        # raw text; 8 simultaneous downloads would consume ~40 MB of string objects on top
+        # of the parsed rows, easily hitting Streamlit Cloud's 1 GB limit).
+        with ThreadPoolExecutor(max_workers=min(3, len(chunks))) as executor:
             futures = {
                 executor.submit(_download_and_parse_chunk, idx, c_start, c_end, parsed_isins_set): idx
                 for idx, (c_start, c_end) in enumerate(chunks)
@@ -1093,7 +1102,8 @@ def run_historical_export(
             is_aum_only = False
             
         df_final = pd.merge(fund_metadata, df_pivot, on="Scheme Code", how="left")
-                
+        del df_pivot  # free pivot memory
+
         if want_aum:
             df_pivot_fallback = df_raw.pivot(index="Scheme Code", columns="Date", values="Fallback_AUM").reset_index()
             fallback_cols_map = {}
@@ -1151,14 +1161,12 @@ def run_historical_export(
         if want_aum:
             ordered_cols.extend(["AUM Date", "AUM"])
     
+        del df_raw  # free the large intermediate frame before building vertical rows
+        
         if vertical_rows:
             df_res_final = pd.DataFrame(vertical_rows)
-            if "NAV Date" in df_res_final.columns:
-                parsed = parse_amfi_date_series(df_res_final["NAV Date"])
-                df_res_final["NAV Date"] = parsed.dt.strftime("%d-%m-%Y")
-            if "AUM Date" in df_res_final.columns:
-                parsed = parse_amfi_date_series(df_res_final["AUM Date"])
-                df_res_final["AUM Date"] = parsed.dt.strftime("%d-%m-%Y")
+            del vertical_rows  # free list now it's in a DataFrame
+            # NAV Date / AUM Date are already formatted as dd-mm-YYYY strings — skip redundant parse
             df_res_final = df_res_final[ordered_cols]
             df_res_final = df_res_final.sort_values(by=["Asset Class", "Scheme Name"]).reset_index(drop=True)
             if want_flows:
