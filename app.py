@@ -409,8 +409,7 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum:
         
     # Initialize AUM with the fallback so every row already has a value.
     # Rows where the live API succeeds will get overwritten below.
-    # Initialize AUM as NaN; we'll fill only where real API values are available.
-    df_res["AUM"] = pd.NA
+    df_res["AUM"] = df_res["Fallback_AUM"]
     
     # 2. Try to fetch real AUM from the AMFI performance API for each unique (date, asset-class) pair.
     def get_date_str(dt):
@@ -805,9 +804,10 @@ def run_historical_export(
                 if want_nav and not want_aum:
                     df_final[curr_col] = df_final[curr_col].fillna(df_final[prev_col])
                 elif want_aum and not want_nav:
-                    pass
+                    df_final[curr_col] = df_final[curr_col].fillna(df_final[prev_col])
                 else:
                     df_final[f"{curr_col} (NAV)"] = df_final[f"{curr_col} (NAV)"].fillna(df_final[f"{prev_col} (NAV)"])
+                    df_final[f"{curr_col} (AUM)"] = df_final[f"{curr_col} (AUM)"].fillna(df_final[f"{prev_col} (AUM)"])
                 
         if want_aum:
             df_pivot_fallback = df_raw.pivot(index="Scheme Code", columns="Date", values="Fallback_AUM").reset_index()
