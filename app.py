@@ -370,7 +370,17 @@ def clean_name(name: str) -> str:
 
 
 import os
+import threading
+import requests
 from datetime import datetime, timedelta
+
+# Create local thread-safe requests session to enable connection reuse
+_thread_local = threading.local()
+
+def get_api_session():
+    if not hasattr(_thread_local, "session"):
+        _thread_local.session = requests.Session()
+    return _thread_local.session
 
 # API Caching to disk to avoid repeat calls
 API_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api_cache")
@@ -380,6 +390,15 @@ def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id
     import json
     import os
     import time
+    
+    # 1. Skip querying dates before 2018-01-01 (SEBI categorization and AMFI performance dataset starts around 2018)
+    # This prevents thousands of useless requests that return 0 rows.
+    try:
+        parsed_date = datetime.strptime(date_str, "%d-%b-%Y")
+        if parsed_date.year < 2018:
+            return []
+    except Exception:
+        pass
     
     key_str = f"{date_str}_{maturity_id}_{category_id}_{subcategory_id}"
     cache_path = os.path.join(API_CACHE_DIR, f"{key_str}.json")
@@ -417,9 +436,11 @@ def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id
     max_retries = 3
     delay = 1.0
     
+    session = get_api_session()
+    
     for attempt in range(max_retries):
         try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=20)
+            resp = session.post(url, json=payload, headers=headers, timeout=20)
             if resp.status_code == 200:
                 res_data = resp.json()
                 if res_data.get("validationMsg") == "SUCCESS":
