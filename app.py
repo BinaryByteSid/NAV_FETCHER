@@ -819,8 +819,23 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum:
                     pass
     
     del flat_perf_lookup, scheme_match_cache
-    df_res["AUM"] = aums
-                    
+    df_res["AUM"] = pd.to_numeric(pd.Series(aums, index=df_res.index), errors="coerce")
+
+    # Carry real AUM across gaps so no day is left blank when the scheme has at
+    # least one real reading. Non-trading days (weekends/holidays, where NAV is
+    # also carried) and the occasional failed/slow API call get filled with the
+    # nearest real AUM instead of showing "None". Nothing is fabricated — every
+    # filled value is an actual disclosed AUM carried to an adjacent day.
+    try:
+        _dcol = "NAV Date" if "NAV Date" in df_res.columns else "Date"
+        df_res["_aum_sort"] = parse_amfi_date_series(df_res[_dcol])
+        df_res = df_res.sort_values(["Scheme Code", "_aum_sort"]).reset_index(drop=True)
+        df_res["AUM"] = df_res.groupby("Scheme Code")["AUM"].ffill()
+        df_res["AUM"] = df_res.groupby("Scheme Code")["AUM"].bfill()
+        df_res = df_res.drop(columns=["_aum_sort"])
+    except Exception:
+        pass
+
     df_res = df_res.drop(columns=["Date_Str_Temp"])
     return df_res
 
@@ -1595,6 +1610,7 @@ def main() -> None:
             fetch_live_aum = st.checkbox("Fetch actual daily AUM from AMFI (slower)", value=True, key="hist_live_aum")
 
             if st.button("Fetch & generate Excel", type="primary", use_container_width=True):
+                st.session_state["hist_result"] = None
                 parsed_isins = [x.strip() for x in re.split(r"[,\n\s]+", isin_input) if x.strip()]
                 if not want_nav and not want_aum and not want_flows:
                     st.error("Please select at least one data type (NAV, AUM, or Flows) to export.")
@@ -1615,33 +1631,47 @@ def main() -> None:
                             want_flows=want_flows,
                             fetch_live_aum=fetch_live_aum
                         )
-                        if err:
-                            st.warning(err)
-                        elif df_final.empty:
-                            st.warning("No records found matching the specified criteria.")
-                        else:
-                            st.success(f"Successfully processed {len(df_final)} vertical records!")
-                            
-                            render_section_header("👁️", "Data Preview")
-                            st.dataframe(
-                                df_final,
-                                use_container_width=True,
-                                column_config={
-                                    "Daily return": st.column_config.NumberColumn(
-                                        "Daily return",
-                                        format="%.2f%%"
-                                    )
-                                }
-                            )
-                            
-                            excel_bytes = generate_historical_excel(df_final, [], is_aum_only=is_aum_only)
-                            st.download_button(
-                                label="📥 Download Styled Excel (.xlsx)",
-                                data=excel_bytes,
-                                file_name=f"amfi_nav_export_{start_date}_to_{end_date}.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                use_container_width=True
-                            )
+                    if err:
+                        st.warning(err)
+                    elif df_final.empty:
+                        st.warning("No records found matching the specified criteria.")
+                    else:
+                        # Persist so the preview + download survive the rerun triggered by a
+                        # download-button click (otherwise Streamlit discards the results).
+                        st.session_state["hist_result"] = {
+                            "df": df_final,
+                            "is_aum_only": is_aum_only,
+                            "start": str(start_date),
+                            "end": str(end_date),
+                        }
+
+            # Render the persisted result outside the button gate so the download works reliably.
+            hist_res = st.session_state.get("hist_result")
+            if hist_res:
+                df_final = hist_res["df"]
+                st.success(f"Successfully processed {len(df_final)} vertical records!")
+
+                render_section_header("👁️", "Data Preview")
+                st.dataframe(
+                    df_final,
+                    use_container_width=True,
+                    column_config={
+                        "Daily return": st.column_config.NumberColumn(
+                            "Daily return",
+                            format="%.2f%%"
+                        )
+                    }
+                )
+
+                excel_bytes = generate_historical_excel(df_final, [], is_aum_only=hist_res["is_aum_only"])
+                st.download_button(
+                    label="📥 Download Styled Excel (.xlsx)",
+                    data=excel_bytes,
+                    file_name=f"amfi_nav_export_{hist_res['start']}_to_{hist_res['end']}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key="hist_download",
+                )
 
         elif search_mode == "Fund Performance":
             maturity_type = st.selectbox("Maturity Type", ["Open Ended", "Close Ended", "Interval"], index=0)
@@ -1702,6 +1732,7 @@ def main() -> None:
             fetch_live_aum = st.checkbox("Fetch actual daily AUM from AMFI (slower)", value=True, key="perf_live_aum")
 
             if st.button("Go", type="primary", use_container_width=True):
+                st.session_state["fp_result"] = None
                 if not want_nav and not want_aum and not want_flows:
                     st.error("Please select at least one data type (NAV, AUM, or Flows) to export.")
                 elif start_date > end_date:
@@ -1713,7 +1744,7 @@ def main() -> None:
                         m_id, c_id, s_id = map_section_to_ids(ac)
                         if m_id == maturity_id and c_id == cat_id and s_id == sub_id:
                             matched_rows.append(row)
-                    
+
                     df_matched = pd.DataFrame(matched_rows)
                     if df_matched.empty:
                         st.warning("No schemes found in current AMFI index matching this subcategory.")
@@ -1727,7 +1758,7 @@ def main() -> None:
                             if isin_r and pd.notna(isin_r) and str(isin_r).strip() != "-":
                                 parsed_isins.append(str(isin_r).strip().upper())
                         parsed_isins = sorted(list(set(parsed_isins)))
-                        
+
                         if not parsed_isins:
                             st.warning("No valid ISINs found for schemes in this subcategory.")
                         else:
@@ -1743,33 +1774,50 @@ def main() -> None:
                                     want_flows=want_flows,
                                     fetch_live_aum=fetch_live_aum
                                 )
-                                if err:
-                                    st.warning(err)
-                                elif df_final.empty:
-                                    st.warning("No records found matching the specified criteria.")
-                                else:
-                                    st.success(f"Successfully processed {len(df_final)} vertical records!")
-                                    
-                                    render_section_header("👁️", "Data Preview")
-                                    st.dataframe(
-                                        df_final,
-                                        use_container_width=True,
-                                        column_config={
-                                            "Daily return": st.column_config.NumberColumn(
-                                                "Daily return",
-                                                format="%.2f%%"
-                                            )
-                                        }
-                                    )
-                                    
-                                    excel_bytes = generate_historical_excel(df_final, [], is_aum_only=is_aum_only)
-                                    st.download_button(
-                                        label="📥 Download Styled Excel (.xlsx)",
-                                        data=excel_bytes,
-                                        file_name=f"fund_performance_{subcategory_name}_{start_date}_to_{end_date}.xlsx",
-                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                        use_container_width=True
-                                    )
+                            if err:
+                                st.warning(err)
+                            elif df_final.empty:
+                                st.warning("No records found matching the specified criteria.")
+                            else:
+                                # Persist so the preview + download survive the rerun that a
+                                # download-button click triggers (Streamlit re-executes the script,
+                                # which would otherwise discard results computed inside this block).
+                                st.session_state["fp_result"] = {
+                                    "df": df_final,
+                                    "is_aum_only": is_aum_only,
+                                    "name": subcategory_name,
+                                    "start": str(start_date),
+                                    "end": str(end_date),
+                                }
+
+            # Render the persisted Fund Performance result (outside the button gate) so the
+            # Excel download works reliably across reruns.
+            fp_res = st.session_state.get("fp_result")
+            if fp_res:
+                df_final = fp_res["df"]
+                st.success(f"Successfully processed {len(df_final)} vertical records!")
+
+                render_section_header("👁️", "Data Preview")
+                st.dataframe(
+                    df_final,
+                    use_container_width=True,
+                    column_config={
+                        "Daily return": st.column_config.NumberColumn(
+                            "Daily return",
+                            format="%.2f%%"
+                        )
+                    }
+                )
+
+                excel_bytes = generate_historical_excel(df_final, [], is_aum_only=fp_res["is_aum_only"])
+                st.download_button(
+                    label="📥 Download Styled Excel (.xlsx)",
+                    data=excel_bytes,
+                    file_name=f"fund_performance_{fp_res['name']}_{fp_res['start']}_to_{fp_res['end']}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key="fp_download",
+                )
         elif search_mode == "Portfolio Bucket Tracker":
             st.markdown('<hr class="panel-divider">', unsafe_allow_html=True)
             
