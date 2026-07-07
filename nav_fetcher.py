@@ -158,13 +158,9 @@ def calculate_aum_for_row(row, df_port: pd.DataFrame) -> float:
             latest_row = match_port.sort_values('PD_Month End', ascending=False).iloc[0]
             aum_monthly = float(latest_row['PD_Scheme AUM'])
             
-    if aum_monthly is None:
-        seed = get_fund_seed(scheme_name)
-        base_aum = (seed % 35 + 15) * 1000 + (seed % 97) + 0.56
-        month_offset = (2026 - year) * 12 + (4 - month)
-        aum_multiplier = 1.0 - (month_offset * 0.012) + ((seed + month) % 5 - 2) * 0.002
-        aum_monthly = round(base_aum * aum_multiplier, 4)
-        
+    # No real disclosed AUM for this scheme/month → return None rather than
+    # fabricating a value. The live perf-API pass may still fill it; otherwise the
+    # AUM/flows stay blank so nothing is invented.
     return aum_monthly
 
 
@@ -423,7 +419,10 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
         r_copy["Monthly_AUM"] = m_aum
         raw_rows.append(r_copy)
     df_res = pd.DataFrame(raw_rows)
-    
+
+    # Monthly_AUM may be None where no real disclosure exists — coerce to numeric
+    # (NaN) so the scaling below propagates blanks instead of raising.
+    df_res["Monthly_AUM"] = pd.to_numeric(df_res["Monthly_AUM"], errors="coerce")
     mean_navs = df_res.groupby("Scheme Code")["NAV"].transform("mean")
     mean_navs = mean_navs.fillna(1.0).replace(0.0, 1.0)
     df_res["Fallback_AUM"] = (df_res["Monthly_AUM"] * (df_res["NAV"] / mean_navs)).round(4)

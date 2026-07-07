@@ -97,6 +97,37 @@ def _get_nav_session():
     return _nav_session
 
 
+def _is_cloud_env() -> bool:
+    """Detect Streamlit Cloud (ephemeral FS / ~1 GB RAM) vs a local machine.
+
+    Used to size worker pools: local runs can afford far more concurrency,
+    which is the main speed lever for multi-year date ranges.
+    """
+    if os.environ.get("STREAMLIT_SHARING_MODE") or os.environ.get("STREAMLIT_RUNTIME_ENV"):
+        return True
+    # No writable local amfi_cache dir next to this file ⇒ treat as cloud.
+    return not os.path.exists(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "amfi_cache")
+    )
+
+
+def _nav_chunk_workers(n_chunks: int) -> int:
+    """Concurrent NAV-history downloads. Local machines can push many more
+    parallel connections than Streamlit Cloud's memory-constrained container."""
+    if n_chunks <= 0:
+        return 1
+    cap = 3 if _is_cloud_env() else 12
+    return max(1, min(cap, n_chunks))
+
+
+def _perf_api_workers(n_calls: int) -> int:
+    """Concurrent daily-AUM performance-API POSTs."""
+    if n_calls <= 0:
+        return 1
+    cap = 8 if _is_cloud_env() else 20
+    return max(1, min(cap, n_calls))
+
+
 def fetch_amfi_chunk_with_cache(c_start, c_end) -> str:
     """Fetch AMFI chunk data with local file-based caching and persistent sessions."""
     import os
@@ -578,6 +609,8 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum:
             aum_lookup[isin_str].sort(key=lambda x: x[0], reverse=True)
 
     def get_aum_from_lookup(isin_growth, isin_reinvestment, m_val, scheme_name, year, month):
+        # Real monthly AUM from the uploaded portfolio disclosure file, matched by
+        # ISIN. Prefer the exact month; else fall back to the latest disclosed month.
         for isin in [isin_growth, isin_reinvestment]:
             if isin and isin != "-":
                 isin_upper = str(isin).strip().upper()
@@ -587,12 +620,11 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum:
                         if m_end == m_val:
                             return aum
                     return records[0][1]
-                    
-        seed = get_fund_seed(scheme_name)
-        base_aum = (seed % 35 + 15) * 1000 + (seed % 97) + 0.56
-        month_offset = (2026 - year) * 12 + (4 - month)
-        aum_multiplier = 1.0 - (month_offset * 0.012) + ((seed + month) % 5 - 2) * 0.002
-        return round(base_aum * aum_multiplier, 4)
+
+        # No real disclosure available for this scheme/month. Return None instead of
+        # fabricating a value — the daily perf-API pass (below) may still fill it, and
+        # anything left blank stays blank so AUM/flows are never invented.
+        return None
 
     df_res = df.copy()
     scheme_names = df_res["Scheme Name"].tolist()
@@ -633,10 +665,13 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum:
         m_val = year * 100 + month
         monthly_aums.append(get_aum_from_lookup(isin_g, isin_r, m_val, scheme_name, year, month))
 
-    df_res["Monthly_AUM"] = monthly_aums
-    
-    # Scale the monthly AUM by each day's NAV relative to the scheme mean NAV
-    # so that AUM varies day-to-day proportional to NAV movement.
+    # Monthly_AUM may contain None where no real disclosure exists — keep it
+    # numeric (NaN) so downstream math propagates blanks instead of erroring.
+    df_res["Monthly_AUM"] = pd.to_numeric(pd.Series(monthly_aums, index=df_res.index), errors="coerce")
+
+    # Scale the (real) monthly AUM by each day's NAV relative to the scheme mean NAV
+    # so that AUM varies day-to-day proportional to NAV movement. Rows without a real
+    # monthly AUM stay NaN (blank) rather than being back-filled with a guess.
     mean_navs = df_res.groupby("Scheme Code")["NAV"].transform("mean")
     mean_navs = mean_navs.fillna(1.0).replace(0.0, 1.0)
     df_res["Fallback_AUM"] = (df_res["Monthly_AUM"] * (df_res["NAV"] / mean_navs)).round(4)
@@ -667,15 +702,12 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum:
         
     date_col = "NAV Date" if "NAV Date" in df_res.columns else "Date"
     df_res["Date_Str_Temp"] = df_res[date_col].apply(get_date_str)
-    
-    # Only fetch for unique (asset_class, date) combinations to minimise API calls.
-    unique_groups = df_res[["Asset Class", "Date_Str_Temp"]].drop_duplicates()
-    
+
     perf_lookup = {}
-    
+
     # Run API calls in parallel using ThreadPoolExecutor for high performance fetching
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    
+
     # Determine if running inside Streamlit context to show status
     in_streamlit = False
     try:
@@ -688,26 +720,47 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum:
         status_text = st.empty()
         status_text.text("Fetching daily AUM from AMFI fund performance website...")
 
-    def fetch_task(asset_class, date_str):
-        m_id, c_id, s_id = map_section_to_ids(asset_class)
-        rows = fetch_performance_data_from_api(date_str, m_id, c_id, s_id)
-        return (date_str, asset_class), rows
+    # Map every distinct asset-class string to its (maturity, category, subcategory)
+    # ID tuple once, so we can deduplicate network calls: many different asset-class
+    # labels collapse to the same performance-API query, and over a multi-year range
+    # this cuts the number of POSTs dramatically (the dominant cost of live AUM).
+    asset_classes = [ac for ac in df_res["Asset Class"].dropna().unique() if ac]
+    ac_to_ids = {ac: map_section_to_ids(ac) for ac in asset_classes}
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = []
-        for _, grp in unique_groups.iterrows():
-            asset_class = grp["Asset Class"]
-            date_str = grp["Date_Str_Temp"]
-            if asset_class and date_str:
-                futures.append(executor.submit(fetch_task, asset_class, date_str))
-                
+    unique_groups = df_res[["Asset Class", "Date_Str_Temp"]].drop_duplicates()
+
+    # Collapse to unique (ids, date) queries; remember which (date, asset_class)
+    # pairs each query feeds so we can rebuild the original lookup shape after.
+    ids_date_to_pairs = {}
+    for _, grp in unique_groups.iterrows():
+        asset_class = grp["Asset Class"]
+        date_str = grp["Date_Str_Temp"]
+        if not asset_class or not date_str:
+            continue
+        ids = ac_to_ids.get(asset_class)
+        if not ids:
+            continue
+        query_key = (ids[0], ids[1], ids[2], date_str)
+        ids_date_to_pairs.setdefault(query_key, []).append((date_str, asset_class))
+
+    def fetch_task(query_key):
+        m_id, c_id, s_id, date_str = query_key
+        rows = fetch_performance_data_from_api(date_str, m_id, c_id, s_id)
+        return query_key, rows
+
+    with ThreadPoolExecutor(max_workers=_perf_api_workers(len(ids_date_to_pairs))) as executor:
+        futures = [executor.submit(fetch_task, qk) for qk in ids_date_to_pairs]
+
         completed_count = 0
         total_count = len(futures)
         for future in as_completed(futures):
             try:
-                key, rows = future.result()
+                query_key, rows = future.result()
                 if rows:
-                    perf_lookup[key] = rows
+                    # Fan the shared result back out to every (date, asset_class)
+                    # pair that maps to this query, preserving downstream logic.
+                    for pair in ids_date_to_pairs.get(query_key, []):
+                        perf_lookup[pair] = rows
             except Exception:
                 pass
             completed_count += 1
@@ -958,10 +1011,11 @@ def run_historical_export(
             except Exception:
                 return idx, []
 
-        # Use at most 3 concurrent workers to cap peak RAM (each AMFI chunk is ~5 MB of
-        # raw text; 8 simultaneous downloads would consume ~40 MB of string objects on top
-        # of the parsed rows, easily hitting Streamlit Cloud's 1 GB limit).
-        with ThreadPoolExecutor(max_workers=min(3, len(chunks))) as executor:
+        # Concurrency is the main speed lever for multi-year ranges (a 10-year
+        # window is ~40 chunks). On Streamlit Cloud we cap at 3 workers to stay
+        # under the ~1 GB RAM limit (each AMFI chunk is ~5 MB of raw text); on a
+        # local machine we push up to 12 parallel downloads for a big speed-up.
+        with ThreadPoolExecutor(max_workers=_nav_chunk_workers(len(chunks))) as executor:
             futures = {
                 executor.submit(_download_and_parse_chunk, idx, c_start, c_end, parsed_isins_set): idx
                 for idx, (c_start, c_end) in enumerate(chunks)
