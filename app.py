@@ -1055,8 +1055,14 @@ def run_historical_export(
                     r_match = isin_reinvest_upper and isin_reinvest_upper in isins_set
                     
                     if g_match or r_match:
-                        scheme_code = parts[0].strip()
                         scheme_name = parts[1].strip()
+                        scheme_name_lower = scheme_name.lower()
+                        is_direct = "direct" in scheme_name_lower or re.search(r"\bdir\b", scheme_name_lower)
+                        is_idcw = "idcw" in scheme_name_lower or "dividend" in scheme_name_lower or "income distribution" in scheme_name_lower or "capital withdrawal" in scheme_name_lower
+                        if is_direct or is_idcw:
+                            continue
+                            
+                        scheme_code = parts[0].strip()
                         nav_value = parts[4].strip()
                         nav_date = parts[7].strip()
                         
