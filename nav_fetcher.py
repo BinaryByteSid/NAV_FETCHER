@@ -686,12 +686,12 @@ def fetch_latest_navs(isin_list: List[str]) -> dict:
         line = line_bytes.strip()
         if ";" not in line or line.startswith("Scheme Code"):
             continue
-        parts = line.split(";")
-        if len(parts) < 8:
+        parts = [p.strip() for p in line.split(";")]
+        if len(parts) < 6:
             continue
 
-        isin_g = parts[2].strip().upper() if parts[2].strip() != "-" else ""
-        isin_r = parts[3].strip().upper() if parts[3].strip() != "-" else ""
+        isin_g = parts[1].upper() if parts[1] != "-" else ""
+        isin_r = parts[2].upper() if parts[2] != "-" else ""
         matched_isin = None
         if isin_g in isin_set:
             matched_isin = isin_g
@@ -700,9 +700,9 @@ def fetch_latest_navs(isin_list: List[str]) -> dict:
         else:
             continue
 
-        nav_val = pd.to_numeric(parts[4].strip().replace(",", ""), errors="coerce")
-        nav_date = parts[7].strip()  # e.g. "27-Jun-2026"
-        scheme_name = parts[1].strip()
+        nav_val = pd.to_numeric(parts[4].replace(",", ""), errors="coerce")
+        nav_date = parts[5]  # e.g. "07-Jul-2026"
+        scheme_name = parts[3]
 
         if pd.notna(nav_val) and matched_isin:
             result[matched_isin] = {
@@ -711,6 +711,7 @@ def fetch_latest_navs(isin_list: List[str]) -> dict:
                 "scheme_name": scheme_name,
             }
     return result
+
 
 
 def fetch_nifty_data_series(index_name: str, start_date, end_date) -> dict:
