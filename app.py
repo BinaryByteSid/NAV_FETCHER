@@ -97,6 +97,12 @@ def _get_nav_session():
     return _nav_session
 
 
+# Populated by populate_actual_aum on each run so the UI can report how much of the
+# AUM came from live AMFI data vs was carried/blank — makes "None / wrong values"
+# diagnosable instead of silent.
+_LAST_AUM_STATS: dict = {}
+
+
 def _is_cloud_env() -> bool:
     """Detect Streamlit Cloud (ephemeral FS / ~1 GB RAM) vs a local machine.
 
@@ -112,19 +118,21 @@ def _is_cloud_env() -> bool:
 
 
 def _nav_chunk_workers(n_chunks: int) -> int:
-    """Concurrent NAV-history downloads. Local machines can push many more
-    parallel connections than Streamlit Cloud's memory-constrained container."""
+    """Concurrent NAV-history downloads. Kept moderate: AMFI's portal throttles
+    (503/timeouts) when hit with too many parallel connections, which shows up as
+    'can't fetch even 6 months'. 6 local / 3 cloud is a safe, reliable balance."""
     if n_chunks <= 0:
         return 1
-    cap = 3 if _is_cloud_env() else 12
+    cap = 3 if _is_cloud_env() else 6
     return max(1, min(cap, n_chunks))
 
 
 def _perf_api_workers(n_calls: int) -> int:
-    """Concurrent daily-AUM performance-API POSTs."""
+    """Concurrent daily-AUM performance-API POSTs. Moderate to avoid the AMFI
+    gateway rate-limiting (which returns empty responses → blank AUM)."""
     if n_calls <= 0:
         return 1
-    cap = 8 if _is_cloud_env() else 20
+    cap = 6 if _is_cloud_env() else 8
     return max(1, min(cap, n_calls))
 
 
@@ -185,9 +193,13 @@ def fetch_amfi_chunk_with_cache(c_start, c_end) -> str:
     max_retries = 5
     delay = 2.0
     response = None
+    nav_headers = {
+        "Accept": "text/plain, text/html, */*",
+        "Referer": "https://www.amfiindia.com/nav-history-download",
+    }
     for attempt in range(max_retries):
         try:
-            response = session.get(url, timeout=(10, 60))
+            response = session.get(url, headers=nav_headers, timeout=(10, 60))
             if response.status_code == 200:
                 text = response.text
                 if text.strip().startswith("<") or "<html" in text[:500].lower():
@@ -472,7 +484,8 @@ def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id
     import json
     import os
     import time
-    
+    import random
+
     # 1. Skip querying dates before 2018-01-01 (SEBI categorization and AMFI performance dataset starts around 2018)
     # This prevents thousands of useless requests that return 0 rows.
     try:
@@ -503,9 +516,17 @@ def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id
             pass
             
     url = "https://www.amfiindia.com/gateway/pollingsebi/api/amfi/fundperformance"
+    # AMFI's gateway API rejects/blanks requests that don't look like they came
+    # from the fund-performance web page. Sending the browser Referer/Origin and an
+    # explicit JSON Accept header is what makes it return data instead of an empty
+    # or non-SUCCESS response — a common cause of blank AUM.
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://www.amfiindia.com",
+        "Referer": "https://www.amfiindia.com/research-information/other-data/fund-performance",
+        "X-Requested-With": "XMLHttpRequest",
     }
     payload = {
         "maturityType": maturity_id,
@@ -514,31 +535,44 @@ def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id
         "mfid": 0,
         "reportDate": date_str
     }
-    
-    max_retries = 3
+
+    max_retries = 4
     delay = 1.0
-    
+
     session = get_api_session()
-    
+
     for attempt in range(max_retries):
         try:
-            resp = session.post(url, json=payload, headers=headers, timeout=20)
+            resp = session.post(url, json=payload, headers=headers, timeout=(10, 40))
             if resp.status_code == 200:
-                res_data = resp.json()
-                if res_data.get("validationMsg") == "SUCCESS":
-                    rows = res_data.get("data", [])
-                    try:
-                        with open(cache_path, "w", encoding="utf-8") as f:
-                            json.dump(rows, f)
-                    except Exception:
-                        pass
-                    return rows
-            time.sleep(delay)
-            delay *= 2
+                try:
+                    res_data = resp.json()
+                except Exception:
+                    res_data = None
+                if isinstance(res_data, dict):
+                    # Accept the data whether or not validationMsg is present/SUCCESS —
+                    # the important thing is that a data array came back.
+                    rows = res_data.get("data")
+                    if rows is None and res_data.get("validationMsg") == "SUCCESS":
+                        rows = []
+                    if isinstance(rows, list):
+                        try:
+                            with open(cache_path, "w", encoding="utf-8") as f:
+                                json.dump(rows, f)
+                        except Exception:
+                            pass
+                        return rows
+            elif resp.status_code in (429, 503):
+                # Throttled — back off harder before retrying.
+                time.sleep(delay + random.uniform(0, 1.0))
+                delay = min(delay * 2, 20)
+                continue
+            time.sleep(delay + random.uniform(0, 0.5))
+            delay = min(delay * 2, 20)
         except Exception:
-            time.sleep(delay)
-            delay *= 2
-            
+            time.sleep(delay + random.uniform(0, 0.5))
+            delay = min(delay * 2, 20)
+
     return []
 
 
@@ -748,6 +782,7 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum:
         rows = fetch_performance_data_from_api(date_str, m_id, c_id, s_id)
         return query_key, rows
 
+    perf_query_ok = 0
     with ThreadPoolExecutor(max_workers=_perf_api_workers(len(ids_date_to_pairs))) as executor:
         futures = [executor.submit(fetch_task, qk) for qk in ids_date_to_pairs]
 
@@ -757,6 +792,7 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum:
             try:
                 query_key, rows = future.result()
                 if rows:
+                    perf_query_ok += 1
                     # Fan the shared result back out to every (date, asset_class)
                     # pair that maps to this query, preserving downstream logic.
                     for pair in ids_date_to_pairs.get(query_key, []):
@@ -821,6 +857,9 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum:
     del flat_perf_lookup, scheme_match_cache
     df_res["AUM"] = pd.to_numeric(pd.Series(aums, index=df_res.index), errors="coerce")
 
+    # How many rows got a real, live AUM before any carry-forward.
+    real_aum_rows = int(df_res["AUM"].notna().sum())
+
     # Carry real AUM across gaps so no day is left blank when the scheme has at
     # least one real reading. Non-trading days (weekends/holidays, where NAV is
     # also carried) and the occasional failed/slow API call get filled with the
@@ -835,6 +874,19 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum:
         df_res = df_res.drop(columns=["_aum_sort"])
     except Exception:
         pass
+
+    # Record fetch health so the UI can flag when the live AMFI feed under-delivered.
+    total_rows = len(df_res)
+    filled_rows = int(df_res["AUM"].notna().sum())
+    _LAST_AUM_STATS.clear()
+    _LAST_AUM_STATS.update({
+        "perf_queries": int(len(ids_date_to_pairs)),
+        "perf_ok": int(perf_query_ok),
+        "rows_total": total_rows,
+        "rows_real_aum": real_aum_rows,
+        "rows_filled": filled_rows,
+        "rows_blank": total_rows - filled_rows,
+    })
 
     df_res = df_res.drop(columns=["Date_Str_Temp"])
     return df_res
@@ -1429,6 +1481,32 @@ def normalize_filename(value: str) -> str:
     return value.strip("_")[:80]
 
 
+def render_aum_health(stats: dict) -> None:
+    """Show how much AUM came from the live AMFI feed vs was carried/blank, so the
+    user can tell whether AMFI throttled the run rather than guessing at 'None'."""
+    if not stats or not stats.get("rows_total"):
+        return
+    total = stats["rows_total"]
+    real = stats.get("rows_real_aum", 0)
+    blank = stats.get("rows_blank", 0)
+    q_total = stats.get("perf_queries", 0)
+    q_ok = stats.get("perf_ok", 0)
+    real_pct = (real / total * 100) if total else 0
+    msg = (
+        f"AUM data: {real:,}/{total:,} rows ({real_pct:.0f}%) came directly from the live "
+        f"AMFI performance feed; the rest were carried forward from the nearest real value. "
+        f"AMFI queries answered: {q_ok}/{q_total}."
+    )
+    if blank > 0 or (q_total and q_ok / q_total < 0.5):
+        st.warning(
+            msg
+            + f" {blank:,} rows have no AUM at all — AMFI likely throttled or has no data for "
+            "those funds/dates. Re-run to fill from cache, or narrow the date range."
+        )
+    else:
+        st.caption(msg)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_data(force_refresh: bool = False) -> pd.DataFrame:
     return fetch_nav_data(force_refresh=force_refresh)
@@ -1643,6 +1721,7 @@ def main() -> None:
                             "is_aum_only": is_aum_only,
                             "start": str(start_date),
                             "end": str(end_date),
+                            "stats": dict(_LAST_AUM_STATS),
                         }
 
             # Render the persisted result outside the button gate so the download works reliably.
@@ -1650,6 +1729,7 @@ def main() -> None:
             if hist_res:
                 df_final = hist_res["df"]
                 st.success(f"Successfully processed {len(df_final)} vertical records!")
+                render_aum_health(hist_res.get("stats"))
 
                 render_section_header("👁️", "Data Preview")
                 st.dataframe(
@@ -1687,7 +1767,14 @@ def main() -> None:
                     sub_resp = requests.post(
                         "https://www.amfiindia.com/gateway/pollingsebi/api/amfi/getsubcategory",
                         json={"category": cat_id},
-                        headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"},
+                        headers={
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                            "Content-Type": "application/json",
+                            "Accept": "application/json, text/plain, */*",
+                            "Origin": "https://www.amfiindia.com",
+                            "Referer": "https://www.amfiindia.com/research-information/other-data/fund-performance",
+                            "X-Requested-With": "XMLHttpRequest",
+                        },
                         timeout=20,
                     )
                     if sub_resp.status_code == 200:
@@ -1788,6 +1875,7 @@ def main() -> None:
                                     "name": subcategory_name,
                                     "start": str(start_date),
                                     "end": str(end_date),
+                                    "stats": dict(_LAST_AUM_STATS),
                                 }
 
             # Render the persisted Fund Performance result (outside the button gate) so the
@@ -1796,6 +1884,7 @@ def main() -> None:
             if fp_res:
                 df_final = fp_res["df"]
                 st.success(f"Successfully processed {len(df_final)} vertical records!")
+                render_aum_health(fp_res.get("stats"))
 
                 render_section_header("👁️", "Data Preview")
                 st.dataframe(
