@@ -1690,10 +1690,34 @@ def main() -> None:
             if st.button("Fetch & generate Excel", type="primary", use_container_width=True):
                 st.session_state["hist_result"] = None
                 parsed_isins = [x.strip() for x in re.split(r"[,\n\s]+", isin_input) if x.strip()]
+                filtered_isins = []
+                for isin in parsed_isins:
+                    # Look up in nav_data cache
+                    match_row = pd.DataFrame()
+                    if not nav_data.empty:
+                        col_g = "ISIN Div Payout/ ISIN Growth" if "ISIN Div Payout/ ISIN Growth" in nav_data.columns else "ISIN Div Payout / ISIN Growth"
+                        match_row = nav_data[
+                            (nav_data[col_g].astype(str).str.strip().str.upper() == isin.upper()) |
+                            (nav_data["ISIN Div Reinvestment"].astype(str).str.strip().str.upper() == isin.upper())
+                        ]
+                    if not match_row.empty:
+                        row = match_row.iloc[0]
+                        scheme_name = str(row.get("Scheme Name", "")).strip().lower()
+                        plan_type = str(row.get("Plan Type", "")).strip().lower()
+                        option_type = str(row.get("Option Type", "")).strip().lower()
+                        
+                        is_direct = "direct" in plan_type or "direct" in scheme_name or "dir" in plan_type or re.search(r"\bdir\b", scheme_name)
+                        is_idcw = "idcw" in option_type or "dividend" in option_type or "idcw" in scheme_name or "dividend" in scheme_name or "income distribution" in scheme_name or "capital withdrawal" in scheme_name
+                        
+                        if is_direct or is_idcw:
+                            continue
+                    filtered_isins.append(isin)
+                parsed_isins = filtered_isins
+                
                 if not want_nav and not want_aum and not want_flows:
                     st.error("Please select at least one data type (NAV, AUM, or Flows) to export.")
                 elif not parsed_isins:
-                    st.error("Please enter at least one valid ISIN.")
+                    st.error("Please enter at least one valid Regular Growth ISIN.")
                 elif start_date > end_date:
                     st.error("Start Date cannot be after End Date.")
                 else:
