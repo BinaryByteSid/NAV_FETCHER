@@ -1838,6 +1838,16 @@ def main() -> None:
                     else:
                         parsed_isins = []
                         for idx, row in df_matched.iterrows():
+                            scheme_name = str(row.get("Scheme Name", "")).strip().lower()
+                            plan_type = str(row.get("Plan Type", "")).strip().lower()
+                            option_type = str(row.get("Option Type", "")).strip().lower()
+                            
+                            is_direct = "direct" in plan_type or "direct" in scheme_name or "dir" in plan_type or re.search(r"\bdir\b", scheme_name)
+                            is_idcw = "idcw" in option_type or "dividend" in option_type or "idcw" in scheme_name or "dividend" in scheme_name or "income distribution" in scheme_name or "capital withdrawal" in scheme_name
+                            
+                            if is_direct or is_idcw:
+                                continue
+                                
                             isin_g = row.get("ISIN Div Payout/ ISIN Growth") or row.get("ISIN Div Payout / ISIN Growth")
                             isin_r = row.get("ISIN Div Reinvestment")
                             if isin_g and pd.notna(isin_g) and str(isin_g).strip() != "-":

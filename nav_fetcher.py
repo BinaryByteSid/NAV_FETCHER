@@ -1233,6 +1233,12 @@ def parse_amfi_text(text: str, isin_list: tuple[str, ...] | None = None) -> pd.D
 
         scheme_code = parts[0]
         scheme_name = parts[1]
+        scheme_name_lower = scheme_name.lower()
+        is_direct = "direct" in scheme_name_lower or re.search(r"\bdir\b", scheme_name_lower)
+        is_idcw = "idcw" in scheme_name_lower or "dividend" in scheme_name_lower or "income distribution" in scheme_name_lower or "capital withdrawal" in scheme_name_lower
+        if is_direct or is_idcw:
+            continue
+            
         isin_growth = parts[2] if parts[2] not in ("", "-") else None
         isin_reinvest = parts[3] if parts[3] not in ("", "-") else None
         nav_value = parts[4]
@@ -1609,6 +1615,12 @@ def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = N
                 
         scheme_code = parts[0].strip()
         scheme_name = parts[1].strip()
+        scheme_name_lower = scheme_name.lower()
+        is_direct = "direct" in scheme_name_lower or re.search(r"\bdir\b", scheme_name_lower)
+        is_idcw = "idcw" in scheme_name_lower or "dividend" in scheme_name_lower or "income distribution" in scheme_name_lower or "capital withdrawal" in scheme_name_lower
+        if is_direct or is_idcw:
+            continue
+            
         nav_value = parts[4].strip()
         nav_date = parts[7].strip()
         
