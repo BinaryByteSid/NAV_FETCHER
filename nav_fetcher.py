@@ -432,8 +432,8 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
         df_res["AUM"] = df_res["Fallback_AUM"]
         return df_res
         
-    # Initialize AUM with None to allow carry-forward for missing dates
-    df_res["AUM"] = None
+    # Initialize AUM with fallback to allow carry-forward / fallback values
+    df_res["AUM"] = df_res["Fallback_AUM"]
     
     # 2. Now, try to fetch the actual AUM from the performance API for each row.
     def get_date_str(dt):
