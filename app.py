@@ -1813,8 +1813,14 @@ def main() -> None:
                 except Exception as e:
                     st.error(f"Failed to fetch subcategories: {e}")
 
-            subcategory_name = st.selectbox("Subcategory", [name for name, _ in subcategories] or ["All"], index=0)
-            sub_id = dict(subcategories).get(subcategory_name, 0)
+            sub_names = [name for name, _ in subcategories]
+            # "ALL" pulls every subcategory in the chosen category together.
+            sub_options = ["ALL"] + sub_names if sub_names else ["ALL"]
+            subcategory_name = st.selectbox("Subcategory", sub_options, index=0)
+            if subcategory_name == "ALL":
+                sub_id = "ALL"
+            else:
+                sub_id = dict(subcategories).get(subcategory_name, 0)
 
             col_d1, col_d2 = st.columns(2)
             with col_d1:
@@ -1859,7 +1865,7 @@ def main() -> None:
                     for idx, row in nav_data.iterrows():
                         ac = row.get("Asset Class", "")
                         m_id, c_id, s_id = map_section_to_ids(ac)
-                        if m_id == maturity_id and c_id == cat_id and s_id == sub_id:
+                        if m_id == maturity_id and c_id == cat_id and (sub_id == "ALL" or s_id == sub_id):
                             matched_rows.append(row)
 
                     df_matched = pd.DataFrame(matched_rows)
