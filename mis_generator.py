@@ -229,6 +229,20 @@ def validate_and_normalize_portfolio(df_input: pd.DataFrame) -> Tuple[pd.DataFra
 
     res_df = pd.DataFrame(clean_rows)
 
+    # Excel stores a percent-formatted cell as its underlying fraction, so a
+    # sheet showing 7.00% hands us 0.07 and the book sums to 1.00 instead of
+    # 100. Rescale when every weight is a fraction and the book is under 1.5 --
+    # a real percentage book of this shape would have to total 1.5%.
+    alloc_series = res_df["Allocation (%)"]
+    positive = alloc_series[alloc_series > 0]
+    if not positive.empty and positive.max() <= 1.0 and alloc_series.sum() <= 1.5:
+        # Round to kill the binary-float artifact: 0.07 * 100 is 7.000000000000001.
+        res_df["Allocation (%)"] = (alloc_series * 100.0).round(6)
+        warnings.append(
+            "Allocations were stored as Excel percentages (7% held as 0.07); "
+            "they have been read as percent values."
+        )
+
     tot_alloc = res_df["Allocation (%)"].sum()
     if tot_alloc <= 0:
         warnings.append("Total allocation was 0%. Weights have been distributed equally.")

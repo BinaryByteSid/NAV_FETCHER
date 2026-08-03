@@ -51,6 +51,41 @@ def test_validation():
     return clean_df
 
 
+def test_excel_percent_allocations():
+    """Excel hands us 0.07 for a cell displaying 7.00%; a real percentage book
+    must survive untouched."""
+    print("2b. Excel percent-formatted allocations...")
+
+    def book(allocs):
+        return pd.DataFrame({
+            "Scheme Name": [f"F{i}" for i in range(len(allocs))],
+            "ISIN": [f"INF{i:03d}X01XX{i % 10}" for i in range(len(allocs))],
+            "Allocation (%)": allocs,
+            "Benchmark": ["NIFTY 50"] * len(allocs),
+        })
+
+    # Fractions get rescaled to percent.
+    frac, _, _ = validate_and_normalize_portfolio(book([0.07, 0.10, 0.09, 0.74]))
+    assert list(frac["Allocation (%)"]) == [7.0, 10.0, 9.0, 74.0], list(frac["Allocation (%)"])
+
+    # An ordinary book is left alone.
+    pct, _, _ = validate_and_normalize_portfolio(book([50.0, 30.0, 20.0]))
+    assert list(pct["Allocation (%)"]) == [50.0, 30.0, 20.0], list(pct["Allocation (%)"])
+
+    # 100 holdings at 1% each: every weight is <= 1.0, so a naive rule
+    # misfires here. The book totals 100, which rules out fractions.
+    many, _, _ = validate_and_normalize_portfolio(book([1.0] * 100))
+    assert many["Allocation (%)"].iloc[0] == 1.0, many["Allocation (%)"].iloc[0]
+
+    # Text cells carrying their own percent sign.
+    txt, _, _ = validate_and_normalize_portfolio(book(["60%", "40%"]))
+    assert list(txt["Allocation (%)"]) == [60.0, 40.0], list(txt["Allocation (%)"])
+
+    # Either reading must produce identical weights -- the scaling is cosmetic.
+    assert abs(frac["Normalized_Weight"].sum() - 1.0) < 1e-9
+    print("   [OK] Percent-formatted allocations handled.")
+
+
 def test_reports(clean_df):
     print("3. MIS report generation (live AMFI fetch, please wait)...")
     results = generate_mis_reports_data(clean_df, date(2026, 4, 1), date(2026, 7, 31))
@@ -114,6 +149,7 @@ def test_exports(results):
 
 if __name__ == "__main__":
     test_benchmark_normalization()
+    test_excel_percent_allocations()
     df = test_validation()
     res = test_reports(df)
     test_exports(res)
