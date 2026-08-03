@@ -1610,7 +1610,10 @@ def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = N
 
     def _download_and_parse() -> tuple[list, bool]:
         """Stream one response. Returns (rows, response_was_a_valid_nav_dump)."""
-        resp = requests.get(url, headers=headers, stream=True, timeout=300)
+        # (connect, read). AMFI answers a good request in ~25s per month of
+        # range or not at all, so a 300s read timeout just parked the app on a
+        # dead socket for five minutes per attempt.
+        resp = requests.get(url, headers=headers, stream=True, timeout=(15, 150))
         resp.raise_for_status()
 
         rows: List[dict] = []
@@ -1695,10 +1698,8 @@ def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = N
 
         return rows, (header_seen or bool(rows))
 
-    # AMFI's throttle window is measured in tens of seconds, so back off well
-    # past it rather than burning all retries inside a single cool-down period.
-    max_retries = 4
-    delay = 6.0
+    max_retries = 3
+    delay = 3.0
     rows: List[dict] = []
     for attempt in range(max_retries):
         try:
@@ -1706,8 +1707,11 @@ def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = N
             if valid:
                 break
             reason = "AMFI returned an error page instead of NAV data"
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError,
-                requests.exceptions.HTTPError) as e:
+        # RequestException is the base of the lot. AMFI regularly drops a
+        # response mid-stream, which surfaces as ChunkedEncodingError -- not a
+        # Timeout or ConnectionError, so naming those individually let it
+        # escape the retry and abort the whole report.
+        except requests.exceptions.RequestException as e:
             reason = f"{type(e).__name__}: {e}"
 
         if attempt == max_retries - 1:
@@ -1732,43 +1736,73 @@ def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = N
 
 
 def fetch_amfi_data_chunked(start_date, end_date, isin_list: List[str] | None = None,
-                            include_direct: bool = False, return_gaps: bool = False):
+                            include_direct: bool = False, return_gaps: bool = False,
+                            progress=None, budget_seconds: float = 300.0):
     """Fetch AMFI data by chunking the date range into 90-day intervals to prevent timeout & memory crash.
 
     With return_gaps=True returns (df, gaps) where gaps lists the (start, end)
     windows AMFI would not serve, so callers can tell a partial history from a
     complete one instead of computing returns off a truncated series.
+
+    ``progress`` is an optional callable(done, total, label) for UI feedback --
+    without it a slow fetch is an unexplained spinner. ``budget_seconds`` caps
+    the whole operation: AMFI can be slow enough that retrying every chunk runs
+    for the better part of an hour, and an unbounded wait is worse than a
+    reported gap.
     """
     import time
     passed_isins = tuple(isin_list) if isin_list else None
     dfs = []
     gaps: List[Tuple[date, date]] = []
-    current_start = start_date
 
-    while current_start <= end_date:
-        current_end = min(current_start + timedelta(days=90), end_date)
-        frmdt_str = current_start.strftime("%d-%b-%Y")
-        todt_str = current_end.strftime("%d-%b-%Y")
+    windows: List[Tuple[date, date]] = []
+    cursor = start_date
+    while cursor <= end_date:
+        w_end = min(cursor + timedelta(days=90), end_date)
+        windows.append((cursor, w_end))
+        cursor = w_end + timedelta(days=1)
+
+    started = time.monotonic()
+    total = len(windows)
+
+    def _remaining() -> float:
+        return budget_seconds - (time.monotonic() - started)
+
+    for i, (w_start, w_end) in enumerate(windows):
+        if progress:
+            progress(i, total, f"{w_start:%b %Y} – {w_end:%b %Y}")
+
+        if _remaining() <= 0:
+            # Out of budget: record the rest as gaps rather than grinding on.
+            gaps.extend(windows[i:])
+            print(f"AMFI fetch budget exhausted; {total - i} window(s) left unfetched.")
+            break
 
         try:
-            df_chunk = fetch_amfi_data(frmdt_str, todt_str, passed_isins, include_direct)
+            df_chunk = fetch_amfi_data(
+                w_start.strftime("%d-%b-%Y"), w_end.strftime("%d-%b-%Y"),
+                passed_isins, include_direct,
+            )
             if not df_chunk.empty:
                 dfs.append(df_chunk)
         except AmfiFetchError as exc:
             print(f"AMFI chunk unavailable: {exc}")
-            gaps.append((current_start, current_end))
+            gaps.append((w_start, w_end))
 
-        current_start = current_end + timedelta(days=1)
-        if current_start <= end_date:
+        if i < total - 1:
             time.sleep(0.5)  # avoid hitting rate limits
 
-    # Second sweep for anything AMFI refused. Throttling is transient and the
-    # first pass has since spent time on other chunks, so a retry now often
-    # succeeds — better than leaving a permanent hole in the history.
-    if gaps:
-        time.sleep(20)
+    # One more pass at whatever AMFI refused, but only with time left to spend.
+    # Throttling is transient, so a retry after the other chunks often works.
+    if gaps and _remaining() > 30:
+        if progress:
+            progress(total, total, f"retrying {len(gaps)} unavailable window(s)")
+        time.sleep(5)
         still_missing: List[Tuple[date, date]] = []
         for g_start, g_end in gaps:
+            if _remaining() <= 0:
+                still_missing.append((g_start, g_end))
+                continue
             try:
                 df_chunk = fetch_amfi_data(
                     g_start.strftime("%d-%b-%Y"), g_end.strftime("%d-%b-%Y"),
@@ -1779,8 +1813,11 @@ def fetch_amfi_data_chunked(start_date, end_date, isin_list: List[str] | None = 
             except AmfiFetchError as exc:
                 print(f"AMFI chunk still unavailable on retry: {exc}")
                 still_missing.append((g_start, g_end))
-            time.sleep(2)
+            time.sleep(1)
         gaps = still_missing
+
+    if progress:
+        progress(total, total, "done")
 
     df_all = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
     if return_gaps:

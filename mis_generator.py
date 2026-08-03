@@ -304,7 +304,7 @@ def validate_and_normalize_portfolio(df_input: pd.DataFrame) -> Tuple[pd.DataFra
 # ─── NAV Fetching ─────────────────────────────────────────────────────────────
 
 def fetch_mis_nav_history(isin_list: List[str], earliest_date: date,
-                          end_date: date) -> Tuple[pd.DataFrame, List[Tuple[date, date]]]:
+                          end_date: date, progress=None) -> Tuple[pd.DataFrame, List[Tuple[date, date]]]:
     """Fetch historical NAVs for all ISINs, overlaid with the live AMFI feed.
 
     ``isin_list`` carries both the portfolio schemes and the benchmark proxy
@@ -317,7 +317,8 @@ def fetch_mis_nav_history(isin_list: List[str], earliest_date: date,
     """
     fetch_start = earliest_date - timedelta(days=20)
     df_raw, gaps = fetch_amfi_data_chunked(
-        fetch_start, end_date, isin_list, include_direct=True, return_gaps=True
+        fetch_start, end_date, isin_list, include_direct=True, return_gaps=True,
+        progress=progress,
     )
     if df_raw.empty:
         return pd.DataFrame(), gaps
@@ -794,6 +795,7 @@ def generate_mis_reports_data(
     end_date: date,
     previous_portfolio_df: Optional[pd.DataFrame] = None,
     include_flows: bool = False,
+    progress=None,
 ) -> Dict[str, Any]:
     """Build the full MIS pack for one (optionally two) portfolios."""
     d_end = end_date
@@ -815,7 +817,7 @@ def generate_mis_reports_data(
     proxy_isins = required_proxy_isins(all_benchmarks)
     fetch_isins = list(dict.fromkeys(all_isins + proxy_isins))
 
-    df_nav_raw, nav_gaps = fetch_mis_nav_history(fetch_isins, earliest, d_end)
+    df_nav_raw, nav_gaps = fetch_mis_nav_history(fetch_isins, earliest, d_end, progress=progress)
     if df_nav_raw.empty:
         raise ValueError(
             "AMFI returned no NAV history for the portfolio ISINs. Check the ISINs and the date range."
@@ -1444,17 +1446,31 @@ def render_mis_generator_page():
             elif start_date > end_date:
                 st.error("Invalid date range.")
             else:
-                with st.spinner("Fetching NAVs and benchmark index levels…"):
-                    try:
-                        st.session_state["mis_results"] = generate_mis_reports_data(
-                            clean_df, start_date, end_date,
-                            previous_portfolio_df=prev_clean if not prev_clean.empty else None,
-                            include_flows=include_flows,
-                        )
-                        st.success("MIS reports generated.")
-                    except Exception as exc:
-                        st.session_state["mis_results"] = None
-                        st.error(f"Failed to generate MIS reports: {exc}")
+                # AMFI serves ~25s per month of range on a good day and drops
+                # responses on a bad one, so this runs for minutes. Show the
+                # actual position rather than an indefinite spinner.
+                bar = st.progress(0.0, text="Contacting AMFI…")
+
+                def _report(done: int, total: int, label: str) -> None:
+                    frac = (done / total) if total else 1.0
+                    bar.progress(
+                        min(max(frac, 0.0), 1.0),
+                        text=f"Fetching NAV history — window {min(done + 1, total)} of {total} ({label})",
+                    )
+
+                try:
+                    st.session_state["mis_results"] = generate_mis_reports_data(
+                        clean_df, start_date, end_date,
+                        previous_portfolio_df=prev_clean if not prev_clean.empty else None,
+                        include_flows=include_flows,
+                        progress=_report,
+                    )
+                    st.success("MIS reports generated.")
+                except Exception as exc:
+                    st.session_state["mis_results"] = None
+                    st.error(f"Failed to generate MIS reports: {exc}")
+                finally:
+                    bar.empty()
 
     res = st.session_state.get("mis_results")
     if not res:
