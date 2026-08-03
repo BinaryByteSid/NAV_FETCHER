@@ -21,14 +21,6 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-# ReportLab PDF imports
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4, landscape
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, KeepTogether
-)
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-
 # Re-use existing NAV fetch services from parent codebase
 from nav_fetcher import (
     fetch_amfi_data_chunked,
@@ -689,6 +681,16 @@ def export_mis_to_excel(mis_data: Dict[str, Any]) -> bytes:
 
 def export_mis_to_pdf(mis_data: Dict[str, Any]) -> bytes:
     """Generate a clean, professional landscape PDF report containing MIS 1, MIS 2, and MIS 3 tables."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        )
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    except ImportError as exc:
+        raise RuntimeError("reportlab package is not installed. Please add reportlab to requirements.txt") from exc
+
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf,
@@ -1074,11 +1076,14 @@ def render_mis_generator_page():
                 )
 
             with col_exp2:
-                pdf_bytes = export_mis_to_pdf(res)
-                st.download_button(
-                    label="Download PDF MIS Report (.pdf)",
-                    data=pdf_bytes,
-                    file_name=f"MIS_Report_{res['dates']['start_date']}_to_{res['dates']['end_date']}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
+                try:
+                    pdf_bytes = export_mis_to_pdf(res)
+                    st.download_button(
+                        label="Download PDF MIS Report (.pdf)",
+                        data=pdf_bytes,
+                        file_name=f"MIS_Report_{res['dates']['start_date']}_to_{res['dates']['end_date']}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+                except Exception as pdf_exc:
+                    st.warning(f"PDF Export is currently unavailable: {pdf_exc}")
