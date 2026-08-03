@@ -7,15 +7,19 @@ and internal consistency rather than specific NAV values.
 
 from __future__ import annotations
 import sys
+import tempfile
 from datetime import date
 from pathlib import Path
 
 # Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import openpyxl
 import pandas as pd
 from mis_generator import (
     validate_and_normalize_portfolio,
+    read_portfolio_excel,
+    _is_percent_format,
     generate_mis_reports_data,
     export_mis_to_excel,
     export_mis_to_pdf,
@@ -52,37 +56,68 @@ def test_validation():
 
 
 def test_excel_percent_allocations():
-    """Excel hands us 0.07 for a cell displaying 7.00%; a real percentage book
-    must survive untouched."""
+    """A cell holding 7 always reads as 7. Excel's percent format is the only
+    thing that turns a stored 0.07 into 7%."""
     print("2b. Excel percent-formatted allocations...")
 
-    def book(allocs):
-        return pd.DataFrame({
-            "Scheme Name": [f"F{i}" for i in range(len(allocs))],
-            "ISIN": [f"INF{i:03d}X01XX{i % 10}" for i in range(len(allocs))],
-            "Allocation (%)": allocs,
-            "Benchmark": ["NIFTY 50"] * len(allocs),
-        })
+    assert _is_percent_format("0.00%")
+    assert _is_percent_format("0%")
+    assert not _is_percent_format("General")
+    assert not _is_percent_format("0.00")
+    # A '%' that is literal text, not a percent multiplier.
+    assert not _is_percent_format('0.00" %"')
+    assert not _is_percent_format(r"0.00\%")
 
-    # Fractions get rescaled to percent.
-    frac, _, _ = validate_and_normalize_portfolio(book([0.07, 0.10, 0.09, 0.74]))
-    assert list(frac["Allocation (%)"]) == [7.0, 10.0, 9.0, 74.0], list(frac["Allocation (%)"])
+    def write_book(path, allocs, number_format):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["Scheme Name", "ISIN", "Allocation", "Benchmark"])
+        for i, a in enumerate(allocs):
+            ws.append([f"F{i}", f"INF{i:03d}X01XX{i % 10}", a, "NIFTY 50"])
+            ws.cell(row=i + 2, column=3).number_format = number_format
+        wb.save(path)
+        return path
 
-    # An ordinary book is left alone.
-    pct, _, _ = validate_and_normalize_portfolio(book([50.0, 30.0, 20.0]))
-    assert list(pct["Allocation (%)"]) == [50.0, 30.0, 20.0], list(pct["Allocation (%)"])
+    tmp = Path(tempfile.gettempdir())
 
-    # 100 holdings at 1% each: every weight is <= 1.0, so a naive rule
-    # misfires here. The book totals 100, which rules out fractions.
-    many, _, _ = validate_and_normalize_portfolio(book([1.0] * 100))
-    assert many["Allocation (%)"].iloc[0] == 1.0, many["Allocation (%)"].iloc[0]
+    # Percent-formatted: 0.07 displays as 7.00%, so it reads as 7.
+    p = write_book(tmp / "_mis_pct.xlsx", [0.07, 0.10, 0.09, 0.74], "0.00%")
+    with open(p, "rb") as fh:
+        df = read_portfolio_excel(fh)
+    assert list(df["Allocation"]) == [7.0, 10.0, 9.0, 74.0], list(df["Allocation"])
+
+    # Plain format: 7 is 7, and stays 7.
+    p = write_book(tmp / "_mis_plain.xlsx", [50.0, 30.0, 20.0], "General")
+    with open(p, "rb") as fh:
+        df = read_portfolio_excel(fh)
+    assert list(df["Allocation"]) == [50.0, 30.0, 20.0], list(df["Allocation"])
+
+    # 100 holdings at 1% each, stored plainly: untouched.
+    p = write_book(tmp / "_mis_ones.xlsx", [1.0] * 100, "General")
+    with open(p, "rb") as fh:
+        df = read_portfolio_excel(fh)
+    assert df["Allocation"].iloc[0] == 1.0, df["Allocation"].iloc[0]
+    assert df["Allocation"].sum() == 100.0
+
+    # The validator itself never rescales: what it is handed is what it uses.
+    lit = pd.DataFrame({
+        "Scheme Name": ["A", "B"],
+        "ISIN": ["INF001A01AA1", "INF002B01BB2"],
+        "Allocation (%)": [0.07, 0.10],
+        "Benchmark": ["NIFTY 50"] * 2,
+    })
+    clean, _, _ = validate_and_normalize_portfolio(lit)
+    assert list(clean["Allocation (%)"]) == [0.07, 0.10], list(clean["Allocation (%)"])
 
     # Text cells carrying their own percent sign.
-    txt, _, _ = validate_and_normalize_portfolio(book(["60%", "40%"]))
-    assert list(txt["Allocation (%)"]) == [60.0, 40.0], list(txt["Allocation (%)"])
-
-    # Either reading must produce identical weights -- the scaling is cosmetic.
-    assert abs(frac["Normalized_Weight"].sum() - 1.0) < 1e-9
+    txt = pd.DataFrame({
+        "Scheme Name": ["A", "B"],
+        "ISIN": ["INF001A01AA1", "INF002B01BB2"],
+        "Allocation (%)": ["60%", "40%"],
+        "Benchmark": ["NIFTY 50"] * 2,
+    })
+    c4, _, _ = validate_and_normalize_portfolio(txt)
+    assert list(c4["Allocation (%)"]) == [60.0, 40.0], list(c4["Allocation (%)"])
     print("   [OK] Percent-formatted allocations handled.")
 
 

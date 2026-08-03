@@ -21,6 +21,7 @@ a market holiday cannot silently collapse a one-day return to 0.00%.
 from __future__ import annotations
 
 import io
+import re
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Tuple, Any, Optional
 
@@ -159,6 +160,62 @@ def _diff(a: Optional[float], b: Optional[float]) -> Optional[float]:
 
 # ─── Data Ingestion & Validation ──────────────────────────────────────────────
 
+def _is_percent_format(fmt: Any) -> bool:
+    """True if an Excel number format displays its value as a percentage.
+
+    A '%' inside a quoted literal or escaped with a backslash is just text --
+    only a bare '%' makes Excel scale the stored value by 100.
+    """
+    if not fmt:
+        return False
+    stripped = re.sub(r'"[^"]*"', "", str(fmt))
+    stripped = re.sub(r"\\.", "", stripped)
+    return "%" in stripped
+
+
+def read_portfolio_excel(file_obj) -> pd.DataFrame:
+    """Read an uploaded portfolio workbook, honouring Excel percent formatting.
+
+    Excel stores a cell displaying 7.00% as 0.07, so the stored number alone
+    is ambiguous: 0.07 could mean 7% or 0.07%. The cell's number format says
+    which, and reading it means a cell holding 7 is always taken as 7 -- no
+    inference from column totals.
+    """
+    df = pd.read_excel(file_obj)
+    if df.empty:
+        return df
+
+    try:
+        file_obj.seek(0)
+        ws = openpyxl.load_workbook(file_obj, data_only=True).worksheets[0]
+    except Exception:
+        # .xls, or a workbook openpyxl cannot parse. Values stand as read.
+        return df
+
+    # Map each header to its column, then scale the columns Excel is
+    # displaying as percentages.
+    header_at = {}
+    for cell in ws[1]:
+        if cell.value is not None:
+            header_at.setdefault(str(cell.value).strip(), cell.column)
+
+    for col_name in df.columns:
+        col_idx = header_at.get(str(col_name).strip())
+        if col_idx is None or not pd.api.types.is_numeric_dtype(df[col_name]):
+            continue
+        formats = [
+            ws.cell(row=r, column=col_idx).number_format
+            for r in range(2, min(ws.max_row, len(df) + 1) + 1)
+            if isinstance(ws.cell(row=r, column=col_idx).value, (int, float))
+        ]
+        if formats and all(_is_percent_format(f) for f in formats):
+            # Round away the binary-float artifact: 0.07 * 100 is
+            # 7.000000000000001.
+            df[col_name] = (df[col_name] * 100.0).round(6)
+
+    return df
+
+
 def validate_and_normalize_portfolio(df_input: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], List[str]]:
     """Validate portfolio input and prepare normalized allocations.
 
@@ -228,20 +285,6 @@ def validate_and_normalize_portfolio(df_input: pd.DataFrame) -> Tuple[pd.DataFra
         return pd.DataFrame(), warnings, errors
 
     res_df = pd.DataFrame(clean_rows)
-
-    # Excel stores a percent-formatted cell as its underlying fraction, so a
-    # sheet showing 7.00% hands us 0.07 and the book sums to 1.00 instead of
-    # 100. Rescale when every weight is a fraction and the book is under 1.5 --
-    # a real percentage book of this shape would have to total 1.5%.
-    alloc_series = res_df["Allocation (%)"]
-    positive = alloc_series[alloc_series > 0]
-    if not positive.empty and positive.max() <= 1.0 and alloc_series.sum() <= 1.5:
-        # Round to kill the binary-float artifact: 0.07 * 100 is 7.000000000000001.
-        res_df["Allocation (%)"] = (alloc_series * 100.0).round(6)
-        warnings.append(
-            "Allocations were stored as Excel percentages (7% held as 0.07); "
-            "they have been read as percent values."
-        )
 
     tot_alloc = res_df["Allocation (%)"].sum()
     if tot_alloc <= 0:
@@ -1346,7 +1389,7 @@ def render_mis_generator_page():
             )
             if uploaded_file is not None:
                 try:
-                    current_portfolio_df = pd.read_excel(uploaded_file)
+                    current_portfolio_df = read_portfolio_excel(uploaded_file)
                     st.success(f"Loaded {len(current_portfolio_df)} rows.")
                 except Exception as exc:
                     st.error(f"Error reading uploaded Excel file: {exc}")
