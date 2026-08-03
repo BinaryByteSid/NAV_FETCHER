@@ -14,7 +14,7 @@ import sys
 from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import pandas as pd
 import requests
@@ -714,11 +714,35 @@ def fetch_latest_navs(isin_list: List[str]) -> dict:
 
 
 
+def fetch_index_level_series(index_name: str, start_date, end_date) -> dict:
+    """Historical level series for a benchmark index, keyed 'dd-mm-YYYY'.
+
+    Tries niftyindices.com first, then falls back to the AMFI index-fund proxy
+    in benchmark_proxy.py. Returns {} when neither source has data — callers
+    must handle that rather than receive invented numbers.
+    """
+    direct = fetch_nifty_data_series(index_name, start_date, end_date)
+    if direct:
+        return direct
+
+    # Imported lazily: benchmark_proxy imports from this module.
+    try:
+        from benchmark_proxy import fetch_benchmark_levels
+    except ImportError:
+        return {}
+
+    series = fetch_benchmark_levels([index_name], start_date, end_date).get(index_name)
+    if series is None or not series.levels:
+        return {}
+    return {d.strftime("%d-%m-%Y"): v for d, v in series.levels.items()}
+
+
 def fetch_nifty_data_series(index_name: str, start_date, end_date) -> dict:
     """Fetch historical close prices for a Nifty index from niftyindices.com.
-    
-    Returns a dictionary mapping date string 'dd-mm-YYYY' to float close price.
-    On failure, falls back to a simulated index series to ensure the app doesn't crash.
+
+    Returns a dictionary mapping date string 'dd-mm-YYYY' to float close price,
+    or {} when the feed is unavailable. Prefer fetch_index_level_series, which
+    adds the AMFI proxy fallback.
     """
     import json
     import requests
@@ -784,19 +808,13 @@ def fetch_nifty_data_series(index_name: str, start_date, end_date) -> dict:
             print(f"Error fetching Nifty index {index_name} for chunk {c_start} to {c_end}: {e}")
             
     if not success_any:
-        print(f"Failed to fetch Nifty data for {index_name}. Falling back to simulation.")
-        import random
-        random.seed(42)
-        base_price = 24000.0 if "50" in index_name else 22000.0
-        curr_price = base_price
-        curr = start_date
-        while curr <= end_date:
-            date_key = curr.strftime("%d-%m-%Y")
-            change = random.normalvariate(0.0003, 0.01)
-            curr_price *= (1.0 + change)
-            date_map[date_key] = round(curr_price, 2)
-            curr += timedelta(days=1)
-            
+        # Return nothing rather than inventing a series. This used to fall back
+        # to a randomly simulated price path, which meant every index return and
+        # every excess-return figure downstream was fabricated without warning.
+        # Callers must treat an empty dict as "no benchmark data available".
+        print(f"Failed to fetch index data for {index_name} — returning no data.")
+        return {}
+
     return date_map
 
 
@@ -826,8 +844,8 @@ def run_live_portfolio(bucket_df: pd.DataFrame, start_date, initial_amount: floa
     fetch_start = start_date - timedelta(days=10)
     
     # Fetch Nifty 50 and Nifty 500 history
-    n50_raw = fetch_nifty_data_series("Nifty 50", fetch_start, end_date)
-    n500_raw = fetch_nifty_data_series("Nifty 500", fetch_start, end_date)
+    n50_raw = fetch_index_level_series("Nifty 50", fetch_start, end_date)
+    n500_raw = fetch_index_level_series("Nifty 500", fetch_start, end_date)
     
     # Build complete chronological series of Nifty close prices (carrying forward for holidays)
     n50_closes = {}
@@ -1195,6 +1213,32 @@ AMFI_HISTORY_URL = (
 )
 AMFI_LATEST_URL = "https://portal.amfiindia.com/spages/NAVAll.txt"
 
+
+class AmfiFetchError(RuntimeError):
+    """AMFI's NAV history endpoint did not return usable data for a date range.
+
+    Raised instead of returning an empty frame so that a throttled request is
+    never mistaken for "this range genuinely has no NAVs" — that confusion
+    silently truncated history and corrupted every return baseline computed
+    from it.
+    """
+
+
+# "Dividend" appears in scheme names two very different ways: as the payout
+# option (exclude) and as the investment strategy, e.g. "ICICI Prudential
+# Dividend Yield Equity Fund - Growth" (keep). Matching the bare word dropped
+# every dividend-yield fund from the app.
+_IDCW_RE = re.compile(
+    r"\bidcw\b|\bincome distribution\b|\bcapital withdrawal\b|\bdividend\b(?!\s*yield)",
+    re.IGNORECASE,
+)
+
+
+def is_idcw_scheme(scheme_name: str) -> bool:
+    """True when the scheme name denotes an income-distribution (IDCW) option."""
+    return bool(_IDCW_RE.search(scheme_name or ""))
+
+
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def parse_amfi_text(text: str, isin_list: tuple[str, ...] | None = None) -> pd.DataFrame:
@@ -1235,7 +1279,7 @@ def parse_amfi_text(text: str, isin_list: tuple[str, ...] | None = None) -> pd.D
         scheme_name = parts[1]
         scheme_name_lower = scheme_name.lower()
         is_direct = "direct" in scheme_name_lower or re.search(r"\bdir\b", scheme_name_lower)
-        is_idcw = "idcw" in scheme_name_lower or "dividend" in scheme_name_lower or "income distribution" in scheme_name_lower or "capital withdrawal" in scheme_name_lower
+        is_idcw = is_idcw_scheme(scheme_name)
         if is_direct or is_idcw:
             continue
             
@@ -1548,132 +1592,200 @@ def style_excel(df: pd.DataFrame, date_cols: List[str], is_aum_only: bool = Fals
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = None) -> pd.DataFrame:
+def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = None,
+                    include_direct: bool = False) -> pd.DataFrame:
+    """Parse AMFI's historical NAV dump.
+
+    Regular-plan Growth options only by default, which is what the rest of the
+    app reports on. Pass include_direct=True for the benchmark index-fund
+    proxies, where the Direct plan's lower TER tracks the index more closely.
+    """
     url = AMFI_HISTORY_URL.format(frmdt=frmdt, todt=todt)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     import time
-    max_retries = 3
-    delay = 2.0
-    resp = None
+
+    isin_set = {isin.strip().upper() for isin in isin_list if isin.strip()} if isin_list else None
+
+    def _download_and_parse() -> tuple[list, bool]:
+        """Stream one response. Returns (rows, response_was_a_valid_nav_dump)."""
+        resp = requests.get(url, headers=headers, stream=True, timeout=300)
+        resp.raise_for_status()
+
+        rows: List[dict] = []
+        current_section = "Unknown"
+        # AMFI answers HTTP 200 with an HTML page when it is throttling or
+        # erroring. That page has no column header, which is how we tell a
+        # genuine empty range from a failed request.
+        header_seen = False
+
+        for line_bytes in resp.iter_lines():
+            if not line_bytes:
+                continue
+            line = line_bytes.decode('utf-8', errors='ignore')
+
+            # Fast section check (no semicolons in section headers)
+            if ";" not in line:
+                line_stripped = line.strip()
+                if (
+                    line_stripped.startswith("Open Ended")
+                    or line_stripped.startswith("Closed Ended")
+                    or line_stripped.startswith("Interval Fund Schemes")
+                ):
+                    current_section = line_stripped
+                continue
+
+            if not header_seen and line.startswith("Scheme Code"):
+                header_seen = True
+                continue
+
+            # Optimize memory & parsing: Skip processing the line if isin_set is provided
+            # and none of the targeted ISINs are in the raw text line (case-insensitive)
+            if isin_set:
+                line_upper = line.upper()
+                if not any(isin in line_upper for isin in isin_set):
+                    continue
+
+            parts = line.split(";")
+            if len(parts) < 8:
+                continue
+
+            isin_growth = parts[2].strip()
+            isin_reinvest = parts[3].strip()
+
+            isin_growth_upper = isin_growth.upper() if isin_growth != "-" else ""
+            isin_reinvest_upper = isin_reinvest.upper() if isin_reinvest != "-" else ""
+
+            # Double check matching against ISIN set
+            if isin_set:
+                g_match = isin_growth_upper and isin_growth_upper in isin_set
+                r_match = isin_reinvest_upper and isin_reinvest_upper in isin_set
+                if not (g_match or r_match):
+                    continue
+
+            scheme_code = parts[0].strip()
+            scheme_name = parts[1].strip()
+            scheme_name_lower = scheme_name.lower()
+            is_direct = "direct" in scheme_name_lower or re.search(r"\bdir\b", scheme_name_lower)
+            is_idcw = is_idcw_scheme(scheme_name)
+            if (is_direct and not include_direct) or is_idcw:
+                continue
+
+            nav_value = parts[4].strip()
+            nav_date = parts[7].strip()
+
+            scheme_code = scheme_code if scheme_code != "-" else None
+            isin_growth_val = isin_growth if isin_growth != "-" else None
+            isin_reinvest_val = isin_reinvest if isin_reinvest != "-" else None
+
+            nav = pd.to_numeric(nav_value.replace(",", ""), errors="coerce")
+
+            rows.append(
+                {
+                    "Asset Class": current_section,
+                    "Scheme Code": scheme_code,
+                    "ISIN Div Payout / ISIN Growth": isin_growth_val,
+                    "ISIN Div Reinvestment": isin_reinvest_val,
+                    "Scheme Name": scheme_name,
+                    "NAV": nav,
+                    "NAV Date": nav_date,
+                }
+            )
+
+        return rows, (header_seen or bool(rows))
+
+    # AMFI's throttle window is measured in tens of seconds, so back off well
+    # past it rather than burning all retries inside a single cool-down period.
+    max_retries = 4
+    delay = 6.0
+    rows: List[dict] = []
     for attempt in range(max_retries):
         try:
-            resp = requests.get(url, headers=headers, stream=True, timeout=300)
-            resp.raise_for_status()
-            break
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            if attempt == max_retries - 1:
-                raise e
-            time.sleep(delay)
-            delay *= 2
-    
-    rows: List[dict] = []
-    current_section = "Unknown"
-    
-    isin_set = {isin.strip().upper() for isin in isin_list if isin.strip()} if isin_list else None
-    
-    for line_bytes in resp.iter_lines():
-        if not line_bytes:
-            continue
-        line = line_bytes.decode('utf-8', errors='ignore')
-        
-        # Fast section check (no semicolons in section headers)
-        if ";" not in line:
-            line_stripped = line.strip()
-            if (
-                line_stripped.startswith("Open Ended")
-                or line_stripped.startswith("Closed Ended")
-                or line_stripped.startswith("Interval Fund Schemes")
-            ):
-                current_section = line_stripped
-            continue
-            
-        # Optimize memory & parsing: Skip processing the line if isin_set is provided
-        # and none of the targeted ISINs are in the raw text line (case-insensitive)
-        if isin_set:
-            line_upper = line.upper()
-            if not any(isin in line_upper for isin in isin_set):
-                continue
-                
-        parts = line.split(";")
-        if len(parts) < 8:
-            continue
-            
-        isin_growth = parts[2].strip()
-        isin_reinvest = parts[3].strip()
-        
-        isin_growth_upper = isin_growth.upper() if isin_growth != "-" else ""
-        isin_reinvest_upper = isin_reinvest.upper() if isin_reinvest != "-" else ""
-        
-        # Double check matching against ISIN set
-        if isin_set:
-            g_match = isin_growth_upper and isin_growth_upper in isin_set
-            r_match = isin_reinvest_upper and isin_reinvest_upper in isin_set
-            if not (g_match or r_match):
-                continue
-                
-        scheme_code = parts[0].strip()
-        scheme_name = parts[1].strip()
-        scheme_name_lower = scheme_name.lower()
-        is_direct = "direct" in scheme_name_lower or re.search(r"\bdir\b", scheme_name_lower)
-        is_idcw = "idcw" in scheme_name_lower or "dividend" in scheme_name_lower or "income distribution" in scheme_name_lower or "capital withdrawal" in scheme_name_lower
-        if is_direct or is_idcw:
-            continue
-            
-        nav_value = parts[4].strip()
-        nav_date = parts[7].strip()
-        
-        scheme_code = scheme_code if scheme_code != "-" else None
-        isin_growth_val = isin_growth if isin_growth != "-" else None
-        isin_reinvest_val = isin_reinvest if isin_reinvest != "-" else None
-        
-        nav = pd.to_numeric(nav_value.replace(",", ""), errors="coerce")
-        
-        rows.append(
-            {
-                "Asset Class": current_section,
-                "Scheme Code": scheme_code,
-                "ISIN Div Payout / ISIN Growth": isin_growth_val,
-                "ISIN Div Reinvestment": isin_reinvest_val,
-                "Scheme Name": scheme_name,
-                "NAV": nav,
-                "NAV Date": nav_date,
-            }
-        )
-        
+            rows, valid = _download_and_parse()
+            if valid:
+                break
+            reason = "AMFI returned an error page instead of NAV data"
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError,
+                requests.exceptions.HTTPError) as e:
+            reason = f"{type(e).__name__}: {e}"
+
+        if attempt == max_retries - 1:
+            # Raise rather than return empty. st.cache_data does not cache
+            # exceptions, so a throttled response can't be memoised into a
+            # permanent hole in the history — which used to truncate NAV
+            # coverage silently and shift every return baseline.
+            raise AmfiFetchError(
+                f"AMFI NAV history unavailable for {frmdt} to {todt} after "
+                f"{max_retries} attempts ({reason})."
+            )
+        time.sleep(delay)
+        delay *= 2
+
     if not rows:
         return pd.DataFrame()
-        
+
     df = pd.DataFrame(rows)
     df["Plan Type"] = df["Scheme Name"].apply(classify_plan_type)
     df["Option Type"] = df["Scheme Name"].apply(classify_option_type)
     return df
 
 
-def fetch_amfi_data_chunked(start_date, end_date, isin_list: List[str] | None = None) -> pd.DataFrame:
-    """Fetch AMFI data by chunking the date range into 90-day intervals to prevent timeout & memory crash."""
+def fetch_amfi_data_chunked(start_date, end_date, isin_list: List[str] | None = None,
+                            include_direct: bool = False, return_gaps: bool = False):
+    """Fetch AMFI data by chunking the date range into 90-day intervals to prevent timeout & memory crash.
+
+    With return_gaps=True returns (df, gaps) where gaps lists the (start, end)
+    windows AMFI would not serve, so callers can tell a partial history from a
+    complete one instead of computing returns off a truncated series.
+    """
     import time
     passed_isins = tuple(isin_list) if isin_list else None
     dfs = []
+    gaps: List[Tuple[date, date]] = []
     current_start = start_date
-    
+
     while current_start <= end_date:
         current_end = min(current_start + timedelta(days=90), end_date)
         frmdt_str = current_start.strftime("%d-%b-%Y")
         todt_str = current_end.strftime("%d-%b-%Y")
-        
-        df_chunk = fetch_amfi_data(frmdt_str, todt_str, passed_isins)
-        if not df_chunk.empty:
-            dfs.append(df_chunk)
-            
+
+        try:
+            df_chunk = fetch_amfi_data(frmdt_str, todt_str, passed_isins, include_direct)
+            if not df_chunk.empty:
+                dfs.append(df_chunk)
+        except AmfiFetchError as exc:
+            print(f"AMFI chunk unavailable: {exc}")
+            gaps.append((current_start, current_end))
+
         current_start = current_end + timedelta(days=1)
         if current_start <= end_date:
             time.sleep(0.5)  # avoid hitting rate limits
-        
-    if not dfs:
-        return pd.DataFrame()
-    return pd.concat(dfs, ignore_index=True)
+
+    # Second sweep for anything AMFI refused. Throttling is transient and the
+    # first pass has since spent time on other chunks, so a retry now often
+    # succeeds — better than leaving a permanent hole in the history.
+    if gaps:
+        time.sleep(20)
+        still_missing: List[Tuple[date, date]] = []
+        for g_start, g_end in gaps:
+            try:
+                df_chunk = fetch_amfi_data(
+                    g_start.strftime("%d-%b-%Y"), g_end.strftime("%d-%b-%Y"),
+                    passed_isins, include_direct,
+                )
+                if not df_chunk.empty:
+                    dfs.append(df_chunk)
+            except AmfiFetchError as exc:
+                print(f"AMFI chunk still unavailable on retry: {exc}")
+                still_missing.append((g_start, g_end))
+            time.sleep(2)
+        gaps = still_missing
+
+    df_all = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+    if return_gaps:
+        return df_all, gaps
+    return df_all
 
 
 def build_date_cols(start_date, end_date, skip_sunday: bool) -> List[str]:

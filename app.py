@@ -1058,7 +1058,7 @@ def run_historical_export(
                         scheme_name = parts[1].strip()
                         scheme_name_lower = scheme_name.lower()
                         is_direct = "direct" in scheme_name_lower or re.search(r"\bdir\b", scheme_name_lower)
-                        is_idcw = "idcw" in scheme_name_lower or "dividend" in scheme_name_lower or "income distribution" in scheme_name_lower or "capital withdrawal" in scheme_name_lower
+                        is_idcw = is_idcw_scheme(scheme_name)
                         if is_direct or is_idcw:
                             continue
                             
@@ -1429,7 +1429,7 @@ from amfi_nav import (
     classify_plan_type,
     classify_option_type,
 )
-from nav_fetcher import parse_bucket_input, run_live_portfolio, style_portfolio_excel
+from nav_fetcher import parse_bucket_input, run_live_portfolio, style_portfolio_excel, is_idcw_scheme
 from ui_theme import (
     finance_panel,
     inject_custom_css,
@@ -1731,7 +1731,7 @@ def main() -> None:
                         option_type = str(row.get("Option Type", "")).strip().lower()
                         
                         is_direct = "direct" in plan_type or "direct" in scheme_name or "dir" in plan_type or re.search(r"\bdir\b", scheme_name)
-                        is_idcw = "idcw" in option_type or "dividend" in option_type or "idcw" in scheme_name or "dividend" in scheme_name or "income distribution" in scheme_name or "capital withdrawal" in scheme_name
+                        is_idcw = is_idcw_scheme(option_type) or is_idcw_scheme(scheme_name)
                         
                         if is_direct or is_idcw:
                             continue
@@ -1897,7 +1897,7 @@ def main() -> None:
                             option_type = str(row.get("Option Type", "")).strip().lower()
                             
                             is_direct = "direct" in plan_type or "direct" in scheme_name or "dir" in plan_type or re.search(r"\bdir\b", scheme_name)
-                            is_idcw = "idcw" in option_type or "dividend" in option_type or "idcw" in scheme_name or "dividend" in scheme_name or "income distribution" in scheme_name or "capital withdrawal" in scheme_name
+                            is_idcw = is_idcw_scheme(option_type) or is_idcw_scheme(scheme_name)
                             
                             if is_direct or is_idcw:
                                 continue
