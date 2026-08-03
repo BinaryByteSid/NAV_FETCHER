@@ -1,7 +1,21 @@
 """
-MIS Generator Module for Mutual Fund Portfolios
-Generate professional MIS reports (MIS 1, MIS 2, MIS 3) with dynamic NAV fetching,
-benchmark comparisons (Nifty 50 and individual benchmarks), and styled Excel/PDF exports.
+MIS Generator Module for Mutual Fund Portfolios.
+
+Produces the three standard MIS views:
+
+  MIS 1 — portfolio vs Nifty 50, for the day and for the period, plus Flows,
+          MTD and YTD (financial-year-to-date) columns.
+  MIS 2 — portfolio vs each scheme's own benchmark, for the day and the period.
+  MIS 3 — performance since 1 April (financial year start) vs both Nifty and
+          each scheme's own benchmark.
+
+Every figure traces to real data. Scheme NAVs come from AMFI; benchmark index
+levels come from benchmark_proxy.py, which maps each benchmark to a passive
+index fund and reads its NAV history from the same AMFI feed. Where a benchmark
+cannot be sourced the report prints "N/A" — it never substitutes a value.
+
+Returns are aligned to actual observation dates rather than calendar dates, so
+a market holiday cannot silently collapse a one-day return to 0.00%.
 """
 
 from __future__ import annotations
@@ -12,8 +26,6 @@ from datetime import datetime, date, timedelta
 from typing import Dict, List, Tuple, Any, Optional
 
 import pandas as pd
-import numpy as np
-import requests
 import streamlit as st
 
 # openpyxl styling imports
@@ -24,110 +36,211 @@ from openpyxl.utils import get_column_letter
 # Re-use existing NAV fetch services from parent codebase
 from nav_fetcher import (
     fetch_amfi_data_chunked,
-    fetch_nifty_data_series,
     fetch_latest_navs,
     parse_amfi_date_series,
-    build_date_cols,
+    populate_actual_aum,
+    load_portfolio_aum_data,
+    calculate_flows_for_dataframe,
     _parse_amfi_date_str,
+)
+from benchmark_proxy import (
+    required_proxy_isins,
+    build_benchmark_series,
+    nav_frame_to_isin_series,
+    overlay_live_navs,
+    describe_gaps,
+    describe_resolution,
+    STATUS_APPROX,
+    STATUS_NONE,
+    DEFAULT_BENCHMARK,
 )
 from ui_theme import render_section_header, render_info_card, finance_panel
 
 # ─── Default Sample Portfolio ──────────────────────────────────────────────────
 
 DEFAULT_SAMPLE_PORTFOLIO = [
-    {
-        "Scheme Name": "HDFC Flexi Cap Fund - Direct Plan - Growth",
-        "ISIN": "INF179K01BE2",
-        "Allocation (%)": 25.0,
-        "Benchmark": "NIFTY 500",
-    },
-    {
-        "Scheme Name": "SBI Bluechip Fund - Direct Plan - Growth",
-        "ISIN": "INF200K01VT2",
-        "Allocation (%)": 25.0,
-        "Benchmark": "NIFTY 50",
-    },
-    {
-        "Scheme Name": "Nippon India Small Cap Fund - Direct Plan - Growth",
-        "ISIN": "INF204K01HY2",
-        "Allocation (%)": 25.0,
-        "Benchmark": "NIFTY Smallcap 250",
-    },
-    {
-        "Scheme Name": "Mirae Asset Large & Midcap Fund - Direct Plan - Growth",
-        "ISIN": "INF769K01150",
-        "Allocation (%)": 25.0,
-        "Benchmark": "NIFTY LargeMidcap 250",
-    },
+    {"Scheme Name": "Invesco India Smallcap Reg Gr",   "ISIN": "INF205K011T7", "Allocation (%)": 7.0,  "Benchmark": "S&P BSE 250 SmallCap TR INR"},
+    {"Scheme Name": "Kotak Midcap Reg Gr",             "ISIN": "INF174K01DS9", "Allocation (%)": 6.0,  "Benchmark": "Nifty Midcap 150 TR INR"},
+    {"Scheme Name": "Quant Large Cap Reg Gr",          "ISIN": "INF966L01AW4", "Allocation (%)": 10.0, "Benchmark": "Nifty 100 TR INR"},
+    {"Scheme Name": "SBI Infrastructure Reg Gr",       "ISIN": "INF200K01CT2", "Allocation (%)": 6.0,  "Benchmark": "Nifty Infrastructure TR INR"},
+    {"Scheme Name": "Invesco India Focused Reg Gr",    "ISIN": "INF205KA1189", "Allocation (%)": 7.0,  "Benchmark": "BSE 500 India TR INR"},
+    {"Scheme Name": "SBI Large & Midcap Reg Gr",       "ISIN": "INF200K01305", "Allocation (%)": 6.0,  "Benchmark": "Nifty LargeMidcap 250 TR INR"},
+    {"Scheme Name": "Bandhan Large & Mid Cap Gr",      "ISIN": "INF194K01524", "Allocation (%)": 7.0,  "Benchmark": "Nifty LargeMidcap 250 TR INR"},
+    {"Scheme Name": "ICICI Pru Focused Equity Gr",     "ISIN": "INF109K01BZ4", "Allocation (%)": 7.0,  "Benchmark": "BSE 500 India TR INR"},
+    {"Scheme Name": "Kotak Multicap Reg Gr",           "ISIN": "INF174KA1HS9", "Allocation (%)": 7.0,  "Benchmark": "Nifty 500 Multicap 50:25:25 TR INR"},
+    {"Scheme Name": "Canara Robeco Multi Cap Reg Gr",  "ISIN": "INF760K01KR2", "Allocation (%)": 7.0,  "Benchmark": "Nifty 500 Multicap 50:25:25 TR INR"},
+    {"Scheme Name": "DSP Large & Mid Cap Fund Reg Gr", "ISIN": "INF740K01094", "Allocation (%)": 9.0,  "Benchmark": "Nifty LargeMidcap 250 TR INR"},
+    {"Scheme Name": "HDFC Flexi Cap Gr",               "ISIN": "INF179K01608", "Allocation (%)": 9.0,  "Benchmark": "Nifty 500 TR INR"},
+    {"Scheme Name": "ICICI Pru Dividend Yield Eq Gr",  "ISIN": "INF109KA1TX4", "Allocation (%)": 7.0,  "Benchmark": "Nifty 500 TR INR"},
+    {"Scheme Name": "HDFC Small Cap Gr",               "ISIN": "INF179KA1RZ8", "Allocation (%)": 5.0,  "Benchmark": "S&P BSE 250 SmallCap TR INR"},
 ]
+
+NIFTY_KEY = "NIFTY 50"
+
 
 # ─── Helper Date Functions ────────────────────────────────────────────────────
 
 def get_fy_start_date(target_date: date) -> date:
-    """Return April 1st of the financial year corresponding to target_date.
-    
-    If target_date is July 2026, FY Start is 1-Apr-2026.
-    If target_date is Feb 2026, FY Start is 1-Apr-2025.
-    """
+    """April 1st of the financial year containing target_date."""
     if target_date.month >= 4:
         return date(target_date.year, 4, 1)
-    else:
-        return date(target_date.year - 1, 4, 1)
-
-
-def get_ytd_start_date(target_date: date) -> date:
-    """Return Dec 31 of the previous calendar year relative to target_date."""
-    return date(target_date.year - 1, 12, 31)
+    return date(target_date.year - 1, 4, 1)
 
 
 def get_mtd_start_date(target_date: date) -> date:
-    """Return the last day of the previous calendar month relative to target_date."""
-    first_of_curr_month = date(target_date.year, target_date.month, 1)
-    return first_of_curr_month - timedelta(days=1)
+    """Last day of the previous calendar month — the MTD baseline."""
+    return date(target_date.year, target_date.month, 1) - timedelta(days=1)
 
 
-def get_monthly_baseline_date(target_date: date) -> date:
-    """Return 1 month prior to target_date."""
-    return target_date - timedelta(days=30)
+# ─── Observation series helpers ───────────────────────────────────────────────
+# A "series" here is {observation_date: value}. Both scheme NAVs and benchmark
+# index levels use this shape so one set of helpers serves both.
+
+Series = Dict[date, float]
 
 
-def get_daily_baseline_date(target_date: date) -> date:
-    """Return 1 day prior to target_date (baseline will fetch closest prior trading day)."""
-    return target_date - timedelta(days=1)
+def value_asof(series: Optional[Series], target: date) -> Tuple[Optional[float], Optional[date]]:
+    """Latest value on or before ``target``, with the date it came from."""
+    if not series:
+        return None, None
+    candidates = [d for d in series if d <= target]
+    if not candidates:
+        return None, None
+    d = max(candidates)
+    return series[d], d
+
+
+def value_prev(series: Optional[Series], before: date) -> Tuple[Optional[float], Optional[date]]:
+    """Latest value strictly before ``before``.
+
+    Used for one-day returns. Resolving both ends with "on or before" would let
+    a holiday pick the same observation twice and report a 0.00% move that never
+    happened.
+    """
+    if not series:
+        return None, None
+    candidates = [d for d in series if d < before]
+    if not candidates:
+        return None, None
+    d = max(candidates)
+    return series[d], d
+
+
+def _num(v: Any) -> Optional[float]:
+    """Coerce to float, mapping None and NaN alike to None.
+
+    Pandas hands back NaN rather than None for missing cells, and `NaN is None`
+    is False — so a plain None check lets NaN through and it then contaminates
+    every sum and average it touches.
+    """
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if pd.isna(f) else f
+
+
+def calc_return(end_val: Optional[float], start_val: Optional[float]) -> Optional[float]:
+    """Non-annualised return %: ((end - start) / start) * 100."""
+    e, s = _num(end_val), _num(start_val)
+    if e is None or s is None or s <= 0:
+        return None
+    return ((e - s) / s) * 100.0
+
+
+def _diff(a: Optional[float], b: Optional[float]) -> Optional[float]:
+    """a - b, propagating missing values so a gap never becomes a fake 0."""
+    x, y = _num(a), _num(b)
+    if x is None or y is None:
+        return None
+    return x - y
 
 
 # ─── Data Ingestion & Validation ──────────────────────────────────────────────
 
+def _is_percent_format(fmt: Any) -> bool:
+    """True if an Excel number format displays its value as a percentage.
+
+    A '%' inside a quoted literal or escaped with a backslash is just text --
+    only a bare '%' makes Excel scale the stored value by 100.
+    """
+    if not fmt:
+        return False
+    stripped = re.sub(r'"[^"]*"', "", str(fmt))
+    stripped = re.sub(r"\\.", "", stripped)
+    return "%" in stripped
+
+
+def read_portfolio_excel(file_obj) -> pd.DataFrame:
+    """Read an uploaded portfolio workbook, honouring Excel percent formatting.
+
+    Excel stores a cell displaying 7.00% as 0.07, so the stored number alone
+    is ambiguous: 0.07 could mean 7% or 0.07%. The cell's number format says
+    which, and reading it means a cell holding 7 is always taken as 7 -- no
+    inference from column totals.
+    """
+    df = pd.read_excel(file_obj)
+    if df.empty:
+        return df
+
+    try:
+        file_obj.seek(0)
+        ws = openpyxl.load_workbook(file_obj, data_only=True).worksheets[0]
+    except Exception:
+        # .xls, or a workbook openpyxl cannot parse. Values stand as read.
+        return df
+
+    # Map each header to its column, then scale the columns Excel is
+    # displaying as percentages.
+    header_at = {}
+    for cell in ws[1]:
+        if cell.value is not None:
+            header_at.setdefault(str(cell.value).strip(), cell.column)
+
+    for col_name in df.columns:
+        col_idx = header_at.get(str(col_name).strip())
+        if col_idx is None or not pd.api.types.is_numeric_dtype(df[col_name]):
+            continue
+        formats = [
+            ws.cell(row=r, column=col_idx).number_format
+            for r in range(2, min(ws.max_row, len(df) + 1) + 1)
+            if isinstance(ws.cell(row=r, column=col_idx).value, (int, float))
+        ]
+        if formats and all(_is_percent_format(f) for f in formats):
+            # Round away the binary-float artifact: 0.07 * 100 is
+            # 7.000000000000001.
+            df[col_name] = (df[col_name] * 100.0).round(6)
+
+    return df
+
+
 def validate_and_normalize_portfolio(df_input: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], List[str]]:
-    """Validate user portfolio input and prepare normalized allocations.
-    
+    """Validate portfolio input and prepare normalized allocations.
+
     Returns (cleaned_df, warnings, errors).
     """
     warnings: List[str] = []
     errors: List[str] = []
 
-    if df_input.empty:
+    if df_input is None or df_input.empty:
         errors.append("Portfolio input is empty. Please enter schemes manually or upload an Excel file.")
         return pd.DataFrame(), warnings, errors
 
     df = df_input.copy()
 
-    # Column normalization
-    isin_col = None
-    name_col = None
-    alloc_col = None
-    bm_col = None
-
+    isin_col = name_col = alloc_col = bm_col = None
     for c in df.columns:
         c_low = str(c).lower().strip()
         if "isin" in c_low:
             isin_col = c
+        elif "bench" in c_low or c_low == "bm":
+            bm_col = c
+        elif "alloc" in c_low or "weight" in c_low or c_low == "wt" or "%" in c_low:
+            alloc_col = c
         elif "scheme" in c_low or "fund" in c_low or "name" in c_low:
             name_col = c
-        elif "alloc" in c_low or "weight" in c_low or "wt" in c_low or "%" in c_low:
-            alloc_col = c
-        elif "bench" in c_low or "bm" in c_low:
-            bm_col = c
 
     if not isin_col:
         errors.append("Missing required column 'ISIN' in input.")
@@ -136,7 +249,7 @@ def validate_and_normalize_portfolio(df_input: pd.DataFrame) -> Tuple[pd.DataFra
     clean_rows = []
     seen_isins = set()
 
-    for idx, row in df.iterrows():
+    for _, row in df.iterrows():
         isin = str(row.get(isin_col, "")).strip().upper()
         if not isin or isin in ("NAN", "NONE", "-"):
             continue
@@ -147,19 +260,18 @@ def validate_and_normalize_portfolio(df_input: pd.DataFrame) -> Tuple[pd.DataFra
         seen_isins.add(isin)
 
         name = str(row.get(name_col, isin)).strip() if name_col else isin
-        if not name or name in ("NAN", "NONE"):
+        if not name or name.upper() in ("NAN", "NONE"):
             name = isin
 
         alloc_raw = row.get(alloc_col, 0.0) if alloc_col else 0.0
         try:
-            alloc_str = str(alloc_raw).replace("%", "").strip()
-            alloc_val = float(alloc_str)
-        except Exception:
+            alloc_val = float(str(alloc_raw).replace("%", "").strip())
+        except (TypeError, ValueError):
             alloc_val = 0.0
 
-        bm_val = str(row.get(bm_col, "NIFTY 50")).strip() if bm_col else "NIFTY 50"
-        if not bm_val or bm_val in ("NAN", "NONE", "-"):
-            bm_val = "NIFTY 50"
+        bm_val = str(row.get(bm_col, DEFAULT_BENCHMARK)).strip() if bm_col else DEFAULT_BENCHMARK
+        if not bm_val or bm_val.upper() in ("NAN", "NONE", "-"):
+            bm_val = DEFAULT_BENCHMARK
 
         clean_rows.append({
             "Scheme Name": name,
@@ -174,7 +286,6 @@ def validate_and_normalize_portfolio(df_input: pd.DataFrame) -> Tuple[pd.DataFra
 
     res_df = pd.DataFrame(clean_rows)
 
-    # Check total allocation
     tot_alloc = res_df["Allocation (%)"].sum()
     if tot_alloc <= 0:
         warnings.append("Total allocation was 0%. Weights have been distributed equally.")
@@ -183,494 +294,848 @@ def validate_and_normalize_portfolio(df_input: pd.DataFrame) -> Tuple[pd.DataFra
 
     if abs(tot_alloc - 100.0) > 0.01:
         warnings.append(
-            f"Total allocation sum is {tot_alloc:.2f}% (not 100%). Weights have been automatically normalized."
+            f"Total allocation sum is {tot_alloc:.2f}% (not 100%). Weights have been normalized to 100%."
         )
 
     res_df["Normalized_Weight"] = res_df["Allocation (%)"] / tot_alloc
     return res_df, warnings, errors
 
 
-# ─── NAV & Benchmark Fetching Engine ──────────────────────────────────────────
+# ─── NAV Fetching ─────────────────────────────────────────────────────────────
 
-def fetch_mis_nav_history(
-    isin_list: List[str],
-    earliest_date: date,
-    end_date: date,
-) -> pd.DataFrame:
-    """Fetch complete historical NAVs for all ISINs from earliest_date to end_date.
-    
-    Includes live feed overlay for today's NAV if applicable.
+def fetch_mis_nav_history(isin_list: List[str], earliest_date: date,
+                          end_date: date) -> Tuple[pd.DataFrame, List[Tuple[date, date]]]:
+    """Fetch historical NAVs for all ISINs, overlaid with the live AMFI feed.
+
+    ``isin_list`` carries both the portfolio schemes and the benchmark proxy
+    funds so the whole report costs one pass over AMFI. include_direct is on
+    for the proxies' sake; an ISIN belongs to exactly one plan, so scheme rows
+    are unaffected.
+
+    Returns (frame, gaps) — gaps are date windows AMFI refused to serve, which
+    the caller must report rather than silently treat as "no NAVs existed".
     """
-    # Fetch 15 days earlier to cover holiday/weekend lookups
-    fetch_start = earliest_date - timedelta(days=15)
-    df_raw = fetch_amfi_data_chunked(fetch_start, end_date, isin_list)
+    fetch_start = earliest_date - timedelta(days=20)
+    df_raw, gaps = fetch_amfi_data_chunked(
+        fetch_start, end_date, isin_list, include_direct=True, return_gaps=True
+    )
     if df_raw.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), gaps
 
+    df_raw = df_raw.copy()
     df_raw["NAV Date"] = parse_amfi_date_series(df_raw["NAV Date"])
     df_raw = df_raw.dropna(subset=["NAV Date", "NAV"])
     df_raw["ISIN_G"] = df_raw["ISIN Div Payout / ISIN Growth"].astype(str).str.strip().str.upper()
     df_raw["ISIN_R"] = df_raw["ISIN Div Reinvestment"].astype(str).str.strip().str.upper()
     df_raw["NAV Date_Date"] = df_raw["NAV Date"].dt.date
 
-    # Overlay live feed
-    latest_live = fetch_latest_navs(isin_list)
-    if latest_live:
-        live_rows = []
-        for isin_u, info in latest_live.items():
-            parsed_iso = _parse_amfi_date_str(info["date"])
-            if parsed_iso:
-                l_dt = datetime.strptime(parsed_iso, "%Y-%m-%d").date()
-                live_rows.append({
-                    "ISIN_G": isin_u,
-                    "ISIN_R": isin_u,
-                    "Scheme Name": info.get("scheme_name", isin_u),
-                    "NAV": info["nav"],
-                    "NAV Date_Date": l_dt,
-                })
-        if live_rows:
-            df_live = pd.DataFrame(live_rows)
-            df_raw = pd.concat([df_raw, df_live], ignore_index=True)
+    latest_live = fetch_latest_navs(isin_list) or {}
+    live_rows = []
+    for isin_u, info in latest_live.items():
+        parsed_iso = _parse_amfi_date_str(info.get("date", ""))
+        if not parsed_iso:
+            continue
+        try:
+            l_dt = datetime.strptime(parsed_iso, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        # A stale-dated live record must not leak past the report's end date.
+        if l_dt > end_date:
+            continue
+        live_rows.append({
+            "ISIN_G": isin_u,
+            "ISIN_R": isin_u,
+            "Scheme Name": info.get("scheme_name", isin_u),
+            "NAV": info["nav"],
+            "NAV Date_Date": l_dt,
+            "NAV Date": pd.Timestamp(l_dt),
+        })
 
-    return df_raw
+    if live_rows:
+        df_raw = pd.concat([df_raw, pd.DataFrame(live_rows)], ignore_index=True)
 
-
-def get_asof_nav(
-    df_nav_raw: pd.DataFrame,
-    isin: str,
-    target_date: date
-) -> Optional[float]:
-    """Find the latest available NAV for an ISIN on or before target_date."""
-    isin_u = isin.strip().upper()
-    mask = (
-        (df_nav_raw["ISIN_G"] == isin_u) | (df_nav_raw["ISIN_R"] == isin_u)
-    ) & (df_nav_raw["NAV Date_Date"] <= target_date)
-
-    matched = df_nav_raw[mask].sort_values("NAV Date_Date", ascending=False)
-    if not matched.empty:
-        val = matched.iloc[0]["NAV"]
-        if pd.notna(val) and float(val) > 0:
-            return float(val)
-    return None
+    return df_raw, gaps
 
 
-def fetch_benchmark_series(
-    benchmark_names: List[str],
-    start_date: date,
-    end_date: date
-) -> Dict[str, Dict[date, float]]:
-    """Fetch daily price series for all required benchmark indices.
-    
-    Returns dict: {benchmark_name: {date_obj: close_price}}
+def build_nav_series(df_nav_raw: pd.DataFrame, isin_list: List[str]) -> Dict[str, Series]:
+    """Collapse the raw NAV frame into {ISIN: {date: nav}}."""
+    out: Dict[str, Series] = {i.strip().upper(): {} for i in isin_list}
+    if df_nav_raw.empty:
+        return out
+
+    wanted = set(out.keys())
+    for _, r in df_nav_raw.iterrows():
+        d = r.get("NAV Date_Date")
+        nav = r.get("NAV")
+        if d is None or pd.isna(d) or pd.isna(nav):
+            continue
+        try:
+            nav_f = float(nav)
+        except (TypeError, ValueError):
+            continue
+        if nav_f <= 0:
+            continue
+        for col in ("ISIN_G", "ISIN_R"):
+            isin = r.get(col)
+            if isin in wanted:
+                out[isin][d] = nav_f
+    return out
+
+
+# ─── Flows ────────────────────────────────────────────────────────────────────
+
+def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
+                         report_date: date, mtd_start: date,
+                         fy_start: date) -> Dict[str, Dict[str, Optional[float]]]:
+    """Net flows per ISIN, via the project's existing AUM engine.
+
+    Reuses populate_actual_aum + calculate_flows_for_dataframe from nav_fetcher
+    so the figures match what the rest of the app reports. Returns
+    {ISIN: {"day": ..., "mtd": ..., "ytd": ...}} in crores, where "day" is the
+    net flow on the report date and the other two are cumulative net flows over
+    the month-to-date and financial-year-to-date windows.
     """
-    fetch_start = start_date - timedelta(days=15)
-    benchmarks_data = {}
+    empty = {"day": None, "mtd": None, "ytd": None}
+    result: Dict[str, Dict[str, Optional[float]]] = {
+        i.strip().upper(): dict(empty) for i in isin_list
+    }
+    if df_nav_raw.empty or "Scheme Code" not in df_nav_raw.columns:
+        return result
 
-    for bm in set(benchmark_names):
-        bm_clean = bm.strip() if bm and str(bm).strip() else "NIFTY 50"
-        raw_map = fetch_nifty_data_series(bm_clean, fetch_start, end_date)
-        date_obj_map = {}
-        for k_str, val in raw_map.items():
-            try:
-                dt_o = datetime.strptime(k_str, "%d-%m-%Y").date()
-                date_obj_map[dt_o] = val
-            except Exception:
-                pass
-        benchmarks_data[bm_clean] = date_obj_map
+    # Flows accumulate day by day, so the whole FY-to-date window is needed —
+    # plus one earlier observation to seed the first day's prior AUM.
+    dates_present = sorted({d for d in df_nav_raw["NAV Date_Date"]
+                            if d is not None and d <= report_date})
+    if len(dates_present) < 2:
+        return result
 
-    return benchmarks_data
+    window_start = min(fy_start, mtd_start)
+    seed = [d for d in dates_present if d <= window_start]
+    keep = {d for d in dates_present if d > window_start}
+    if seed:
+        keep.add(max(seed))
+    if len(keep) < 2:
+        return result
+
+    df_slice = df_nav_raw[df_nav_raw["NAV Date_Date"].isin(keep)].copy()
+    df_slice = df_slice.dropna(subset=["Scheme Code"])
+    if df_slice.empty:
+        return result
+
+    try:
+        df_port = load_portfolio_aum_data()
+        df_aum = populate_actual_aum(df_slice, df_port, want_aum=True, fetch_live_aum=True)
+        df_flows = calculate_flows_for_dataframe(
+            df_aum,
+            min(keep),
+            ["Asset Class", "Scheme Code", "ISIN Div Payout / ISIN Growth",
+             "ISIN Div Reinvestment", "Scheme Name", "Plan Type", "Option Type"],
+        )
+    except Exception:
+        # Flows are supplementary; a failure here must not sink the whole report.
+        return result
+
+    if df_flows.empty or "Net flows on current day" not in df_flows.columns:
+        return result
+
+    for _, r in df_flows.iterrows():
+        flow = r.get("Net flows on current day")
+        if flow is None or pd.isna(flow):
+            continue
+        try:
+            d = datetime.strptime(str(r.get("NAV Date", "")).strip(), "%d-%m-%Y").date()
+        except ValueError:
+            continue
+        if d > report_date:
+            continue
+
+        for col in ("ISIN Div Payout / ISIN Growth", "ISIN Div Reinvestment"):
+            isin = str(r.get(col, "")).strip().upper()
+            if isin not in result:
+                continue
+            bucket = result[isin]
+            val = float(flow)
+            if d == report_date:
+                bucket["day"] = val
+            if d > mtd_start:
+                bucket["mtd"] = (bucket["mtd"] or 0.0) + val
+            if d > fy_start:
+                bucket["ytd"] = (bucket["ytd"] or 0.0) + val
+            break
+
+    return result
 
 
-def get_asof_benchmark_price(
-    bm_map: Dict[date, float],
-    target_date: date
-) -> Optional[float]:
-    """Find the latest available benchmark price on or before target_date."""
-    if not bm_map:
-        return None
-    valid_dates = [d for d in bm_map.keys() if d <= target_date]
-    if valid_dates:
-        latest_d = max(valid_dates)
-        return bm_map[latest_d]
-    return None
+# ─── Per-scheme metric computation ────────────────────────────────────────────
+
+# A one-day return may legitimately span a long weekend or a cluster of
+# holidays, but not much more. Beyond this the two observations are too far
+# apart to be called a daily move.
+MAX_DAILY_GAP_DAYS = 7
 
 
-# ─── Return & MIS Core Calculations ─────────────────────────────────────────
+def _scheme_metrics(series: Series, d_end: date, d_period_base: date,
+                    d_fy_base: date, d_mtd_base: date) -> Dict[str, Any]:
+    """All return figures for a single observation series."""
+    v_end, dt_end = value_asof(series, d_end)
+    v_prev, dt_prev = value_prev(series, dt_end) if dt_end else (None, None)
+    v_period, dt_period = value_asof(series, d_period_base)
+    v_fy, dt_fy = value_asof(series, d_fy_base)
+    v_mtd, dt_mtd = value_asof(series, d_mtd_base)
 
-def calc_return(end_val: Optional[float], start_val: Optional[float]) -> Optional[float]:
-    """Calculate non-annualized return %: ((end - start) / start) * 100."""
-    if end_val is not None and start_val is not None and start_val > 0:
-        return ((end_val - start_val) / start_val) * 100.0
-    return None
+    # Don't dress a multi-week move up as a daily one when the feed has a hole.
+    day_gap = (dt_end - dt_prev).days if (dt_end and dt_prev) else None
+    day_stale = day_gap is not None and day_gap > MAX_DAILY_GAP_DAYS
+    day_ret = None if day_stale else calc_return(v_end, v_prev)
+
+    return {
+        "nav_end": v_end, "date_end": dt_end,
+        "nav_prev": v_prev, "date_prev": dt_prev,
+        "day": day_ret,
+        "day_gap_days": day_gap,
+        "day_stale": day_stale,
+        "period": calc_return(v_end, v_period),
+        "fy": calc_return(v_end, v_fy),
+        "mtd": calc_return(v_end, v_mtd),
+        "date_period_base": dt_period,
+        "date_fy_base": dt_fy,
+        "date_mtd_base": dt_mtd,
+    }
+
+
+def _weighted(values: List[Optional[float]], weights: List[float]) -> Tuple[Optional[float], float]:
+    """Weighted average over entries that have a value.
+
+    Returns (weighted_average, covered_weight). Weights are renormalized across
+    the covered rows; covered_weight lets the caller flag partial coverage
+    rather than let a gap quietly inflate the remaining holdings.
+    """
+    pairs = []
+    for v, w in zip(values, weights):
+        vn, wn = _num(v), _num(w)
+        if vn is not None and wn is not None:
+            pairs.append((vn, wn))
+    covered = sum(w for _, w in pairs)
+    if not pairs or covered <= 0:
+        return None, 0.0
+    return sum(v * w for v, w in pairs) / covered, covered
+
+
+# ─── MIS report construction ──────────────────────────────────────────────────
+
+def _ordinal(n: int) -> str:
+    if 11 <= (n % 100) <= 13:
+        return f"{n}th"
+    return f"{n}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th') }"
+
+
+def _long_date(d: date) -> str:
+    return f"{_ordinal(d.day)} {d:%B %Y}"
+
+
+def _build_reports(portfolio_df: pd.DataFrame, nav_series: Dict[str, Series],
+                   bm_series: Dict[str, Any], flows: Dict[str, Optional[float]],
+                   d_end: date, d_start: date, d_fy: date, d_mtd: date,
+                   label: str) -> Dict[str, Any]:
+    """Assemble MIS 1, 2 and 3 for one portfolio."""
+    nifty = bm_series.get(NIFTY_KEY)
+    nifty_levels = nifty.levels if nifty is not None else {}
+    n_metrics = _scheme_metrics(nifty_levels, d_end, d_start, d_fy, d_mtd)
+
+    rows: List[Dict[str, Any]] = []
+    for _, r in portfolio_df.iterrows():
+        isin = str(r["ISIN"]).strip().upper()
+        sm = _scheme_metrics(nav_series.get(isin, {}), d_end, d_start, d_fy, d_mtd)
+
+        bm_name = r["Benchmark"]
+        bser = bm_series.get(bm_name)
+        bm_levels = bser.levels if bser is not None else {}
+        bm = _scheme_metrics(bm_levels, d_end, d_start, d_fy, d_mtd)
+
+        rows.append({
+            "Scheme Name": r["Scheme Name"],
+            "ISIN": isin,
+            "Benchmark": bm_name,
+            "Allocation": r["Allocation (%)"],
+            "Weight": r["Normalized_Weight"],
+            # day
+            "Day Scheme Return": sm["day"],
+            "Day Nifty Return": n_metrics["day"],
+            "Day Excess vs Nifty": _diff(sm["day"], n_metrics["day"]),
+            "Day Benchmark Return": bm["day"],
+            "Day Excess vs Benchmark": _diff(sm["day"], bm["day"]),
+            # period
+            "Period Scheme Return": sm["period"],
+            "Period Nifty Return": n_metrics["period"],
+            "Period Excess vs Nifty": _diff(sm["period"], n_metrics["period"]),
+            "Period Benchmark Return": bm["period"],
+            "Period Excess vs Benchmark": _diff(sm["period"], bm["period"]),
+            # FY / since 1 April
+            "FY Scheme Return": sm["fy"],
+            "FY Nifty Return": n_metrics["fy"],
+            "FY Excess vs Nifty": _diff(sm["fy"], n_metrics["fy"]),
+            "FY Benchmark Return": bm["fy"],
+            "FY Excess vs Benchmark": _diff(sm["fy"], bm["fy"]),
+            # Supplementary flow columns, in crores — these mirror the
+            # reference report, where MTD and YTD are cumulative net flows
+            # rather than returns.
+            "Flows": (flows.get(isin) or {}).get("day"),
+            "MTD": (flows.get(isin) or {}).get("mtd"),
+            "YTD": (flows.get(isin) or {}).get("ytd"),
+            # Return-based month/FY figures, kept for the detail frame.
+            "MTD Return": sm["mtd"],
+            # provenance
+            "_nav_date": sm["date_end"],
+            "_nav_prev_date": sm["date_prev"],
+            "_day_gap_days": sm["day_gap_days"],
+            "_day_stale": sm["day_stale"],
+            "_bm_status": bser.status if bser is not None else STATUS_NONE,
+        })
+
+    df = pd.DataFrame(rows)
+    weights = df["Weight"].tolist()
+
+    def wavg(col: str) -> Tuple[Optional[float], float]:
+        return _weighted(df[col].tolist(), weights)
+
+    p_day, cov_day = wavg("Day Scheme Return")
+    p_period, cov_period = wavg("Period Scheme Return")
+    p_fy, _ = wavg("FY Scheme Return")
+    b_day, _ = wavg("Day Benchmark Return")
+    b_period, _ = wavg("Period Benchmark Return")
+    b_fy, _ = wavg("FY Benchmark Return")
+
+    n_day, n_period, n_fy = n_metrics["day"], n_metrics["period"], n_metrics["fy"]
+
+    day_label = _long_date(d_end)
+    period_label = f"{_long_date(d_start)} - {_long_date(d_end)}"
+    fy_label = f"{d_fy:%b'%y}"
+
+    # ── MIS 1 ────────────────────────────────────────────────────────────────
+    mis1_cols = [
+        "S.No", "Scheme Name", "ISIN", "Allocation",
+        "Day Scheme Return", "Day Nifty Return", "Day Excess vs Nifty",
+        "Period Scheme Return", "Period Nifty Return", "Period Excess vs Nifty",
+        "Flows", "MTD", "YTD",
+    ]
+    mis1 = df.sort_values("Period Excess vs Nifty", ascending=False, na_position="last").reset_index(drop=True)
+    mis1.insert(0, "S.No", range(1, len(mis1) + 1))
+
+    mis1_spec = {
+        "title": f"{label} — Performance w.r.t Nifty 50",
+        "columns": mis1_cols,
+        "headers": {
+            "S.No": "S.No", "Scheme Name": "Scheme Name", "ISIN": "ISIN",
+            "Allocation": "Allocation",
+            "Day Scheme Return": "Scheme Return in %",
+            "Day Nifty Return": "Return-Nifty 50",
+            "Day Excess vs Nifty": "Excess Return Over Nifty 50",
+            "Period Scheme Return": "Scheme Return in %",
+            "Period Nifty Return": "Return-Nifty 50",
+            "Period Excess vs Nifty": "Excess Return Over Nifty 50",
+            "Flows": f"Flows- {_long_date(d_end)}",
+            "MTD": f"MTD- {d_end:%B'%y}",
+            "YTD": f"YTD ({_ordinal(d_fy.day)} {d_fy:%B'%y} to {_ordinal(d_end.day)} {d_end:%B'%y})",
+        },
+        # Flows/MTD/YTD are rupee amounts in crores, not percentages.
+        "bands": [
+            ("", ["S.No", "Scheme Name", "ISIN", "Allocation"]),
+            (f"For the day {day_label}", ["Day Scheme Return", "Day Nifty Return", "Day Excess vs Nifty"]),
+            (f"For the Period {period_label}", ["Period Scheme Return", "Period Nifty Return", "Period Excess vs Nifty"]),
+            ("", ["Flows", "MTD", "YTD"]),
+        ],
+        "rows": mis1[mis1_cols],
+        "pct_cols": ["Day Scheme Return", "Day Nifty Return", "Day Excess vs Nifty",
+                     "Period Scheme Return", "Period Nifty Return", "Period Excess vs Nifty"],
+        "alloc_cols": ["Allocation"],
+        "num_cols": ["Flows", "MTD", "YTD"],
+        "colour_cols": ["Day Excess vs Nifty", "Period Excess vs Nifty", "Flows", "MTD", "YTD"],
+        "footers": [
+            ("day", "Weighted Average Daily Portfolio Return", p_day, False),
+            ("day", "Nifty's Daily Return", n_day, False),
+            ("day", "Excess Return", _diff(p_day, n_day), True),
+            ("period", "Weighted Average Portfolio Return", p_period, False),
+            ("period", "Nifty's Return", n_period, False),
+            ("period", "Excess Return", _diff(p_period, n_period), True),
+            ("period", f"Excess Return ( since 1st April'{d_fy:%y} )", _diff(p_fy, n_fy), True),
+        ],
+    }
+
+    # ── MIS 2 ────────────────────────────────────────────────────────────────
+    mis2_cols = [
+        "S.No", "Scheme Name", "ISIN", "Benchmark", "Allocation",
+        "Day Scheme Return", "Day Benchmark Return", "Day Excess vs Benchmark",
+        "Period Scheme Return", "Period Benchmark Return", "Period Excess vs Benchmark",
+    ]
+    mis2 = df.sort_values("Period Excess vs Benchmark", ascending=False, na_position="last").reset_index(drop=True)
+    mis2.insert(0, "S.No", range(1, len(mis2) + 1))
+
+    mis2_spec = {
+        "title": f"{label} — Performance w.r.t Own Benchmark",
+        "columns": mis2_cols,
+        "headers": {
+            "S.No": "S.No", "Scheme Name": "Scheme Name", "ISIN": "ISIN",
+            "Benchmark": "Benchmark", "Allocation": "Allocation",
+            "Day Scheme Return": "Scheme Return in %",
+            "Day Benchmark Return": "Return-Own Benchmark",
+            "Day Excess vs Benchmark": "Excess Return Over Own Benchmark",
+            "Period Scheme Return": "Scheme Return in %",
+            "Period Benchmark Return": "Return-Own Benchmark",
+            "Period Excess vs Benchmark": "Excess Return Over Own Benchmark",
+        },
+        "bands": [
+            ("", ["S.No", "Scheme Name", "ISIN", "Benchmark", "Allocation"]),
+            (f"For the day {day_label}", ["Day Scheme Return", "Day Benchmark Return", "Day Excess vs Benchmark"]),
+            (f"For the Period {period_label}", ["Period Scheme Return", "Period Benchmark Return", "Period Excess vs Benchmark"]),
+        ],
+        "rows": mis2[mis2_cols],
+        "pct_cols": ["Day Scheme Return", "Day Benchmark Return", "Day Excess vs Benchmark",
+                     "Period Scheme Return", "Period Benchmark Return", "Period Excess vs Benchmark"],
+        "alloc_cols": ["Allocation"],
+        "num_cols": [],
+        "colour_cols": ["Day Excess vs Benchmark", "Period Excess vs Benchmark"],
+        "footers": [
+            ("day", "Weighted Average Daily Portfolio Return", p_day, False),
+            ("day", "Weighted Average Daily Benchmark Return", b_day, False),
+            ("day", "Excess Return", _diff(p_day, b_day), True),
+            ("period", "Weighted Average Portfolio Return", p_period, False),
+            ("period", "Weighted Average Benchmark Return", b_period, False),
+            ("period", "Excess Return", _diff(p_period, b_period), True),
+            ("period", f"Excess Return ( since 1st April'{d_fy:%y} )", _diff(p_fy, b_fy), True),
+        ],
+    }
+
+    # ── MIS 3 ────────────────────────────────────────────────────────────────
+    mis3_cols = [
+        "Scheme Name", "ISIN", "Allocation", "Benchmark",
+        "FY Scheme Return", "FY Nifty Return", "FY Excess vs Nifty",
+        "FY Benchmark Return", "FY Excess vs Benchmark",
+    ]
+    mis3 = df.sort_values("FY Excess vs Nifty", ascending=False, na_position="last").reset_index(drop=True)
+
+    fy_range = f"{_ordinal(d_fy.day)} {d_fy:%B %Y} - {_long_date(d_end)}"
+    mis3_spec = {
+        "title": f"{label} — Performance since {_ordinal(d_fy.day)} {d_fy:%B %Y}",
+        "columns": mis3_cols,
+        "headers": {
+            "Scheme Name": "Scheme Name", "ISIN": "ISIN",
+            "Allocation": "New allocation", "Benchmark": "Benchmark",
+            "FY Scheme Return": "Scheme Return",
+            "FY Nifty Return": "Nifty",
+            "FY Excess vs Nifty": "Excess Return over Nifty",
+            "FY Benchmark Return": "Benchmark Return",
+            "FY Excess vs Benchmark": "Excess Return over Benchmark",
+        },
+        "bands": [
+            ("", ["Scheme Name", "ISIN", "Allocation", "Benchmark"]),
+            (fy_range, ["FY Scheme Return", "FY Nifty Return", "FY Excess vs Nifty"]),
+            (fy_range + " ", ["FY Benchmark Return", "FY Excess vs Benchmark"]),
+        ],
+        "rows": mis3[mis3_cols],
+        "pct_cols": ["FY Scheme Return", "FY Nifty Return", "FY Excess vs Nifty",
+                     "FY Benchmark Return", "FY Excess vs Benchmark"],
+        "alloc_cols": ["Allocation"],
+        "num_cols": [],
+        "colour_cols": ["FY Excess vs Nifty", "FY Excess vs Benchmark"],
+        "total_row": {
+            "Scheme Name": "Portfolio weighted average",
+            "ISIN": "", "Allocation": df["Allocation"].sum(), "Benchmark": "",
+            "FY Scheme Return": p_fy,
+            "FY Nifty Return": n_fy,
+            "FY Excess vs Nifty": _diff(p_fy, n_fy),
+            "FY Benchmark Return": b_fy,
+            "FY Excess vs Benchmark": _diff(p_fy, b_fy),
+        },
+        "footers": [],
+    }
+
+    coverage_warnings = []
+
+    if n_metrics["day_stale"]:
+        coverage_warnings.append(
+            f"{label}: the latest Nifty 50 observation ({n_metrics['date_end']:%d-%b-%Y}) and the one "
+            f"before it are {n_metrics['day_gap_days']} days apart, so no genuine one-day return exists. "
+            f"The 'for the day' columns show N/A rather than a multi-day move."
+        )
+
+    stale_rows = df.loc[df["_day_stale"], "Scheme Name"].tolist()
+    if stale_rows:
+        coverage_warnings.append(
+            f"{label}: NAV history has a hole before the report date for {', '.join(stale_rows)}, so their "
+            f"one-day returns show N/A instead of a multi-day move mislabelled as daily."
+        )
+
+    if cov_day < 0.9999:
+        missing = df.loc[df["Day Scheme Return"].isna(), "Scheme Name"].tolist()
+        coverage_warnings.append(
+            f"{label}: daily return covers {cov_day * 100:.1f}% of allocation. "
+            f"No NAV move available for: {', '.join(missing)}. Weights were renormalized over the rest."
+        )
+    if cov_period < 0.9999:
+        missing = df.loc[df["Period Scheme Return"].isna(), "Scheme Name"].tolist()
+        coverage_warnings.append(
+            f"{label}: period return covers {cov_period * 100:.1f}% of allocation. "
+            f"No NAV history available for: {', '.join(missing)}. Weights were renormalized over the rest."
+        )
+
+    return {
+        "label": label,
+        "mis1": mis1_spec,
+        "mis2": mis2_spec,
+        "mis3": mis3_spec,
+        "detail": df,
+        "warnings": coverage_warnings,
+    }
 
 
 def generate_mis_reports_data(
     portfolio_df: pd.DataFrame,
     start_date: date,
-    end_date: date
+    end_date: date,
+    previous_portfolio_df: Optional[pd.DataFrame] = None,
+    include_flows: bool = False,
 ) -> Dict[str, Any]:
-    """Calculate all returns, excess returns, and weighted portfolio metrics for MIS 1, 2 & 3.
-    
-    Returns a dictionary containing MIS dataframes and executive summary statistics.
-    """
-    # 1. Determine key baseline dates
+    """Build the full MIS pack for one (optionally two) portfolios."""
     d_end = end_date
     d_start = start_date
-    d_daily_base = get_daily_baseline_date(end_date)
-    d_monthly_base = get_monthly_baseline_date(end_date)
-    d_mtd_base = get_mtd_start_date(end_date)
-    d_ytd_base = get_ytd_start_date(end_date)
-    d_fy_base = get_fy_start_date(end_date)
+    d_fy = get_fy_start_date(end_date)
+    d_mtd = get_mtd_start_date(end_date)
+    earliest = min(d_start, d_fy, d_mtd, d_end - timedelta(days=10))
 
-    earliest_date = min(d_start, d_daily_base, d_monthly_base, d_mtd_base, d_ytd_base, d_fy_base)
+    frames = [portfolio_df]
+    if previous_portfolio_df is not None and not previous_portfolio_df.empty:
+        frames.append(previous_portfolio_df)
 
-    # 2. Fetch raw NAVs and Benchmark series
-    isins = portfolio_df["ISIN"].tolist()
-    df_nav_raw = fetch_mis_nav_history(isins, earliest_date, end_date)
+    all_isins = sorted({str(i).strip().upper() for f in frames for i in f["ISIN"]})
+    all_benchmarks = sorted({str(b).strip() for f in frames for b in f["Benchmark"]})
+    if NIFTY_KEY not in all_benchmarks:
+        all_benchmarks.append(NIFTY_KEY)
 
+    # One AMFI pass covers both the schemes and the benchmark proxy funds.
+    proxy_isins = required_proxy_isins(all_benchmarks)
+    fetch_isins = list(dict.fromkeys(all_isins + proxy_isins))
+
+    df_nav_raw, nav_gaps = fetch_mis_nav_history(fetch_isins, earliest, d_end)
     if df_nav_raw.empty:
-        raise ValueError("Could not fetch historical NAV data for the entered portfolio ISINs.")
+        raise ValueError(
+            "AMFI returned no NAV history for the portfolio ISINs. Check the ISINs and the date range."
+        )
 
-    bm_list = portfolio_df["Benchmark"].tolist() + ["NIFTY 50"]
-    benchmarks_data = fetch_benchmark_series(bm_list, earliest_date, end_date)
-    nifty50_map = benchmarks_data.get("NIFTY 50", {})
+    nav_series = build_nav_series(df_nav_raw, all_isins)
 
-    # Nifty 50 baseline prices
-    nifty_nav_end = get_asof_benchmark_price(nifty50_map, d_end)
-    nifty_nav_daily_base = get_asof_benchmark_price(nifty50_map, d_daily_base)
-    nifty_nav_period_base = get_asof_benchmark_price(nifty50_map, d_start)
-    nifty_nav_fy_base = get_asof_benchmark_price(nifty50_map, d_fy_base)
+    missing_navs = [i for i, s in nav_series.items() if not s]
+    if len(missing_navs) == len(all_isins):
+        raise ValueError(
+            "None of the portfolio ISINs matched an AMFI record. Check that the ISINs are correct "
+            "and that the date range covers dates on which these schemes reported a NAV."
+        )
 
-    nifty_daily_ret = calc_return(nifty_nav_end, nifty_nav_daily_base)
-    nifty_period_ret = calc_return(nifty_nav_end, nifty_nav_period_base)
-    nifty_fy_ret = calc_return(nifty_nav_end, nifty_nav_fy_base)
+    proxy_series = nav_frame_to_isin_series(df_nav_raw)
+    proxy_series = overlay_live_navs(proxy_series, proxy_isins, d_end)
+    bm_series = build_benchmark_series(all_benchmarks, proxy_series, earliest, describe_gaps(nav_gaps))
 
-    # 3. Calculate per-scheme metrics
-    mis1_rows = []
-    mis2_rows = []
-    mis3_rows = []
-
-    for _, row in portfolio_df.iterrows():
-        name = row["Scheme Name"]
-        isin = row["ISIN"]
-        alloc = row["Allocation (%)"]
-        weight = row["Normalized_Weight"]
-        bm_name = row["Benchmark"]
-
-        # As-of NAVs for scheme
-        nav_end = get_asof_nav(df_nav_raw, isin, d_end)
-        nav_daily_base = get_asof_nav(df_nav_raw, isin, d_daily_base)
-        nav_period_base = get_asof_nav(df_nav_raw, isin, d_start)
-        nav_fy_base = get_asof_nav(df_nav_raw, isin, d_fy_base)
-
-        # Scheme returns
-        sch_daily_ret = calc_return(nav_end, nav_daily_base)
-        sch_period_ret = calc_return(nav_end, nav_period_base)
-        sch_fy_ret = calc_return(nav_end, nav_fy_base)
-
-        # Benchmark prices & returns
-        bm_map = benchmarks_data.get(bm_name, nifty50_map)
-        bm_nav_end = get_asof_benchmark_price(bm_map, d_end)
-        bm_nav_period_base = get_asof_benchmark_price(bm_map, d_start)
-        bm_nav_fy_base = get_asof_benchmark_price(bm_map, d_fy_base)
-
-        bm_period_ret = calc_return(bm_nav_end, bm_nav_period_base)
-        bm_fy_ret = calc_return(bm_nav_end, bm_nav_fy_base)
-
-        # --- MIS 1 (Portfolio vs Nifty) ---
-        daily_excess_nifty = (sch_daily_ret - nifty_daily_ret) if (sch_daily_ret is not None and nifty_daily_ret is not None) else None
-        period_excess_nifty = (sch_period_ret - nifty_period_ret) if (sch_period_ret is not None and nifty_period_ret is not None) else None
-
-        mis1_rows.append({
-            "Scheme Name": name,
-            "ISIN": isin,
-            "Allocation (%)": alloc,
-            "Normalized_Weight": weight,
-            "Daily Return (%)": sch_daily_ret,
-            "Nifty Daily Return (%)": nifty_daily_ret,
-            "Daily Excess (%)": daily_excess_nifty,
-            "Period Return (%)": sch_period_ret,
-            "Nifty Period Return (%)": nifty_period_ret,
-            "Period Excess (%)": period_excess_nifty,
-        })
-
-        # --- MIS 2 (Portfolio vs Individual Benchmark) ---
-        period_excess_bm = (sch_period_ret - bm_period_ret) if (sch_period_ret is not None and bm_period_ret is not None) else None
-
-        mis2_rows.append({
-            "Scheme Name": name,
-            "ISIN": isin,
-            "Allocation (%)": alloc,
-            "Normalized_Weight": weight,
-            "Benchmark": bm_name,
-            "Period Return (%)": sch_period_ret,
-            "Benchmark Return (%)": bm_period_ret,
-            "Excess Return (%)": period_excess_bm,
-        })
-
-        # --- MIS 3 (Performance Since FY Start - 1 April) ---
-        excess_over_bm_fy = (sch_fy_ret - bm_fy_ret) if (sch_fy_ret is not None and bm_fy_ret is not None) else None
-        excess_over_nifty_fy = (sch_fy_ret - nifty_fy_ret) if (sch_fy_ret is not None and nifty_fy_ret is not None) else None
-
-        mis3_rows.append({
-            "Scheme Name": name,
-            "ISIN": isin,
-            "Allocation (%)": alloc,
-            "Normalized_Weight": weight,
-            "Scheme Return (%)": sch_fy_ret,
-            "Benchmark Return (%)": bm_fy_ret,
-            "Nifty Return (%)": nifty_fy_ret,
-            "Excess over Benchmark (%)": excess_over_bm_fy,
-            "Excess over Nifty (%)": excess_over_nifty_fy,
-        })
-
-    df_mis1 = pd.DataFrame(mis1_rows)
-    df_mis2 = pd.DataFrame(mis2_rows)
-    df_mis3 = pd.DataFrame(mis3_rows)
-
-    # 4. Weighted Portfolio Totals
-    def weighted_sum(series: pd.Series, weights: pd.Series) -> Optional[float]:
-        valid_mask = series.notna() & weights.notna()
-        if not valid_mask.any():
-            return None
-        w_sub = weights[valid_mask]
-        s_sub = series[valid_mask]
-        norm_w = w_sub / w_sub.sum()
-        return (s_sub * norm_w).sum()
-
-    # MIS 1 Summary Totals
-    w_sch_daily = weighted_sum(df_mis1["Daily Return (%)"], df_mis1["Normalized_Weight"])
-    w_nifty_daily = nifty_daily_ret
-    w_daily_excess = (w_sch_daily - w_nifty_daily) if (w_sch_daily is not None and w_nifty_daily is not None) else None
-
-    w_sch_period = weighted_sum(df_mis1["Period Return (%)"], df_mis1["Normalized_Weight"])
-    w_nifty_period = nifty_period_ret
-    w_period_excess = (w_sch_period - w_nifty_period) if (w_sch_period is not None and w_nifty_period is not None) else None
-
-    mis1_summary = {
-        "Scheme Name": "PORTFOLIO WEIGHTED TOTAL",
-        "ISIN": "-",
-        "Allocation (%)": df_mis1["Allocation (%)"].sum(),
-        "Daily Return (%)": w_sch_daily,
-        "Nifty Daily Return (%)": w_nifty_daily,
-        "Daily Excess (%)": w_daily_excess,
-        "Period Return (%)": w_sch_period,
-        "Nifty Period Return (%)": w_nifty_period,
-        "Period Excess (%)": w_period_excess,
+    flows: Dict[str, Dict[str, Optional[float]]] = {
+        i: {"day": None, "mtd": None, "ytd": None} for i in all_isins
     }
+    if include_flows:
+        flows = compute_scheme_flows(df_nav_raw, all_isins, d_end, d_mtd, d_fy)
 
-    # MIS 2 Summary Totals
-    w_bm_period = weighted_sum(df_mis2["Benchmark Return (%)"], df_mis2["Normalized_Weight"])
-    w_excess_bm = (w_sch_period - w_bm_period) if (w_sch_period is not None and w_bm_period is not None) else None
+    current = _build_reports(portfolio_df, nav_series, bm_series, flows,
+                             d_end, d_start, d_fy, d_mtd, "14 Fund AR Model Portfolio")
 
-    mis2_summary = {
-        "Scheme Name": "PORTFOLIO WEIGHTED TOTAL",
-        "ISIN": "-",
-        "Allocation (%)": df_mis2["Allocation (%)"].sum(),
-        "Benchmark": "Weighted Benchmarks",
-        "Period Return (%)": w_sch_period,
-        "Benchmark Return (%)": w_bm_period,
-        "Excess Return (%)": w_excess_bm,
-    }
+    previous = None
+    if previous_portfolio_df is not None and not previous_portfolio_df.empty:
+        previous = _build_reports(previous_portfolio_df, nav_series, bm_series, flows,
+                                  d_end, d_start, d_fy, d_mtd, "Previous 14 Fund AR Model Portfolio")
 
-    # MIS 3 Summary Totals
-    w_sch_fy = weighted_sum(df_mis3["Scheme Return (%)"], df_mis3["Normalized_Weight"])
-    w_bm_fy = weighted_sum(df_mis3["Benchmark Return (%)"], df_mis3["Normalized_Weight"])
-    w_nifty_fy = nifty_fy_ret
-    w_excess_bm_fy = (w_sch_fy - w_bm_fy) if (w_sch_fy is not None and w_bm_fy is not None) else None
-    w_excess_nifty_fy = (w_sch_fy - w_nifty_fy) if (w_sch_fy is not None and w_nifty_fy is not None) else None
+    warnings: List[str] = list(current["warnings"])
+    if previous:
+        warnings.extend(previous["warnings"])
 
-    mis3_summary = {
-        "Scheme Name": "PORTFOLIO WEIGHTED TOTAL",
-        "ISIN": "-",
-        "Allocation (%)": df_mis3["Allocation (%)"].sum(),
-        "Scheme Return (%)": w_sch_fy,
-        "Benchmark Return (%)": w_bm_fy,
-        "Nifty Return (%)": w_nifty_fy,
-        "Excess over Benchmark (%)": w_excess_bm_fy,
-        "Excess over Nifty (%)": w_excess_nifty_fy,
-    }
+    if missing_navs:
+        warnings.append(
+            "No AMFI NAV history found for these ISINs (shown as N/A): " + ", ".join(missing_navs)
+        )
+
+    if nav_gaps:
+        spans = ", ".join(f"{a:%d-%b-%Y} to {b:%d-%b-%Y}" for a, b in nav_gaps)
+        warnings.append(
+            f"AMFI did not serve NAV history for {spans}. Returns whose baseline falls in those windows "
+            f"are measured from the nearest earlier NAV instead — re-run in a few minutes for complete data."
+        )
+
+    approx = [s.requested for s in bm_series.values() if s.status == STATUS_APPROX]
+    if approx:
+        warnings.append(
+            "These benchmarks have no matching index fund, so the closest available index was used as a "
+            "stand-in — treat their excess returns as indicative: " + ", ".join(approx)
+        )
+
+    unavailable = [s.requested for s in bm_series.values() if s.status == STATUS_NONE]
+    if unavailable:
+        warnings.append(
+            "No index data could be sourced for these benchmarks; their columns show N/A: "
+            + ", ".join(unavailable)
+        )
 
     return {
-        "mis1": df_mis1,
-        "mis1_summary": mis1_summary,
-        "mis2": df_mis2,
-        "mis2_summary": mis2_summary,
-        "mis3": df_mis3,
-        "mis3_summary": mis3_summary,
+        "current": current,
+        "previous": previous,
+        "benchmark_report": describe_resolution(bm_series),
+        "warnings": warnings,
         "dates": {
             "start_date": d_start,
             "end_date": d_end,
-            "fy_start": d_fy_base,
+            "fy_start": d_fy,
+            "mtd_start": d_mtd,
         },
+        "include_flows": include_flows,
     }
 
 
 # ─── Excel Workbook Export Engine ─────────────────────────────────────────────
 
+FONT = "Segoe UI"
+GREEN_FILL = PatternFill("solid", fgColor="92D050")
+RED_FILL = PatternFill("solid", fgColor="FF0000")
+HEADER_FILL = PatternFill("solid", fgColor="D9D9D9")
+BAND_FILL = PatternFill("solid", fgColor="FFFFFF")
+TITLE_FILL = PatternFill("solid", fgColor="FCE4D6")
+
+THIN = Side(style="thin", color="000000")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+
+ALIGN_C = Alignment(horizontal="center", vertical="center", wrap_text=True)
+ALIGN_L = Alignment(horizontal="left", vertical="center")
+ALIGN_R = Alignment(horizontal="center", vertical="center")
+
+
+def _write_mis_block(ws, spec: Dict[str, Any], start_row: int) -> int:
+    """Write one MIS table (band header, column header, rows, footers).
+
+    Returns the next free row.
+    """
+    cols = spec["columns"]
+    headers = spec["headers"]
+    bands = spec["bands"]
+    df = spec["rows"]
+    pct = set(spec.get("pct_cols", []))
+    alloc = set(spec.get("alloc_cols", []))
+    nums = set(spec.get("num_cols", []))
+    colour = set(spec.get("colour_cols", []))
+
+    col_index = {c: i + 1 for i, c in enumerate(cols)}
+
+    band_row = start_row
+    head_row = start_row + 1
+
+    # Band header: the merged "For the day …" / "For the Period …" captions.
+    for caption, band_cols in bands:
+        first = col_index[band_cols[0]]
+        last = col_index[band_cols[-1]]
+        if last > first:
+            ws.merge_cells(start_row=band_row, start_column=first, end_row=band_row, end_column=last)
+        cell = ws.cell(row=band_row, column=first, value=caption.strip() or None)
+        cell.font = Font(name=FONT, size=10, bold=True)
+        cell.alignment = ALIGN_C
+        if caption.strip():
+            cell.fill = HEADER_FILL
+        for c in range(first, last + 1):
+            ws.cell(row=band_row, column=c).border = BORDER
+
+    # The leading identity band carries the report title.
+    title_first = col_index[bands[0][1][0]]
+    title_last = col_index[bands[0][1][-1]]
+    ws.merge_cells(start_row=band_row, start_column=title_first, end_row=band_row, end_column=title_last)
+    tcell = ws.cell(row=band_row, column=title_first, value=spec["title"])
+    tcell.font = Font(name=FONT, size=10, bold=True)
+    tcell.alignment = ALIGN_C
+    tcell.fill = TITLE_FILL
+
+    ws.row_dimensions[band_row].height = 24
+    ws.row_dimensions[head_row].height = 42
+
+    for c in cols:
+        cell = ws.cell(row=head_row, column=col_index[c], value=headers[c])
+        cell.font = Font(name=FONT, size=9, bold=True)
+        cell.fill = HEADER_FILL
+        cell.alignment = ALIGN_C
+        cell.border = BORDER
+
+    r = head_row + 1
+    for _, row in df.iterrows():
+        for c in cols:
+            val = row.get(c)
+            cell = ws.cell(row=r, column=col_index[c])
+
+            if c in pct or c in nums:
+                if val is None or pd.isna(val):
+                    cell.value = "N/A"
+                    cell.alignment = ALIGN_R
+                else:
+                    cell.value = round(float(val), 2)
+                    cell.number_format = "0.00"
+                    cell.alignment = ALIGN_R
+                    if c in colour:
+                        cell.fill = GREEN_FILL if float(val) >= 0 else RED_FILL
+            elif c in alloc:
+                cell.value = (float(val) / 100.0) if pd.notna(val) else 0.0
+                cell.number_format = "0.00%"
+                cell.alignment = ALIGN_R
+            elif c == "S.No":
+                cell.value = int(val)
+                cell.alignment = ALIGN_R
+            else:
+                cell.value = str(val) if pd.notna(val) else ""
+                cell.alignment = ALIGN_L
+
+            cell.font = Font(name=FONT, size=9)
+            cell.border = BORDER
+        ws.row_dimensions[r].height = 16
+        r += 1
+
+    # Optional total row (MIS 3 renders its portfolio average inline).
+    total = spec.get("total_row")
+    if total:
+        for c in cols:
+            val = total.get(c)
+            cell = ws.cell(row=r, column=col_index[c])
+            if c in pct or c in nums:
+                if val is None or pd.isna(val):
+                    cell.value = "N/A"
+                else:
+                    cell.value = round(float(val), 2)
+                    cell.number_format = "0.00"
+                    if c in colour:
+                        cell.fill = GREEN_FILL if float(val) >= 0 else RED_FILL
+                cell.alignment = ALIGN_R
+            elif c in alloc:
+                cell.value = (float(val) / 100.0) if val not in (None, "") and pd.notna(val) else None
+                cell.number_format = "0.00%"
+                cell.alignment = ALIGN_R
+            else:
+                cell.value = str(val) if val not in (None, "") else ""
+                cell.alignment = ALIGN_L
+            cell.font = Font(name=FONT, size=10, bold=True)
+            cell.border = BORDER
+        ws.row_dimensions[r].height = 26
+        r += 1
+
+    # Footers sit under the band they summarise, label then value.
+    band_by_key = {}
+    for caption, band_cols in bands:
+        if caption.lower().startswith("for the day"):
+            band_by_key["day"] = band_cols
+        elif caption.lower().startswith("for the period"):
+            band_by_key["period"] = band_cols
+
+    if spec.get("footers"):
+        r += 1
+        offsets = {"day": 0, "period": 0}
+        base_row = r
+        for band_key, label, value, coloured in spec["footers"]:
+            band_cols = band_by_key.get(band_key)
+            if not band_cols:
+                continue
+            row_i = base_row + offsets[band_key]
+            offsets[band_key] += 1
+
+            lab_c = col_index[band_cols[0]]
+            val_first = col_index[band_cols[1]]
+            val_last = col_index[band_cols[-1]]
+
+            lcell = ws.cell(row=row_i, column=lab_c, value=label)
+            lcell.font = Font(name=FONT, size=9, bold=True)
+            lcell.alignment = ALIGN_C
+            lcell.border = BORDER
+
+            if val_last > val_first:
+                ws.merge_cells(start_row=row_i, start_column=val_first, end_row=row_i, end_column=val_last)
+            vcell = ws.cell(row=row_i, column=val_first)
+            if value is None or pd.isna(value):
+                vcell.value = "N/A"
+            else:
+                vcell.value = round(float(value), 2)
+                vcell.number_format = "0.00"
+                if coloured:
+                    vcell.fill = GREEN_FILL if float(value) >= 0 else RED_FILL
+            vcell.font = Font(name=FONT, size=9, bold=True)
+            vcell.alignment = ALIGN_C
+            for c in range(val_first, val_last + 1):
+                ws.cell(row=row_i, column=c).border = BORDER
+            ws.row_dimensions[row_i].height = 30
+
+        r = base_row + max(offsets.values() or [0])
+
+    return r + 2
+
+
+def _autosize(ws, specs: List[Dict[str, Any]]):
+    widths: Dict[int, int] = {}
+    for spec in specs:
+        for i, c in enumerate(spec["columns"], 1):
+            hdr = spec["headers"][c]
+            base = 34 if c == "Scheme Name" else (30 if c == "Benchmark" else 14)
+            widths[i] = max(widths.get(i, 10), min(max(len(hdr) // 2 + 6, base), 40))
+    for i, w in widths.items():
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+
 def export_mis_to_excel(mis_data: Dict[str, Any]) -> bytes:
-    """Generate a corporate-styled Excel workbook containing Executive Summary, MIS 1, MIS 2, and MIS 3 tabs."""
+    """Excel workbook with one sheet per MIS, laid out like the reference report."""
     wb = openpyxl.Workbook()
-    # Remove default sheet
     wb.remove(wb.active)
 
-    font_family = "Segoe UI"
-    title_font = Font(name=font_family, size=14, bold=True, color="1F497D")
-    meta_label_font = Font(name=font_family, size=10, bold=True, color="555555")
-    meta_val_font = Font(name=font_family, size=10, color="000000")
+    current = mis_data["current"]
+    previous = mis_data.get("previous")
 
-    header_fill_dark = PatternFill("solid", fgColor="1F497D")  # Dark Blue
-    header_fill_green = PatternFill("solid", fgColor="145A32") # Dark Emerald
-    header_fill_gold = PatternFill("solid", fgColor="7D5A1F")  # Gold/Bronze
-    summary_fill = PatternFill("solid", fgColor="D9E1F2")      # Light Blue Accent
+    sheet_defs = [
+        ("MIS 1", "mis1", "MIS 1 : Performance of Funds w.r.t Nifty"),
+        ("MIS 2", "mis2", "MIS 2 : Performance of Funds w.r.t Benchmark"),
+        ("MIS 3", "mis3", "Performance of fund basket since financial year start"),
+    ]
 
-    header_font = Font(name=font_family, size=11, bold=True, color="FFFFFF")
-    data_font = Font(name=font_family, size=10)
-    summary_font = Font(name=font_family, size=10, bold=True)
+    for sheet_name, key, caption in sheet_defs:
+        ws = wb.create_sheet(title=sheet_name)
+        ws.sheet_view.showGridLines = False
 
-    even_fill = PatternFill("solid", fgColor="F9FAFB")
-    odd_fill = PatternFill("solid", fgColor="FFFFFF")
+        specs = [current[key]]
+        if previous:
+            specs.append(previous[key])
 
-    border_thin = Border(
-        left=Side(style="thin", color="D3D3D3"),
-        right=Side(style="thin", color="D3D3D3"),
-        top=Side(style="thin", color="D3D3D3"),
-        bottom=Side(style="thin", color="D3D3D3"),
-    )
+        row = 2
+        for spec in specs:
+            row = _write_mis_block(ws, spec, row)
 
-    align_center = Alignment(horizontal="center", vertical="center")
-    align_right = Alignment(horizontal="right", vertical="center")
-    align_left = Alignment(horizontal="left", vertical="center")
+        note = ws.cell(row=row + 1, column=2, value=caption)
+        note.font = Font(name=FONT, size=10, bold=True)
 
-    d_start = mis_data["dates"]["start_date"].strftime("%d-%m-%Y")
-    d_end = mis_data["dates"]["end_date"].strftime("%d-%m-%Y")
-    d_fy = mis_data["dates"]["fy_start"].strftime("%d-%m-%Y")
+        _autosize(ws, specs)
 
-    def format_worksheet_table(
-        ws: openpyxl.worksheet.worksheet.Worksheet,
-        title_text: str,
-        df: pd.DataFrame,
-        summary_dict: dict,
-        header_fill: PatternFill,
-        num_pct_cols: List[str],
-    ):
-        ws.views.sheetView[0].showGridLines = True
-        ws.row_dimensions[1].height = 24
-        ws.row_dimensions[2].height = 18
+    # Provenance sheet: every benchmark, its proxy fund, and coverage.
+    ws_src = wb.create_sheet(title="Benchmark Sources")
+    ws_src.sheet_view.showGridLines = False
+    ws_src.cell(row=1, column=1, value="Benchmark index levels used in this report").font = \
+        Font(name=FONT, size=12, bold=True)
+    ws_src.cell(row=2, column=1, value=(
+        "Each benchmark is represented by a passive index fund; its NAV history (AMFI) stands in for the "
+        "index level. Rows marked APPROX have no matching index fund and use the closest available index."
+    )).font = Font(name=FONT, size=9, italic=True)
 
-        ws.cell(row=1, column=1, value=title_text).font = title_font
-        ws.cell(row=2, column=1, value=f"Date Range: {d_start} to {d_end} | FY Start: {d_fy}").font = meta_label_font
-
-        # Headers start at row 4
-        headers = [c for c in df.columns if c != "Normalized_Weight"]
-        ws.row_dimensions[4].height = 28
-
-        for ci, col in enumerate(headers, 1):
-            cell = ws.cell(row=4, column=ci, value=col)
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.border = border_thin
-            cell.alignment = align_left if col in ("Scheme Name", "ISIN", "Benchmark") else align_right
-
-        # Data Rows
-        curr_row = 5
-        for _, row in df.iterrows():
-            ws.row_dimensions[curr_row].height = 20
-            row_fill = even_fill if curr_row % 2 == 0 else odd_fill
-
-            for ci, col in enumerate(headers, 1):
-                val = row.get(col)
-                cell = ws.cell(row=curr_row, column=ci)
-
-                if col in ("Scheme Name", "ISIN", "Benchmark"):
-                    cell.value = str(val) if pd.notna(val) else "-"
-                    cell.alignment = align_left
-                elif col == "Allocation (%)":
-                    cell.value = (val / 100.0) if pd.notna(val) else 0.0
-                    cell.number_format = "0.00%"
-                    cell.alignment = align_right
-                elif col in num_pct_cols:
-                    if pd.notna(val):
-                        cell.value = val / 100.0
-                        cell.number_format = "0.00%"
-                    else:
-                        cell.value = "N/A"
-                    cell.alignment = align_right
-
-                cell.font = data_font
-                cell.fill = row_fill
-                cell.border = border_thin
-            curr_row += 1
-
-        # Summary Total Row
-        ws.row_dimensions[curr_row].height = 22
-        for ci, col in enumerate(headers, 1):
-            val = summary_dict.get(col)
-            cell = ws.cell(row=curr_row, column=ci)
-
-            if col in ("Scheme Name", "ISIN", "Benchmark"):
-                cell.value = str(val) if pd.notna(val) else "-"
-                cell.alignment = align_left
-            elif col == "Allocation (%)":
-                cell.value = (val / 100.0) if pd.notna(val) else 0.0
-                cell.number_format = "0.00%"
-                cell.alignment = align_right
-            elif col in num_pct_cols:
-                if pd.notna(val):
-                    cell.value = val / 100.0
-                    cell.number_format = "0.00%"
-                else:
-                    cell.value = "N/A"
-                cell.alignment = align_right
-
-            cell.font = summary_font
-            cell.fill = summary_fill
-            cell.border = border_thin
-        
-        # Auto-adjust column widths
-        for col in ws.columns:
-            max_len = max(len(str(cell.value or "")) for cell in col)
-            col_letter = get_column_letter(col[0].column)
-            ws.column_dimensions[col_letter].width = max(max_len + 4, 14)
-
-    # 1. Sheet MIS 1 - Portfolio vs Nifty
-    ws1 = wb.create_sheet(title="MIS 1 - Portfolio vs Nifty")
-    format_worksheet_table(
-        ws1,
-        "MIS 1: Portfolio vs Nifty Performance Report",
-        mis_data["mis1"],
-        mis_data["mis1_summary"],
-        header_fill_dark,
-        [
-            "Daily Return (%)", "Nifty Daily Return (%)", "Daily Excess (%)",
-            "Period Return (%)", "Nifty Period Return (%)", "Period Excess (%)"
-        ],
-    )
-
-    # 2. Sheet MIS 2 - Portfolio vs Benchmark
-    ws2 = wb.create_sheet(title="MIS 2 - vs Benchmarks")
-    format_worksheet_table(
-        ws2,
-        "MIS 2: Portfolio vs Individual Benchmark Report",
-        mis_data["mis2"],
-        mis_data["mis2_summary"],
-        header_fill_green,
-        ["Period Return (%)", "Benchmark Return (%)", "Excess Return (%)"],
-    )
-
-    # 3. Sheet MIS 3 - FY Performance
-    ws3 = wb.create_sheet(title="MIS 3 - Since FY Start")
-    format_worksheet_table(
-        ws3,
-        "MIS 3: Performance Since Financial Year Start (1 April)",
-        mis_data["mis3"],
-        mis_data["mis3_summary"],
-        header_fill_gold,
-        [
-            "Scheme Return (%)", "Benchmark Return (%)", "Nifty Return (%)",
-            "Excess over Benchmark (%)", "Excess over Nifty (%)"
-        ],
-    )
+    bench_df = mis_data.get("benchmark_report")
+    if bench_df is not None and not bench_df.empty:
+        for ci, col in enumerate(bench_df.columns, 1):
+            c = ws_src.cell(row=4, column=ci, value=col)
+            c.font = Font(name=FONT, size=9, bold=True)
+            c.fill = HEADER_FILL
+            c.border = BORDER
+        for ri, (_, r) in enumerate(bench_df.iterrows(), 5):
+            for ci, col in enumerate(bench_df.columns, 1):
+                c = ws_src.cell(row=ri, column=ci, value=str(r[col]))
+                c.font = Font(name=FONT, size=9)
+                c.border = BORDER
+        for ci, col in enumerate(bench_df.columns, 1):
+            ws_src.column_dimensions[get_column_letter(ci)].width = 46 if col in ("Proxy Fund", "Note") else 20
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -680,214 +1145,127 @@ def export_mis_to_excel(mis_data: Dict[str, Any]) -> bytes:
 # ─── PDF Report Export Engine ──────────────────────────────────────────────────
 
 def export_mis_to_pdf(mis_data: Dict[str, Any]) -> bytes:
-    """Generate a clean, professional landscape PDF report containing MIS 1, MIS 2, and MIS 3 tables."""
+    """Landscape PDF containing MIS 1, MIS 2 and MIS 3."""
     try:
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import A4, landscape
-        from reportlab.platypus import (
-            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-        )
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     except ImportError as exc:
-        raise RuntimeError("reportlab package is not installed. Please add reportlab to requirements.txt") from exc
+        raise RuntimeError("reportlab is not installed. Add reportlab to requirements.txt") from exc
 
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buf,
-        pagesize=landscape(A4),
-        leftMargin=20,
-        rightMargin=20,
-        topMargin=20,
-        bottomMargin=20,
-    )
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4),
+                            leftMargin=16, rightMargin=16, topMargin=18, bottomMargin=18)
 
     styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("T", parent=styles["Heading1"], fontName="Helvetica-Bold",
+                                 fontSize=15, leading=19, textColor=colors.HexColor("#1F497D"), spaceAfter=3)
+    sub_style = ParagraphStyle("S", parent=styles["Normal"], fontName="Helvetica", fontSize=8.5,
+                               leading=11, textColor=colors.HexColor("#555555"), spaceAfter=10)
+    sec_style = ParagraphStyle("H", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=11,
+                               leading=14, textColor=colors.HexColor("#1F497D"), spaceBefore=8, spaceAfter=5)
+    hdr_style = ParagraphStyle("CH", parent=styles["Normal"], fontName="Helvetica-Bold",
+                               fontSize=6.5, leading=8, alignment=1)
+    txt_style = ParagraphStyle("CT", parent=styles["Normal"], fontName="Helvetica", fontSize=6.5, leading=8)
+    num_style = ParagraphStyle("CN", parent=styles["Normal"], fontName="Helvetica", fontSize=6.5,
+                               leading=8, alignment=1)
 
-    title_style = ParagraphStyle(
-        "PDFTitle",
-        parent=styles["Heading1"],
-        fontName="Helvetica-Bold",
-        fontSize=16,
-        leading=20,
-        textColor=colors.HexColor("#1F497D"),
-        spaceAfter=4,
-    )
+    d = mis_data["dates"]
+    story = [
+        Paragraph("MUTUAL FUND PORTFOLIO MIS REPORT", title_style),
+        Paragraph(
+            f"<b>Period:</b> {d['start_date']:%d-%b-%Y} to {d['end_date']:%d-%b-%Y} &nbsp;|&nbsp; "
+            f"<b>Financial year start:</b> {d['fy_start']:%d-%b-%Y} &nbsp;|&nbsp; "
+            f"Benchmark levels sourced from AMFI index-fund NAVs.",
+            sub_style),
+    ]
 
-    sub_style = ParagraphStyle(
-        "PDFSubTitle",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=9,
-        leading=12,
-        textColor=colors.HexColor("#555555"),
-        spaceAfter=12,
-    )
+    def build_table(spec):
+        cols = spec["columns"]
+        pct = set(spec.get("pct_cols", []))
+        nums = set(spec.get("num_cols", []))
+        alloc = set(spec.get("alloc_cols", []))
+        colour = set(spec.get("colour_cols", []))
 
-    section_header_style = ParagraphStyle(
-        "PDFSectionHeader",
-        parent=styles["Heading2"],
-        fontName="Helvetica-Bold",
-        fontSize=12,
-        leading=15,
-        textColor=colors.HexColor("#1F497D"),
-        spaceBefore=8,
-        spaceAfter=6,
-    )
-
-    cell_hdr_style = ParagraphStyle(
-        "PDFCellHeader",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=8,
-        leading=10,
-        textColor=colors.white,
-        alignment=1, # Center
-    )
-
-    cell_data_style = ParagraphStyle(
-        "PDFCellData",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=7.5,
-        leading=9,
-        alignment=0, # Left
-    )
-
-    cell_num_style = ParagraphStyle(
-        "PDFCellNum",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=7.5,
-        leading=9,
-        alignment=2, # Right
-    )
-
-    cell_summary_style = ParagraphStyle(
-        "PDFCellSummary",
-        parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=7.5,
-        leading=9,
-        alignment=2, # Right
-    )
-
-    d_start = mis_data["dates"]["start_date"].strftime("%d-%b-%Y")
-    d_end = mis_data["dates"]["end_date"].strftime("%d-%b-%Y")
-    d_fy = mis_data["dates"]["fy_start"].strftime("%d-%b-%Y")
-
-    story = []
-
-    # Title & Metadata
-    story.append(Paragraph("MUTUAL FUND PORTFOLIO MIS REPORT", title_style))
-    story.append(Paragraph(
-        f"<b>Selected Date Range:</b> {d_start} to {d_end} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Financial Year Start:</b> {d_fy}",
-        sub_style
-    ))
-
-    def build_pdf_table(
-        df: pd.DataFrame,
-        summary_dict: dict,
-        num_cols: List[str],
-        col_widths: List[float],
-        header_bg: colors.Color,
-    ) -> Table:
-        headers = [c for c in df.columns if c != "Normalized_Weight"]
-        table_data = []
-
-        # Header Row
-        hdr_row = [Paragraph(h, cell_hdr_style) for h in headers]
-        table_data.append(hdr_row)
-
-        # Data Rows
-        for _, row in df.iterrows():
-            r_cells = []
-            for h in headers:
-                val = row.get(h)
-                if h in ("Scheme Name", "ISIN", "Benchmark"):
-                    r_cells.append(Paragraph(str(val) if pd.notna(val) else "-", cell_data_style))
-                elif h == "Allocation (%)":
-                    v_str = f"{val:.2f}%" if pd.notna(val) else "0.00%"
-                    r_cells.append(Paragraph(v_str, cell_num_style))
-                elif h in num_cols:
-                    v_str = f"{val:.2f}%" if pd.notna(val) else "N/A"
-                    r_cells.append(Paragraph(v_str, cell_num_style))
-            table_data.append(r_cells)
-
-        # Summary Row
-        sum_cells = []
-        for h in headers:
-            val = summary_dict.get(h)
-            if h in ("Scheme Name", "ISIN", "Benchmark"):
-                sum_cells.append(Paragraph(str(val), cell_summary_style))
-            elif h == "Allocation (%)":
-                v_str = f"{val:.2f}%" if pd.notna(val) else "0.00%"
-                sum_cells.append(Paragraph(v_str, cell_summary_style))
-            elif h in num_cols:
-                v_str = f"{val:.2f}%" if pd.notna(val) else "N/A"
-                sum_cells.append(Paragraph(v_str, cell_summary_style))
-        table_data.append(sum_cells)
-
-        t = Table(table_data, colWidths=col_widths, repeatRows=1)
-        t_style = [
-            ("BACKGROUND", (0, 0), (-1, 0), header_bg),
-            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+        data = [[Paragraph(spec["headers"][c], hdr_style) for c in cols]]
+        style = [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#D9D9D9")),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#999999")),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#D3D3D3")),
-            ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#EAECEE")),
-            ("TOPPADDING", (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
         ]
-        # Alternating row colors
-        for i in range(1, len(table_data) - 1):
-            if i % 2 == 0:
-                t_style.append(("BACKGROUND", (0, i), (-1, i), colors.HexColor("#F8F9F9")))
 
-        t.setStyle(TableStyle(t_style))
+        body = list(spec["rows"].to_dict("records"))
+        if spec.get("total_row"):
+            body.append(spec["total_row"])
+
+        for ri, row in enumerate(body, 1):
+            cells = []
+            for ci, c in enumerate(cols):
+                v = row.get(c)
+                if c in pct or c in nums:
+                    if v is None or pd.isna(v):
+                        cells.append(Paragraph("N/A", num_style))
+                    else:
+                        cells.append(Paragraph(f"{float(v):.2f}", num_style))
+                        if c in colour:
+                            bg = colors.HexColor("#92D050") if float(v) >= 0 else colors.HexColor("#FF0000")
+                            style.append(("BACKGROUND", (ci, ri), (ci, ri), bg))
+                elif c in alloc:
+                    cells.append(Paragraph(f"{float(v):.2f}%" if pd.notna(v) else "", num_style))
+                elif c == "S.No":
+                    cells.append(Paragraph(str(int(v)), num_style))
+                else:
+                    cells.append(Paragraph(str(v) if pd.notna(v) else "", txt_style))
+            data.append(cells)
+
+        if spec.get("total_row"):
+            style.append(("BACKGROUND", (0, len(data) - 1), (-1, len(data) - 1), colors.HexColor("#EAECEE")))
+
+        n = len(cols)
+        wide = {"Scheme Name": 3.4, "Benchmark": 2.8, "ISIN": 1.5, "S.No": 0.5}
+        units = [wide.get(c, 1.0) for c in cols]
+        total_units = sum(units)
+        avail = landscape(A4)[0] - 32
+        widths = [avail * u / total_units for u in units]
+
+        t = Table(data, colWidths=widths, repeatRows=1)
+        t.setStyle(TableStyle(style))
         return t
 
-    # 1. MIS 1 Table
-    story.append(Paragraph("MIS 1: Portfolio vs Nifty Performance", section_header_style))
-    col_w1 = [200, 85, 55, 60, 60, 60, 60, 60, 60] # Total ~ 800
-    t1 = build_pdf_table(
-        mis_data["mis1"],
-        mis_data["mis1_summary"],
-        [
-            "Daily Return (%)", "Nifty Daily Return (%)", "Daily Excess (%)",
-            "Period Return (%)", "Nifty Period Return (%)", "Period Excess (%)"
-        ],
-        col_w1,
-        colors.HexColor("#1F497D"),
-    )
-    story.append(t1)
-    story.append(Spacer(1, 14))
+    def footer_table(spec):
+        rows = [[Paragraph(f"<b>{lab}</b>", txt_style),
+                 Paragraph("N/A" if (v is None or pd.isna(v)) else f"<b>{float(v):.2f}</b>", num_style)]
+                for _band, lab, v, _col in spec.get("footers", [])]
+        if not rows:
+            return None
+        t = Table(rows, colWidths=[260, 70])
+        t.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#999999")),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        return t
 
-    # 2. MIS 2 Table
-    story.append(Paragraph("MIS 2: Portfolio vs Individual Benchmarks", section_header_style))
-    col_w2 = [220, 90, 65, 120, 75, 75, 75]
-    t2 = build_pdf_table(
-        mis_data["mis2"],
-        mis_data["mis2_summary"],
-        ["Period Return (%)", "Benchmark Return (%)", "Excess Return (%)"],
-        col_w2,
-        colors.HexColor("#145A32"),
-    )
-    story.append(t2)
-    story.append(Spacer(1, 14))
+    blocks = [("current", mis_data["current"])]
+    if mis_data.get("previous"):
+        blocks.append(("previous", mis_data["previous"]))
 
-    # 3. MIS 3 Table
-    story.append(Paragraph("MIS 3: Performance Since Financial Year Start (1 April)", section_header_style))
-    col_w3 = [210, 85, 65, 80, 80, 80, 85, 85]
-    t3 = build_pdf_table(
-        mis_data["mis3"],
-        mis_data["mis3_summary"],
-        [
-            "Scheme Return (%)", "Benchmark Return (%)", "Nifty Return (%)",
-            "Excess over Benchmark (%)", "Excess over Nifty (%)"
-        ],
-        col_w3,
-        colors.HexColor("#7D5A1F"),
-    )
-    story.append(t3)
+    for key, caption in [("mis1", "MIS 1 : Performance w.r.t Nifty"),
+                         ("mis2", "MIS 2 : Performance w.r.t Own Benchmark"),
+                         ("mis3", "MIS 3 : Performance since financial year start")]:
+        story.append(Paragraph(caption, sec_style))
+        for _which, block in blocks:
+            spec = block[key]
+            story.append(Paragraph(f"<b>{spec['title']}</b>", sub_style))
+            story.append(build_table(spec))
+            ft = footer_table(spec)
+            if ft is not None:
+                story.append(Spacer(1, 5))
+                story.append(ft)
+            story.append(Spacer(1, 10))
 
     doc.build(story)
     return buf.getvalue()
@@ -895,68 +1273,124 @@ def export_mis_to_pdf(mis_data: Dict[str, Any]) -> bytes:
 
 # ─── Streamlit UI View Renderer ───────────────────────────────────────────────
 
+def _display_headers(spec: Dict[str, Any]) -> Dict[str, str]:
+    """Map internal column names to on-screen headers.
+
+    The report headers repeat across bands — two columns are both called
+    "Scheme Return in %" — which is fine in Excel under a merged band caption
+    but ambiguous in a flat table, so the band is appended here.
+    """
+    band_of = {c: caption.strip() for caption, band_cols in spec["bands"] for c in band_cols}
+
+    out = {}
+    for c in spec["columns"]:
+        hdr = spec["headers"][c]
+        band = band_of.get(c, "").lower()
+        if band.startswith("for the day"):
+            hdr = f"{hdr} — Day"
+        elif band.startswith("for the period"):
+            hdr = f"{hdr} — Period"
+        out[c] = hdr
+    return out
+
+
+def _display_frame(spec: Dict[str, Any]) -> pd.DataFrame:
+    """Rename internal columns to their report headers for on-screen display."""
+    df = spec["rows"].copy()
+    if spec.get("total_row"):
+        df = pd.concat([df, pd.DataFrame([spec["total_row"]])], ignore_index=True)
+    return df[spec["columns"]].rename(columns=_display_headers(spec))
+
+
+def _render_block(block: Dict[str, Any], key: str):
+    spec = block[key]
+    st.markdown(f"**{spec['title']}**")
+    disp = _display_frame(spec)
+    headers = _display_headers(spec)
+
+    styler = disp.style.format(
+        {c: "{:.2f}" for c in disp.columns if disp[c].dtype.kind in "fc"}, na_rep="N/A"
+    )
+
+    def colour_by_sign(v):
+        if pd.isna(v) or not isinstance(v, (int, float)):
+            return ""
+        return "background-color:#92D050;color:#111" if v >= 0 else "background-color:#FF6B6B;color:#111"
+
+    existing = [headers[c] for c in spec.get("colour_cols", []) if headers.get(c) in disp.columns]
+    if existing:
+        # Styler.map replaced applymap in pandas 2.1; keep working on both.
+        apply_elementwise = getattr(styler, "map", None) or styler.applymap
+        styler = apply_elementwise(colour_by_sign, subset=existing)
+
+    st.dataframe(styler, use_container_width=True, hide_index=True)
+
+    if spec.get("footers"):
+        f_day = [(l, v) for b, l, v, _ in spec["footers"] if b == "day"]
+        f_per = [(l, v) for b, l, v, _ in spec["footers"] if b == "period"]
+        c1, c2 = st.columns(2)
+        for col, items, heading in ((c1, f_day, "For the day"), (c2, f_per, "For the period")):
+            if not items:
+                continue
+            with col:
+                st.caption(heading)
+                st.dataframe(
+                    pd.DataFrame([{"Measure": l, "Value": (None if v is None or pd.isna(v) else round(v, 2))}
+                                  for l, v in items]),
+                    use_container_width=True, hide_index=True,
+                )
+
+
 def render_mis_generator_page():
     """Render the full interactive MIS Generator Streamlit page."""
     render_section_header(
         "📊",
         "MIS Generator Module",
-        "Create custom portfolios, calculate returns, compare against benchmarks, and export MIS reports"
+        "Portfolio vs Nifty and vs own benchmark — for the day, the period, and since 1 April",
     )
 
     render_info_card(
-        "<strong>MIS Generator:</strong> Enter your mutual fund portfolio manually or upload an Excel file. "
-        "The app fetches complete NAV history dynamically, calculates Daily, Period, and FY returns, "
-        "compares against Nifty 50 and individual fund benchmarks, and exports corporate-styled Excel and PDF reports."
+        "<strong>MIS Generator:</strong> Enter your portfolio or upload an Excel file. Scheme NAVs come from "
+        "AMFI. Benchmark index levels come from a passive index fund tracking each benchmark, read from the "
+        "same AMFI feed — so every figure traces to real data. Where a benchmark cannot be sourced the report "
+        "shows <code>N/A</code> rather than a substituted number."
     )
 
-    # State management
     if "portfolio_input_df" not in st.session_state:
         st.session_state["portfolio_input_df"] = pd.DataFrame(DEFAULT_SAMPLE_PORTFOLIO)
-
+    if "prev_portfolio_input_df" not in st.session_state:
+        st.session_state["prev_portfolio_input_df"] = pd.DataFrame(columns=["Scheme Name", "ISIN", "Allocation (%)", "Benchmark"])
     if "mis_results" not in st.session_state:
         st.session_state["mis_results"] = None
 
-    # Step 1: Input Mode Selection
+    col_cfg = {
+        "Scheme Name": st.column_config.TextColumn("Scheme Name", width="large", required=True),
+        "ISIN": st.column_config.TextColumn("ISIN", width="medium", required=True),
+        "Allocation (%)": st.column_config.NumberColumn("Allocation (%)", min_value=0.0, max_value=100.0, format="%.2f"),
+        "Benchmark": st.column_config.TextColumn("Benchmark", width="large"),
+    }
+
     with finance_panel("1. Portfolio Input"):
-        input_mode = st.radio(
-            "Portfolio Entry Method",
-            ["Manual Entry / Edit", "Upload Excel File"],
-            horizontal=True,
-        )
+        input_mode = st.radio("Portfolio Entry Method", ["Manual Entry / Edit", "Upload Excel File"], horizontal=True)
 
         if input_mode == "Manual Entry / Edit":
-            col_b1, col_b2 = st.columns([1, 4])
-            with col_b1:
-                if st.button("🔄 Reset Sample Template", use_container_width=True):
-                    st.session_state["portfolio_input_df"] = pd.DataFrame(DEFAULT_SAMPLE_PORTFOLIO)
-                    st.session_state["mis_results"] = None
-                    st.rerun()
-
-            edited_df = st.data_editor(
-                st.session_state["portfolio_input_df"],
-                num_rows="dynamic",
-                use_container_width=True,
-                column_config={
-                    "Scheme Name": st.column_config.TextColumn("Scheme Name", width="large", required=True),
-                    "ISIN": st.column_config.TextColumn("ISIN", width="medium", required=True),
-                    "Allocation (%)": st.column_config.NumberColumn("Allocation (%)", min_value=0.0, max_value=100.0, format="%.2f%%"),
-                    "Benchmark": st.column_config.TextColumn("Benchmark (e.g. NIFTY 50, NIFTY 500)", width="medium"),
-                },
-                key="mis_manual_editor",
+            if st.button("🔄 Reset Sample Template"):
+                st.session_state["portfolio_input_df"] = pd.DataFrame(DEFAULT_SAMPLE_PORTFOLIO)
+                st.session_state["mis_results"] = None
+                st.rerun()
+            current_portfolio_df = st.data_editor(
+                st.session_state["portfolio_input_df"], num_rows="dynamic",
+                use_container_width=True, column_config=col_cfg, key="mis_manual_editor",
             )
-            current_portfolio_df = edited_df
-
         else:
             uploaded_file = st.file_uploader(
-                "Upload Portfolio Excel (.xlsx)",
-                type=["xlsx", "xls"],
-                help="Excel file must contain columns: Scheme Name, ISIN, Allocation (%), Benchmark"
+                "Upload Portfolio Excel (.xlsx)", type=["xlsx", "xls"],
+                help="Columns: Scheme Name, ISIN, Allocation (%), Benchmark",
             )
             if uploaded_file is not None:
                 try:
-                    df_up = pd.read_excel(uploaded_file)
-                    st.success(f"Successfully loaded {len(df_up)} rows from uploaded file.")
-                    current_portfolio_df = df_up
+                    current_portfolio_df = read_portfolio_excel(uploaded_file)
+                    st.success(f"Loaded {len(current_portfolio_df)} rows.")
                 except Exception as exc:
                     st.error(f"Error reading uploaded Excel file: {exc}")
                     current_portfolio_df = st.session_state["portfolio_input_df"]
@@ -964,126 +1398,122 @@ def render_mis_generator_page():
                 st.info("Upload an Excel file above, or switch to Manual Entry.")
                 current_portfolio_df = st.session_state["portfolio_input_df"]
 
-        # Validate input
-        clean_df, warnings, errors = validate_and_normalize_portfolio(current_portfolio_df)
-
-        for w in warnings:
+        clean_df, warns, errs = validate_and_normalize_portfolio(current_portfolio_df)
+        for w in warns:
             st.warning(w)
-
-        for e in errors:
+        for e in errs:
             st.error(e)
-
         if not clean_df.empty:
-            tot_alloc = clean_df["Allocation (%)"].sum()
             st.caption(
-                f"📋 **Valid Schemes Indexed:** {len(clean_df)} | **Total Input Allocation:** {tot_alloc:.2f}% "
-                f"*(weights automatically normalized for return calculations)*"
+                f"📋 **Valid schemes:** {len(clean_df)} | "
+                f"**Total allocation:** {clean_df['Allocation (%)'].sum():.2f}%"
             )
 
-    # Step 2: Date Selection & MIS Generation Trigger
-    with finance_panel("2. Date Range & Generate"):
-        col_d1, col_d2, col_d3 = st.columns([2, 2, 2])
-        today = date.today()
-        default_start = today - timedelta(days=365)
+    with finance_panel("2. Previous Portfolio (optional)"):
+        st.caption(
+            "Add the prior portfolio to render the second comparison block that appears beneath each "
+            "MIS table in the reference report. Leave empty to skip it."
+        )
+        prev_raw = st.data_editor(
+            st.session_state["prev_portfolio_input_df"], num_rows="dynamic",
+            use_container_width=True, column_config=col_cfg, key="mis_prev_editor",
+        )
+        prev_clean, prev_warns, _prev_errs = validate_and_normalize_portfolio(prev_raw)
+        for w in prev_warns:
+            st.warning(f"Previous portfolio: {w}")
 
-        with col_d1:
-            start_date = st.date_input("Start Date", value=default_start, max_value=today)
-        with col_d2:
-            end_date = st.date_input("End Date", value=today, max_value=today)
-        with col_d3:
-            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-            generate_btn = st.button("⚡ Generate MIS Reports", type="primary", use_container_width=True)
+    with finance_panel("3. Date Range & Generate"):
+        c1, c2, c3 = st.columns([2, 2, 2])
+        today = date.today()
+        with c1:
+            start_date = st.date_input("Period Start Date", value=today - timedelta(days=270), max_value=today)
+        with c2:
+            end_date = st.date_input("Report Date", value=today, max_value=today)
+        with c3:
+            include_flows = st.checkbox(
+                "Include Flows column", value=False,
+                help="Derives net flows from daily AUM via the AMFI performance API. Noticeably slower.",
+            )
 
         if start_date > end_date:
-            st.error("Start Date must be before or equal to End Date.")
+            st.error("Period Start Date must be on or before the Report Date.")
 
-        if generate_btn:
+        if st.button("⚡ Generate MIS Reports", type="primary", use_container_width=True):
             if clean_df.empty:
                 st.error("Cannot generate MIS reports without valid portfolio input.")
             elif start_date > end_date:
                 st.error("Invalid date range.")
             else:
-                with st.spinner("Fetching historical NAVs & generating MIS reports..."):
+                with st.spinner("Fetching NAVs and benchmark index levels…"):
                     try:
-                        results = generate_mis_reports_data(clean_df, start_date, end_date)
-                        st.session_state["mis_results"] = results
-                        st.success("MIS Reports generated successfully!")
+                        st.session_state["mis_results"] = generate_mis_reports_data(
+                            clean_df, start_date, end_date,
+                            previous_portfolio_df=prev_clean if not prev_clean.empty else None,
+                            include_flows=include_flows,
+                        )
+                        st.success("MIS reports generated.")
                     except Exception as exc:
+                        st.session_state["mis_results"] = None
                         st.error(f"Failed to generate MIS reports: {exc}")
 
-    # Step 3: Display MIS Reports & Export Options
     res = st.session_state.get("mis_results")
-    if res:
-        with finance_panel("3. MIS Reports Output"):
-            tab1, tab2, tab3 = st.tabs([
-                "📊 MIS 1: Portfolio vs Nifty",
-                "🎯 MIS 2: Portfolio vs Benchmark",
-                "📅 MIS 3: FY Performance (Since 1 Apr)",
-            ])
+    if not res:
+        return
 
-            col_config_pct = {
-                "Allocation (%)": st.column_config.NumberColumn("Allocation (%)", format="%.2f%%"),
-                "Daily Return (%)": st.column_config.NumberColumn("Daily Return (%)", format="%.2f%%"),
-                "Nifty Daily Return (%)": st.column_config.NumberColumn("Nifty Daily Return (%)", format="%.2f%%"),
-                "Daily Excess (%)": st.column_config.NumberColumn("Daily Excess (%)", format="%.2f%%"),
-                "Period Return (%)": st.column_config.NumberColumn("Period Return (%)", format="%.2f%%"),
-                "Nifty Period Return (%)": st.column_config.NumberColumn("Nifty Period Return (%)", format="%.2f%%"),
-                "Period Excess (%)": st.column_config.NumberColumn("Period Excess (%)", format="%.2f%%"),
-                "Benchmark Return (%)": st.column_config.NumberColumn("Benchmark Return (%)", format="%.2f%%"),
-                "Excess Return (%)": st.column_config.NumberColumn("Excess Return (%)", format="%.2f%%"),
-                "Scheme Return (%)": st.column_config.NumberColumn("Scheme Return (%)", format="%.2f%%"),
-                "Nifty Return (%)": st.column_config.NumberColumn("Nifty Return (%)", format="%.2f%%"),
-                "Excess over Benchmark (%)": st.column_config.NumberColumn("Excess over Benchmark (%)", format="%.2f%%"),
-                "Excess over Nifty (%)": st.column_config.NumberColumn("Excess over Nifty (%)", format="%.2f%%"),
-            }
+    for w in res.get("warnings", []):
+        st.warning(w)
 
-            with tab1:
-                render_section_header("📈", "MIS 1: Portfolio vs Nifty Performance")
-                mis1_display = pd.concat([
-                    res["mis1"].drop(columns=["Normalized_Weight"], errors="ignore"),
-                    pd.DataFrame([res["mis1_summary"]])
-                ], ignore_index=True)
-                st.dataframe(mis1_display, use_container_width=True, hide_index=True, column_config=col_config_pct)
+    with finance_panel("4. MIS Reports"):
+        tab1, tab2, tab3, tab4 = st.tabs([
+            "📊 MIS 1: vs Nifty 50",
+            "🎯 MIS 2: vs Own Benchmark",
+            "📅 MIS 3: Since 1 April",
+            "🔎 Benchmark Sources",
+        ])
 
-            with tab2:
-                render_section_header("🎯", "MIS 2: Portfolio vs Individual Benchmarks")
-                mis2_display = pd.concat([
-                    res["mis2"].drop(columns=["Normalized_Weight"], errors="ignore"),
-                    pd.DataFrame([res["mis2_summary"]])
-                ], ignore_index=True)
-                st.dataframe(mis2_display, use_container_width=True, hide_index=True, column_config=col_config_pct)
+        blocks = [res["current"]] + ([res["previous"]] if res.get("previous") else [])
 
-            with tab3:
-                render_section_header("📅", "MIS 3: Performance Since Financial Year Start (1 April)")
-                mis3_display = pd.concat([
-                    res["mis3"].drop(columns=["Normalized_Weight"], errors="ignore"),
-                    pd.DataFrame([res["mis3_summary"]])
-                ], ignore_index=True)
-                st.dataframe(mis3_display, use_container_width=True, hide_index=True, column_config=col_config_pct)
+        with tab1:
+            for b in blocks:
+                _render_block(b, "mis1")
+        with tab2:
+            for b in blocks:
+                _render_block(b, "mis2")
+        with tab3:
+            for b in blocks:
+                _render_block(b, "mis3")
+        with tab4:
+            st.caption(
+                "Each benchmark resolves to a passive index fund whose NAV history stands in for the index "
+                "level. EXACT = the fund tracks that index. APPROX = no fund tracks it, closest index used. "
+                "UNAVAILABLE = no data, columns show N/A."
+            )
+            st.dataframe(res["benchmark_report"], use_container_width=True, hide_index=True)
 
-            # Export Section
-            render_section_header("📥", "Export Reports")
-            col_exp1, col_exp2 = st.columns(2)
+        render_section_header("📥", "Export Reports")
+        e1, e2 = st.columns(2)
+        stamp = f"{res['dates']['start_date']}_to_{res['dates']['end_date']}"
 
-            with col_exp1:
-                excel_bytes = export_mis_to_excel(res)
+        with e1:
+            try:
                 st.download_button(
-                    label="Download Excel MIS Report (.xlsx)",
-                    data=excel_bytes,
-                    file_name=f"MIS_Report_{res['dates']['start_date']}_to_{res['dates']['end_date']}.xlsx",
+                    "Download Excel MIS Report (.xlsx)",
+                    data=export_mis_to_excel(res),
+                    file_name=f"MIS_Report_{stamp}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
+            except Exception as exc:
+                st.error(f"Excel export failed: {exc}")
 
-            with col_exp2:
-                try:
-                    pdf_bytes = export_mis_to_pdf(res)
-                    st.download_button(
-                        label="Download PDF MIS Report (.pdf)",
-                        data=pdf_bytes,
-                        file_name=f"MIS_Report_{res['dates']['start_date']}_to_{res['dates']['end_date']}.pdf",
-                        mime="application/pdf",
-                        use_container_width=True,
-                    )
-                except Exception as pdf_exc:
-                    st.warning(f"PDF Export is currently unavailable: {pdf_exc}")
+        with e2:
+            try:
+                st.download_button(
+                    "Download PDF MIS Report (.pdf)",
+                    data=export_mis_to_pdf(res),
+                    file_name=f"MIS_Report_{stamp}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            except Exception as exc:
+                st.warning(f"PDF export unavailable: {exc}")
