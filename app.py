@@ -1610,6 +1610,21 @@ def main() -> None:
     inject_custom_css()
     render_top_bar()
 
+    with st.sidebar:
+        st.markdown("### 📌 Navigation")
+        app_module = st.radio(
+            "Select Module",
+            ["MIS Generator", "NAV Terminal"],
+            index=0,
+            key="main_app_module_selector",
+        )
+
+    if app_module == "MIS Generator":
+        from mis_generator import render_mis_generator_page
+        render_mis_generator_page()
+        render_app_footer()
+        return
+
     try:
         nav_data = load_data(force_refresh=False)
     except Exception as exc:
@@ -1637,13 +1652,16 @@ def main() -> None:
         render_section_header("🔍", "Fund Discovery", "Search single funds, run batch lookups, or generate historical ISIN reports")
         search_mode = st.radio(
             "Search mode",
-            ["Historical ISIN Export", "Fund Performance", "Portfolio Bucket Tracker"],
+            ["MIS Generator", "Historical ISIN Export", "Fund Performance", "Portfolio Bucket Tracker"],
             horizontal=True,
             index=0,
             label_visibility="collapsed",
         )
 
-        if search_mode == "Historical ISIN Export":
+        if search_mode == "MIS Generator":
+            from mis_generator import render_mis_generator_page
+            render_mis_generator_page()
+        elif search_mode == "Historical ISIN Export":
             render_section_header("📋", "Historical ISIN Export", "Pivoted NAV/AUM reports with corporate Excel styling")
             render_info_card(
                 "<strong>Historical NAV Extractor:</strong> Specify a date range and target ISINs to generate "
