@@ -480,9 +480,30 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
     if df_flows.empty or "Net flows on current day" not in df_flows.columns:
         return result, flow_date
 
+    # AMFI sometimes repeats yesterday's AUM verbatim. The flow formula is
+    # AUM_t - AUM_(t-1) * (1 + return), so an unchanged AUM books the whole
+    # mark-to-market move as a subscription: Kotak Midcap showed a 913cr
+    # "flow" purely because a 69,849cr AUM was served twice while the NAV fell
+    # 1.3%. An AUM that does not move at all while the NAV does is
+    # arithmetically impossible, so treat those days as missing, not as flows.
+    stale_days = 0
+    stale_names: set = set()
+
     for _, r in df_flows.iterrows():
         flow = r.get("Net flows on current day")
         if flow is None or pd.isna(flow):
+            continue
+
+        prev_aum = pd.to_numeric(r.get("Closing AUM as on previous day"), errors="coerce")
+        curr_aum = pd.to_numeric(r.get("Actual AUM as on current date"), errors="coerce")
+        day_ret = pd.to_numeric(r.get("Daily return"), errors="coerce")
+        if (
+            pd.notna(prev_aum) and pd.notna(curr_aum) and pd.notna(day_ret)
+            and prev_aum == curr_aum
+            and abs(float(day_ret)) > STALE_AUM_MIN_MOVE_PCT
+        ):
+            stale_days += 1
+            stale_names.add(str(r.get("Scheme Name", "")).strip())
             continue
         try:
             d = datetime.strptime(str(r.get("NAV Date", "")).strip(), "%d-%m-%Y").date()
@@ -508,6 +529,16 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
                 bucket["ytd"] = (bucket["ytd"] or 0.0) + val
             break
 
+    if stale_days and notes is not None:
+        shown = ", ".join(sorted(n for n in stale_names if n)[:4])
+        more = f" and {len(stale_names) - 4} more" if len(stale_names) > 4 else ""
+        notes.append(
+            f"AMFI repeated the previous day's AUM on {stale_days} scheme-day(s) "
+            f"({shown}{more}). Those days are excluded from Flows, MTD and YTD rather "
+            f"than reported as flows, since an unchanged AUM against a moved NAV is a "
+            f"stale feed, not a subscription."
+        )
+
     return result, flow_date
 
 
@@ -520,6 +551,10 @@ MAX_DAILY_GAP_DAYS = 7
 
 # Wall-clock cap on the live-AUM fetch behind the Flows column.
 AUM_BUDGET_SECONDS = 90.0
+
+# A daily move smaller than this is too small to tell a stale AUM apart from a
+# genuinely flat one, so staleness is only called above it.
+STALE_AUM_MIN_MOVE_PCT = 0.05
 
 
 def _scheme_metrics(series: Series, d_end: date, d_period_base: date,
