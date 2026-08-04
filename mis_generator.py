@@ -389,8 +389,8 @@ def build_nav_series(df_nav_raw: pd.DataFrame, isin_list: List[str]) -> Dict[str
 # ─── Flows ────────────────────────────────────────────────────────────────────
 
 def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
-                         report_date: date, mtd_start: date,
-                         fy_start: date) -> Dict[str, Dict[str, Optional[float]]]:
+                         report_date: date, mtd_start: date, fy_start: date,
+                         notes: Optional[List[str]] = None) -> Dict[str, Dict[str, Optional[float]]]:
     """Net flows per ISIN, via the project's existing AUM engine.
 
     Reuses populate_actual_aum + calculate_flows_for_dataframe from nav_fetcher
@@ -428,9 +428,23 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
     if df_slice.empty:
         return result
 
+    partial: List[str] = []
+
+    def _note_partial(done: int, total: int) -> None:
+        partial.append(
+            f"Live AUM was retrieved for {done} of {total} day/category combinations; the rest fall "
+            f"back to a derived AUM, so Flows, MTD and YTD are approximate."
+        )
+
     try:
         df_port = load_portfolio_aum_data()
-        df_aum = populate_actual_aum(df_slice, df_port, want_aum=True, fetch_live_aum=True)
+        # One API call per day/category: a financial year is hundreds of them.
+        # Bound the wall time and parallelise modestly rather than letting the
+        # report hang -- partial live AUM plus a warning beats no report.
+        df_aum = populate_actual_aum(
+            df_slice, df_port, want_aum=True, fetch_live_aum=True,
+            budget_seconds=AUM_BUDGET_SECONDS, max_workers=4, on_incomplete=_note_partial,
+        )
         df_flows = calculate_flows_for_dataframe(
             df_aum,
             min(keep),
@@ -440,6 +454,9 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
     except Exception:
         # Flows are supplementary; a failure here must not sink the whole report.
         return result
+
+    if notes is not None:
+        notes.extend(partial)
 
     if df_flows.empty or "Net flows on current day" not in df_flows.columns:
         return result
@@ -481,6 +498,9 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
 # holidays, but not much more. Beyond this the two observations are too far
 # apart to be called a daily move.
 MAX_DAILY_GAP_DAYS = 7
+
+# Wall-clock cap on the live-AUM fetch behind the Flows column.
+AUM_BUDGET_SECONDS = 90.0
 
 
 def _scheme_metrics(series: Series, d_end: date, d_period_base: date,
@@ -871,8 +891,9 @@ def generate_mis_reports_data(
     flows: Dict[str, Dict[str, Optional[float]]] = {
         i: {"day": None, "mtd": None, "ytd": None} for i in all_isins
     }
+    flow_notes: List[str] = []
     if include_flows:
-        flows = compute_scheme_flows(df_nav_raw, all_isins, d_end, d_mtd, d_fy)
+        flows = compute_scheme_flows(df_nav_raw, all_isins, d_end, d_mtd, d_fy, notes=flow_notes)
 
     current = _build_reports(portfolio_df, nav_series, bm_series, flows,
                              d_end, d_start, d_fy, d_mtd, "14 Fund AR Model Portfolio")
@@ -885,6 +906,7 @@ def generate_mis_reports_data(
     warnings: List[str] = list(current["warnings"])
     if nifty_fallback_note:
         warnings.append(nifty_fallback_note)
+    warnings.extend(flow_notes)
     if previous:
         warnings.extend(previous["warnings"])
 

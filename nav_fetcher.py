@@ -399,7 +399,9 @@ def find_matching_perf_row(nav_name: str, perf_rows: list) -> Optional[dict]:
     return None
 
 
-def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool = True, fetch_live_aum: bool = False) -> pd.DataFrame:
+def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool = True,
+                        fetch_live_aum: bool = False, budget_seconds: float | None = None,
+                        max_workers: int = 1, on_incomplete=None) -> pd.DataFrame:
     if df.empty:
         return df.copy()
         
@@ -461,23 +463,57 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
     perf_lookup = {}
     import time
     
-    for i, (_, grp) in enumerate(unique_groups.iterrows()):
-        asset_class = grp["Asset Class"]
-        date_str = grp["Date_Str_Temp"]
-        if not asset_class or not date_str:
-            continue
-            
-        m_id, c_id, s_id = map_section_to_ids(asset_class)
-        
-        # Rate-limiting sleep between calls to AMFI APIs
-        if i > 0:
-            time.sleep(0.5)
-            
-        # Fetch from API
-        perf_rows = fetch_performance_data_from_api(date_str, m_id, c_id, s_id)
-        if perf_rows:
-            perf_lookup[(date_str, asset_class)] = perf_rows
-            
+    jobs = [(g["Asset Class"], g["Date_Str_Temp"]) for _, g in unique_groups.iterrows()
+            if g["Asset Class"] and g["Date_Str_Temp"]]
+
+    # One API call per (asset class x date). Over a financial year that is
+    # hundreds of serial calls -- minutes of wall time, and far worse on a
+    # throttled host. Bound the total and report what was missed; rows that
+    # never get a live figure keep the derived fallback already in "AUM".
+    started = time.monotonic()
+    fetched = 0
+
+    def _expired() -> bool:
+        return budget_seconds is not None and (time.monotonic() - started) >= budget_seconds
+
+    if max_workers > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {}
+            for asset_class, date_str in jobs:
+                m_id, c_id, s_id = map_section_to_ids(asset_class)
+                futures[pool.submit(fetch_performance_data_from_api, date_str, m_id, c_id, s_id)] = (
+                    date_str, asset_class
+                )
+            for fut in as_completed(futures):
+                date_str, asset_class = futures[fut]
+                if _expired():
+                    fut.cancel()
+                    continue
+                try:
+                    perf_rows = fut.result()
+                except Exception:
+                    perf_rows = None
+                if perf_rows:
+                    perf_lookup[(date_str, asset_class)] = perf_rows
+                    fetched += 1
+    else:
+        for i, (asset_class, date_str) in enumerate(jobs):
+            if _expired():
+                break
+            m_id, c_id, s_id = map_section_to_ids(asset_class)
+            if i > 0:
+                time.sleep(0.5)  # rate-limit AMFI
+            perf_rows = fetch_performance_data_from_api(date_str, m_id, c_id, s_id)
+            if perf_rows:
+                perf_lookup[(date_str, asset_class)] = perf_rows
+                fetched += 1
+
+    if on_incomplete and fetched < len(jobs):
+        on_incomplete(fetched, len(jobs))
+
+
     # Now, try to match each row to the fetched performance rows
     for idx, row in df_res.iterrows():
         asset_class = row["Asset Class"]
