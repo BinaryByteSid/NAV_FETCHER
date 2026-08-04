@@ -133,14 +133,13 @@ BENCHMARK_PROXIES: Dict[str, BenchmarkProxy] = {
     ], STATUS_APPROX, "No BSE 250 SmallCap index fund exists; Nifty Smallcap 250 used as stand-in."),
 
     "NIFTY 500 MULTICAP 50:25:25": _P("NIFTY 500 MULTICAP 50:25:25", [
-        ("INF109KC16Y3", "ICICI Prudential Nifty 500 Index Fund - Direct - Growth"),
-        ("INF846K019W9", "Axis Nifty 500 Index Fund - Direct - Growth"),
-    ], STATUS_APPROX, "No Nifty500 Multicap 50:25:25 index fund exists; Nifty 500 used as stand-in "
-                      "(it is cap-weighted, so mid/small exposure is understated)."),
+        ("INF179KC1IO9", "HDFC NIFTY500 Multicap 50:25:25 Index Fund - Direct Plan"),
+        ("INF179KC1IN1", "HDFC NIFTY500 Multicap 50:25:25 Index Fund - Regular Plan"),
+    ], STATUS_EXACT),
 
     "NIFTY INFRASTRUCTURE": _P("NIFTY INFRASTRUCTURE", [
-        ("INF209KC1332", "Aditya Birla Sun Life BSE India Infrastructure Index Fund - Direct - Growth"),
-    ], STATUS_APPROX, "No Nifty Infrastructure index fund exists; BSE India Infrastructure used as stand-in."),
+        ("INF109KC16E5", "ICICI Prudential Nifty Infrastructure ETF"),
+    ], STATUS_EXACT),
 
     "NIFTY MIDCAP 100": _P("NIFTY MIDCAP 100", [
         ("INF204KB18Z7", "Nippon India Nifty Midcap 150 Index Fund - Direct - Growth"),
