@@ -1773,7 +1773,8 @@ def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = N
 
 def fetch_amfi_data_chunked(start_date, end_date, isin_list: List[str] | None = None,
                             include_direct: bool = False, return_gaps: bool = False,
-                            progress=None, budget_seconds: float = 300.0):
+                            progress=None, budget_seconds: float = 300.0,
+                            chunk_days: int = 90):
     """Fetch AMFI data by chunking the date range into 90-day intervals to prevent timeout & memory crash.
 
     With return_gaps=True returns (df, gaps) where gaps lists the (start, end)
@@ -1794,7 +1795,7 @@ def fetch_amfi_data_chunked(start_date, end_date, isin_list: List[str] | None = 
     windows: List[Tuple[date, date]] = []
     cursor = start_date
     while cursor <= end_date:
-        w_end = min(cursor + timedelta(days=90), end_date)
+        w_end = min(cursor + timedelta(days=chunk_days), end_date)
         windows.append((cursor, w_end))
         cursor = w_end + timedelta(days=1)
 

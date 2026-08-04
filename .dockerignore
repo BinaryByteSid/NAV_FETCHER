@@ -1,0 +1,10 @@
+# Runtime caches and build artefacts must not ship in the image.
+__pycache__/
+*.pyc
+cache/
+api_cache/
+amfi_cache/
+scratch/
+.venv/
+.git/
+.pytest_cache/

@@ -322,6 +322,10 @@ def fetch_mis_nav_history(isin_list: List[str], earliest_date: date,
     df_raw, gaps = fetch_amfi_data_chunked(
         fetch_start, end_date, isin_list, include_direct=True, return_gaps=True,
         progress=progress,
+        # Smaller windows than the 90-day default: each AMFI call blocks the
+        # script, and a long silence lets the Spaces proxy drop the websocket
+        # mid-report. Shorter calls keep the progress bar talking.
+        chunk_days=45,
     )
     if df_raw.empty:
         return pd.DataFrame(), gaps
