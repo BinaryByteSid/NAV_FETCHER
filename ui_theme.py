@@ -900,16 +900,14 @@ def finance_panel(label: str):
 
 def render_section_header(icon: str, title: str, description: str = "") -> None:
     desc_html = f'<p class="section-desc">{description}</p>' if description else ""
+    # Emitted as one unindented line. With no description the template used to
+    # leave a blank line, and Markdown then read the indented closing tags that
+    # followed as an indented code block -- printing a literal </div> on screen.
     st.markdown(
-        f"""
-        <div class="section-header">
-            <div class="section-icon">{icon}</div>
-            <div>
-                <p class="section-title">{title}</p>
-                {desc_html}
-            </div>
-        </div>
-        """,
+        f'<div class="section-header">'
+        f'<div class="section-icon">{icon}</div>'
+        f'<div><p class="section-title">{title}</p>{desc_html}</div>'
+        f'</div>',
         unsafe_allow_html=True,
     )
 
