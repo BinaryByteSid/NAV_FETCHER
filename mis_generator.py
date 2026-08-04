@@ -50,6 +50,9 @@ from benchmark_proxy import (
     overlay_live_navs,
     describe_gaps,
     describe_resolution,
+    fetch_nifty_price_index,
+    BenchmarkSeries,
+    STATUS_EXACT,
     STATUS_APPROX,
     STATUS_NONE,
     DEFAULT_BENCHMARK,
@@ -410,7 +413,9 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
     if len(dates_present) < 2:
         return result
 
-    window_start = min(fy_start, mtd_start)
+    # One day earlier than the first day being counted, so the seed observation
+    # supplies the prior-day AUM that 1 April's own flow is measured against.
+    window_start = min(fy_start - timedelta(days=1), mtd_start)
     seed = [d for d in dates_present if d <= window_start]
     keep = {d for d in dates_present if d > window_start}
     if seed:
@@ -458,9 +463,12 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
             val = float(flow)
             if d == report_date:
                 bucket["day"] = val
+            # mtd_start is a baseline date (last day of the previous month), so
+            # it is excluded. fy_start is the first day OF the year, so a flow
+            # dated 1 April belongs inside it — hence >= rather than >.
             if d > mtd_start:
                 bucket["mtd"] = (bucket["mtd"] or 0.0) + val
-            if d > fy_start:
+            if d >= fy_start:
                 bucket["ytd"] = (bucket["ytd"] or 0.0) + val
             break
 
@@ -539,19 +547,27 @@ def _build_reports(portfolio_df: pd.DataFrame, nav_series: Dict[str, Series],
                    d_end: date, d_start: date, d_fy: date, d_mtd: date,
                    label: str) -> Dict[str, Any]:
     """Assemble MIS 1, 2 and 3 for one portfolio."""
+    # A period's return is measured from the close of the day BEFORE it opens:
+    # "since 1st April" compounds 1 April's own move, so it bases off 31 March.
+    # Basing off 1 April instead silently drops the first day, which understates
+    # every return by roughly one day's move. d_mtd is already a baseline date
+    # (the last day of the previous month), so it needs no shift.
+    d_period_base = d_start - timedelta(days=1)
+    d_fy_base = d_fy - timedelta(days=1)
+
     nifty = bm_series.get(NIFTY_KEY)
     nifty_levels = nifty.levels if nifty is not None else {}
-    n_metrics = _scheme_metrics(nifty_levels, d_end, d_start, d_fy, d_mtd)
+    n_metrics = _scheme_metrics(nifty_levels, d_end, d_period_base, d_fy_base, d_mtd)
 
     rows: List[Dict[str, Any]] = []
     for _, r in portfolio_df.iterrows():
         isin = str(r["ISIN"]).strip().upper()
-        sm = _scheme_metrics(nav_series.get(isin, {}), d_end, d_start, d_fy, d_mtd)
+        sm = _scheme_metrics(nav_series.get(isin, {}), d_end, d_period_base, d_fy_base, d_mtd)
 
         bm_name = r["Benchmark"]
         bser = bm_series.get(bm_name)
         bm_levels = bser.levels if bser is not None else {}
-        bm = _scheme_metrics(bm_levels, d_end, d_start, d_fy, d_mtd)
+        bm = _scheme_metrics(bm_levels, d_end, d_period_base, d_fy_base, d_mtd)
 
         rows.append({
             "Scheme Name": r["Scheme Name"],
@@ -836,6 +852,22 @@ def generate_mis_reports_data(
     proxy_series = overlay_live_navs(proxy_series, proxy_isins, d_end)
     bm_series = build_benchmark_series(all_benchmarks, proxy_series, earliest, describe_gaps(nav_gaps))
 
+    # The Nifty column is the headline PRICE index, unlike the schemes' own
+    # "TR INR" benchmarks. An index-fund proxy answers the total-return
+    # question and reads ~0.5pp high over a quarter, so source it directly.
+    nifty_levels = fetch_nifty_price_index(earliest, d_end)
+    nifty_fallback_note = ""
+    if nifty_levels:
+        bm_series[NIFTY_KEY] = BenchmarkSeries(
+            NIFTY_KEY, NIFTY_KEY, nifty_levels, STATUS_EXACT,
+            proxy_name="Nifty 50 price index (dividends excluded)",
+        )
+    else:
+        nifty_fallback_note = (
+            "The Nifty 50 price index could not be fetched, so the Nifty column falls back to a "
+            "total-return index fund. It will read slightly high — total return includes dividends."
+        )
+
     flows: Dict[str, Dict[str, Optional[float]]] = {
         i: {"day": None, "mtd": None, "ytd": None} for i in all_isins
     }
@@ -851,6 +883,8 @@ def generate_mis_reports_data(
                                   d_end, d_start, d_fy, d_mtd, "Previous 14 Fund AR Model Portfolio")
 
     warnings: List[str] = list(current["warnings"])
+    if nifty_fallback_note:
+        warnings.append(nifty_fallback_note)
     if previous:
         warnings.extend(previous["warnings"])
 

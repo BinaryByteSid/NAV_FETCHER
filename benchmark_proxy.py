@@ -21,7 +21,7 @@ surfaces as "N/A".
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -341,6 +341,53 @@ def build_benchmark_series(
         )
 
     return out
+
+
+NIFTY_PRICE_SYMBOL = "^NSEI"
+
+
+def fetch_nifty_price_index(start_date: date, end_date: date) -> Dict[date, float]:
+    """Daily closes for the Nifty 50 *price* index.
+
+    The MIS uses two conventions on purpose: the schemes' own benchmarks are
+    total-return ("TR INR"), but the standalone Nifty column is the headline
+    price index, which excludes dividends. An index fund proxy would answer the
+    total-return question and read roughly half a point high over a quarter, so
+    this column needs the real price index.
+
+    Returns {} on failure -- callers must fall back visibly, never silently.
+    """
+    import requests
+
+    try:
+        resp = requests.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{NIFTY_PRICE_SYMBOL}",
+            params={
+                "period1": int(datetime.combine(start_date - timedelta(days=10),
+                                                datetime.min.time()).timestamp()),
+                "period2": int(datetime.combine(end_date + timedelta(days=2),
+                                                datetime.min.time()).timestamp()),
+                "interval": "1d",
+            },
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                   "Chrome/124.0.0.0 Safari/537.36"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        result = resp.json()["chart"]["result"][0]
+        stamps = result["timestamp"]
+        closes = result["indicators"]["quote"][0]["close"]
+    except Exception as exc:  # network, shape change, empty result
+        print(f"Nifty 50 price index unavailable: {type(exc).__name__}: {exc}")
+        return {}
+
+    levels: Dict[date, float] = {}
+    for ts, close in zip(stamps, closes):
+        if close is None:
+            continue
+        levels[datetime.fromtimestamp(ts, tz=timezone.utc).date()] = float(close)
+    return levels
 
 
 def nav_frame_to_isin_series(df_raw: pd.DataFrame) -> Dict[str, Dict[date, float]]:

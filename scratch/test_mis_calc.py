@@ -25,8 +25,10 @@ from mis_generator import (
     export_mis_to_pdf,
     DEFAULT_SAMPLE_PORTFOLIO,
     MAX_DAILY_GAP_DAYS,
+    NIFTY_KEY,
+    _build_reports,
 )
-from benchmark_proxy import normalize_benchmark_name, STATUS_NONE
+from benchmark_proxy import normalize_benchmark_name, BenchmarkSeries, STATUS_NONE, STATUS_EXACT
 
 
 def test_benchmark_normalization():
@@ -121,6 +123,41 @@ def test_excel_percent_allocations():
     print("   [OK] Percent-formatted allocations handled.")
 
 
+def test_period_baseline_is_prior_close():
+    """A period return compounds its own first day, so it bases off the close
+    BEFORE the period opens. Basing off the start date itself drops day one and
+    understates every return."""
+    print("2c. Period/FY baseline convention...")
+
+    # 31 Mar = 100, then +10% on 1 Apr, then flat to the report date.
+    series = {
+        date(2026, 3, 31): 100.0,
+        date(2026, 4, 1): 110.0,
+        date(2026, 7, 22): 110.0,
+        date(2026, 7, 23): 110.0,
+    }
+    nav = {"INF000A01AA1": series}
+    bm = {NIFTY_KEY: BenchmarkSeries(NIFTY_KEY, NIFTY_KEY, series, STATUS_EXACT)}
+    port = pd.DataFrame([{
+        "Scheme Name": "F", "ISIN": "INF000A01AA1", "Allocation (%)": 100.0,
+        "Benchmark": NIFTY_KEY, "Normalized_Weight": 1.0,
+    }])
+    flows = {"INF000A01AA1": {"day": None, "mtd": None, "ytd": None}}
+
+    block = _build_reports(
+        port, nav, bm, flows,
+        d_end=date(2026, 7, 23), d_start=date(2026, 4, 1),
+        d_fy=date(2026, 4, 1), d_mtd=date(2026, 6, 30), label="T",
+    )
+    row = block["mis3"]["rows"].iloc[0]
+    # From 31 Mar's close of 100 to 110 is 10%. Basing off 1 Apr gives 0%.
+    assert abs(row["FY Scheme Return"] - 10.0) < 1e-6, row["FY Scheme Return"]
+
+    row1 = block["mis1"]["rows"].iloc[0]
+    assert abs(row1["Period Scheme Return"] - 10.0) < 1e-6, row1["Period Scheme Return"]
+    print("   [OK] Baselines take the prior close.")
+
+
 def test_reports(clean_df):
     print("3. MIS report generation (live AMFI fetch, please wait)...")
     results = generate_mis_reports_data(clean_df, date(2026, 4, 1), date(2026, 7, 31))
@@ -185,6 +222,7 @@ def test_exports(results):
 if __name__ == "__main__":
     test_benchmark_normalization()
     test_excel_percent_allocations()
+    test_period_baseline_is_prior_close()
     df = test_validation()
     res = test_reports(df)
     test_exports(res)
