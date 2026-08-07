@@ -46,6 +46,8 @@ from nav_fetcher import (
 from benchmark_proxy import (
     required_proxy_isins,
     build_benchmark_series,
+    parse_supplied_levels,
+    apply_supplied_levels,
     nav_frame_to_isin_series,
     overlay_live_navs,
     describe_gaps,
@@ -903,6 +905,7 @@ def generate_mis_reports_data(
     previous_portfolio_df: Optional[pd.DataFrame] = None,
     include_flows: bool = False,
     progress=None,
+    supplied_levels_df: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
     """Build the full MIS pack for one (optionally two) portfolios."""
     d_end = end_date
@@ -942,6 +945,14 @@ def generate_mis_reports_data(
     proxy_series = nav_frame_to_isin_series(df_nav_raw)
     proxy_series = overlay_live_navs(proxy_series, proxy_isins, d_end)
     bm_series = build_benchmark_series(all_benchmarks, proxy_series, earliest, describe_gaps(nav_gaps))
+
+    # User-supplied index levels win over any proxy, including an EXACT one:
+    # the report is meant to reconcile to the user's own benchmark source.
+    if supplied_levels_df is not None and not supplied_levels_df.empty:
+        supplied, supply_problems = parse_supplied_levels(supplied_levels_df)
+        warnings.extend(supply_problems)
+        bm_series, supply_notes = apply_supplied_levels(bm_series, supplied)
+        warnings.extend(supply_notes)
 
     # The Nifty column is the headline PRICE index, unlike the schemes' own
     # "TR INR" benchmarks. An index-fund proxy answers the total-return
@@ -1554,7 +1565,28 @@ def render_mis_generator_page():
         for w in prev_warns:
             st.warning(f"Previous portfolio: {w}")
 
-    with finance_panel("3. Date Range & Generate"):
+    with finance_panel("3. Benchmark index levels (optional)"):
+        st.caption(
+            "Upload your own index levels to override the proxy funds. Columns: **Benchmark**, "
+            "**Date**, **Close**. Use this for benchmarks a proxy can only approximate — a "
+            "Morningstar TR INR series, or an index with no tracker such as S&P BSE 250 SmallCap. "
+            "Supplied levels take precedence over every proxy."
+        )
+        levels_file = st.file_uploader(
+            "Index levels (.xlsx / .csv)", type=["xlsx", "xls", "csv"], key="mis_levels_upload",
+        )
+        supplied_levels_df = None
+        if levels_file is not None:
+            try:
+                supplied_levels_df = (
+                    pd.read_csv(levels_file) if levels_file.name.lower().endswith(".csv")
+                    else read_portfolio_excel(levels_file)
+                )
+                st.success(f"Loaded {len(supplied_levels_df)} level row(s).")
+            except Exception as exc:
+                st.error(f"Could not read the levels file: {exc}")
+
+    with finance_panel("4. Date Range & Generate"):
         c1, c2, c3 = st.columns([2, 2, 2])
         today = date.today()
         with c1:
@@ -1594,6 +1626,7 @@ def render_mis_generator_page():
                         previous_portfolio_df=prev_clean if not prev_clean.empty else None,
                         include_flows=include_flows,
                         progress=_report,
+                        supplied_levels_df=supplied_levels_df,
                     )
                     st.success("MIS reports generated.")
                 except Exception as exc:

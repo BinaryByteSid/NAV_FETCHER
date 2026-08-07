@@ -507,3 +507,89 @@ def describe_resolution(all_series: Dict[str, BenchmarkSeries]) -> pd.DataFrame:
             "Note": s.note or "",
         })
     return pd.DataFrame(rows)
+
+
+# ─── User-supplied index levels ───────────────────────────────────────────────
+
+STATUS_SUPPLIED = "SUPPLIED"  # levels given by the user; authoritative
+
+
+def parse_supplied_levels(df: pd.DataFrame) -> Tuple[Dict[str, Dict[date, float]], List[str]]:
+    """Read a sheet of index levels into {benchmark_key: {date: level}}.
+
+    Expects a Benchmark/Index column, a Date column and a level column (Close,
+    Level, Value or Index Value). Anything a proxy fund can only approximate --
+    a Morningstar TR INR series, or an index with no tracker at all -- can be
+    supplied here and is then used verbatim.
+
+    Returns (levels_by_key, problems).
+    """
+    problems: List[str] = []
+    out: Dict[str, Dict[str, float]] = {}
+    if df is None or df.empty:
+        return {}, problems
+
+    def find(*cands) -> Optional[str]:
+        for c in df.columns:
+            cl = str(c).strip().lower()
+            if any(t == cl or t in cl for t in cands):
+                return c
+        return None
+
+    name_col = find("benchmark", "index name", "index")
+    date_col = find("date")
+    val_col = find("close", "level", "index value", "value")
+
+    missing = [lbl for lbl, col in
+               (("Benchmark", name_col), ("Date", date_col), ("Close/Level", val_col))
+               if col is None]
+    if missing:
+        problems.append(
+            f"Benchmark levels sheet is missing column(s): {', '.join(missing)}. "
+            f"Expected Benchmark, Date and Close (or Level/Value)."
+        )
+        return {}, problems
+
+    for _, row in df.iterrows():
+        raw_name = str(row[name_col]).strip()
+        if not raw_name or raw_name.lower() in ("nan", "none", "-"):
+            continue
+        key = normalize_benchmark_name(raw_name)
+        parsed = pd.to_datetime(row[date_col], errors="coerce", dayfirst=True)
+        level = pd.to_numeric(row[val_col], errors="coerce")
+        if pd.isna(parsed) or pd.isna(level) or float(level) <= 0:
+            continue
+        out.setdefault(key, {})[parsed.date()] = float(level)
+
+    return out, problems
+
+
+def apply_supplied_levels(
+    series: Dict[str, BenchmarkSeries],
+    supplied: Dict[str, Dict[date, float]],
+) -> Tuple[Dict[str, BenchmarkSeries], List[str]]:
+    """Override resolved benchmarks with user-supplied levels where given.
+
+    Supplied levels win over any proxy, including an EXACT one: the user's
+    source is by definition the series the report is meant to reconcile to.
+    """
+    notes: List[str] = []
+    if not supplied:
+        return series, notes
+
+    for name, bs in list(series.items()):
+        levels = supplied.get(bs.key)
+        if not levels:
+            continue
+        series[name] = BenchmarkSeries(
+            bs.requested, bs.key, dict(levels), STATUS_SUPPLIED,
+            proxy_name="Supplied by user", proxy_isin="-",
+            note=f"{len(levels)} level(s) supplied; proxy fund not used.",
+        )
+        notes.append(f"'{bs.requested}' used {len(levels)} supplied index level(s) instead of a proxy fund.")
+
+    unused = set(supplied) - {bs.key for bs in series.values()}
+    for key in sorted(unused):
+        notes.append(f"Supplied levels for '{key}' matched no benchmark in the portfolio and were ignored.")
+
+    return series, notes
