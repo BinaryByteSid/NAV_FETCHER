@@ -104,11 +104,27 @@ def get_mtd_start_date(target_date: date) -> date:
 Series = Dict[date, float]
 
 
+def _is_skipped_day(d: date) -> bool:
+    """True for days whose observations must not anchor a return.
+
+    Indian equity markets are shut on Saturdays, but some AMCs still stamp a
+    NAV on them. Anchoring a return to a Saturday mark measures the AMC's
+    bookkeeping rather than a market move, so those observations are passed
+    over. Sunday is excluded for the same reason.
+    """
+    return d.weekday() >= 5  # 5 = Saturday, 6 = Sunday
+
+
 def value_asof(series: Optional[Series], target: date) -> Tuple[Optional[float], Optional[date]]:
-    """Latest value on or before ``target``, with the date it came from."""
+    """Latest weekday value on or before ``target``, with the date it came from."""
     if not series:
         return None, None
-    candidates = [d for d in series if d <= target]
+    candidates = [d for d in series if d <= target and not _is_skipped_day(d)]
+    if not candidates:
+        # Fall back to any observation rather than reporting N/A outright: a
+        # weekend-only series is still better than nothing, and the caller
+        # flags a stale anchor separately.
+        candidates = [d for d in series if d <= target]
     if not candidates:
         return None, None
     d = max(candidates)
@@ -124,7 +140,9 @@ def value_prev(series: Optional[Series], before: date) -> Tuple[Optional[float],
     """
     if not series:
         return None, None
-    candidates = [d for d in series if d < before]
+    candidates = [d for d in series if d < before and not _is_skipped_day(d)]
+    if not candidates:
+        candidates = [d for d in series if d < before]
     if not candidates:
         return None, None
     d = max(candidates)
@@ -535,14 +553,19 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
         prev_aum = pd.to_numeric(r.get("Closing AUM as on previous day"), errors="coerce")
         curr_aum = pd.to_numeric(r.get("Actual AUM as on current date"), errors="coerce")
         day_ret = pd.to_numeric(r.get("Daily return"), errors="coerce")
-        if (
+        # An AUM that does not move while the NAV does is a feed that has not
+        # been updated, not a subscription. The flow formula would otherwise
+        # book the entire mark-to-market move as one: Kotak Midcap showed a
+        # 913cr "flow" purely because a 69,849cr AUM was served twice while the
+        # NAV fell 1.3%. Report those days as a flow of zero.
+        aum_stale = (
             pd.notna(prev_aum) and pd.notna(curr_aum) and pd.notna(day_ret)
             and prev_aum == curr_aum
             and abs(float(day_ret)) > STALE_AUM_MIN_MOVE_PCT
-        ):
+        )
+        if aum_stale:
             stale_days += 1
             stale_names.add(str(r.get("Scheme Name", "")).strip())
-            continue
         try:
             d = datetime.strptime(str(r.get("NAV Date", "")).strip(), "%d-%m-%Y").date()
         except ValueError:
@@ -555,7 +578,7 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
             if isin not in result:
                 continue
             bucket = result[isin]
-            val = float(flow)
+            val = 0.0 if aum_stale else float(flow)
             if d == flow_date:
                 bucket["day"] = val
             # mtd_start is a baseline date (last day of the previous month), so
@@ -572,9 +595,9 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
         more = f" and {len(stale_names) - 4} more" if len(stale_names) > 4 else ""
         notes.append(
             f"AMFI repeated the previous day's AUM on {stale_days} scheme-day(s) "
-            f"({shown}{more}). Those days are excluded from Flows, MTD and YTD rather "
-            f"than reported as flows, since an unchanged AUM against a moved NAV is a "
-            f"stale feed, not a subscription."
+            f"({shown}{more}). Those days are counted as zero flow, since an unchanged "
+            f"AUM against a moved NAV is a feed that has not updated rather than a "
+            f"subscription. MTD and YTD therefore understate any real flow on those days."
         )
 
     return result, flow_date
@@ -597,6 +620,18 @@ AUM_FETCH_WORKERS = 6
 # A daily move smaller than this is too small to tell a stale AUM apart from a
 # genuinely flat one, so staleness is only called above it.
 STALE_AUM_MIN_MOVE_PCT = 0.05
+
+
+def _window_return(series: Optional[Series], d_base: date, d_to: date) -> Optional[float]:
+    """Return over (d_base, d_to], both ends resolved to real observations.
+
+    d_base is the day *before* the window opens, so the opening day's own move
+    is inside the window -- the same prior-close convention the period and FY
+    figures use.
+    """
+    v_to, _ = value_asof(series, d_to)
+    v_base, _ = value_asof(series, d_base)
+    return calc_return(v_to, v_base)
 
 
 def _scheme_metrics(series: Series, d_end: date, d_period_base: date,
@@ -661,7 +696,9 @@ def _long_date(d: date) -> str:
 def _build_reports(portfolio_df: pd.DataFrame, nav_series: Dict[str, Series],
                    bm_series: Dict[str, Any], flows: Dict[str, Optional[float]],
                    d_end: date, d_start: date, d_fy: date, d_mtd: date,
-                   label: str, d_flow: Optional[date] = None) -> Dict[str, Any]:
+                   label: str, d_flow: Optional[date] = None,
+                   d_mis3_start: Optional[date] = None,
+                   d_mis3_end: Optional[date] = None) -> Dict[str, Any]:
     """Assemble MIS 1, 2 and 3 for one portfolio.
 
     ``d_flow`` is the day the Flows/MTD/YTD figures run to -- a day behind
@@ -676,6 +713,11 @@ def _build_reports(portfolio_df: pd.DataFrame, nav_series: Dict[str, Series],
     # (the last day of the previous month), so it needs no shift.
     d_period_base = d_start - timedelta(days=1)
     d_fy_base = d_fy - timedelta(days=1)
+
+    # MIS 3 defaults to the financial year but can be pointed at any window.
+    d_m3_start = d_mis3_start or d_fy
+    d_m3_end = d_mis3_end or d_end
+    d_m3_base = d_m3_start - timedelta(days=1)
 
     nifty = bm_series.get(NIFTY_KEY)
     nifty_levels = nifty.levels if nifty is not None else {}
@@ -709,12 +751,15 @@ def _build_reports(portfolio_df: pd.DataFrame, nav_series: Dict[str, Series],
             "Period Excess vs Nifty": _diff(sm["period"], n_metrics["period"]),
             "Period Benchmark Return": bm["period"],
             "Period Excess vs Benchmark": _diff(sm["period"], bm["period"]),
-            # FY / since 1 April
-            "FY Scheme Return": sm["fy"],
-            "FY Nifty Return": n_metrics["fy"],
-            "FY Excess vs Nifty": _diff(sm["fy"], n_metrics["fy"]),
-            "FY Benchmark Return": bm["fy"],
-            "FY Excess vs Benchmark": _diff(sm["fy"], bm["fy"]),
+            # MIS 3 window — the financial year unless a separate range is set.
+            # The "since 1st April" footers on MIS 1/2 keep using sm["fy"].
+            "FY Scheme Return": _window_return(nav_series.get(isin, {}), d_m3_base, d_m3_end),
+            "FY Nifty Return": _window_return(nifty_levels, d_m3_base, d_m3_end),
+            "FY Excess vs Nifty": _diff(_window_return(nav_series.get(isin, {}), d_m3_base, d_m3_end),
+                                        _window_return(nifty_levels, d_m3_base, d_m3_end)),
+            "FY Benchmark Return": _window_return(bm_levels, d_m3_base, d_m3_end),
+            "FY Excess vs Benchmark": _diff(_window_return(nav_series.get(isin, {}), d_m3_base, d_m3_end),
+                                            _window_return(bm_levels, d_m3_base, d_m3_end)),
             # Supplementary flow columns, in crores — these mirror the
             # reference report, where MTD and YTD are cumulative net flows
             # rather than returns.
@@ -852,9 +897,9 @@ def _build_reports(portfolio_df: pd.DataFrame, nav_series: Dict[str, Series],
     ]
     mis3 = df.sort_values("FY Excess vs Nifty", ascending=False, na_position="last").reset_index(drop=True)
 
-    fy_range = f"{_ordinal(d_fy.day)} {d_fy:%B %Y} - {_long_date(d_end)}"
+    fy_range = f"{_long_date(d_m3_start)} - {_long_date(d_m3_end)}"
     mis3_spec = {
-        "title": f"{label} — Performance since {_ordinal(d_fy.day)} {d_fy:%B %Y}",
+        "title": f"{label} — Performance {_long_date(d_m3_start)} to {_long_date(d_m3_end)}",
         "columns": mis3_cols,
         "headers": {
             "Scheme Name": "Scheme Name", "ISIN": "ISIN",
@@ -935,13 +980,17 @@ def generate_mis_reports_data(
     include_flows: bool = False,
     progress=None,
     supplied_levels_df: Optional[pd.DataFrame] = None,
+    mis3_start: Optional[date] = None,
+    mis3_end: Optional[date] = None,
 ) -> Dict[str, Any]:
     """Build the full MIS pack for one (optionally two) portfolios."""
     d_end = end_date
     d_start = start_date
     d_fy = get_fy_start_date(end_date)
     d_mtd = get_mtd_start_date(end_date)
-    earliest = min(d_start, d_fy, d_mtd, d_end - timedelta(days=10))
+    d_m3_start = mis3_start or d_fy
+    d_m3_end = mis3_end or d_end
+    earliest = min(d_start, d_fy, d_mtd, d_m3_start, d_end - timedelta(days=10))
 
     frames = [portfolio_df]
     if previous_portfolio_df is not None and not previous_portfolio_df.empty:
@@ -956,7 +1005,9 @@ def generate_mis_reports_data(
     proxy_isins = required_proxy_isins(all_benchmarks)
     fetch_isins = list(dict.fromkeys(all_isins + proxy_isins))
 
-    df_nav_raw, nav_gaps = fetch_mis_nav_history(fetch_isins, earliest, d_end, progress=progress)
+    df_nav_raw, nav_gaps = fetch_mis_nav_history(
+        fetch_isins, earliest, max(d_end, d_m3_end), progress=progress
+    )
     if df_nav_raw.empty:
         raise ValueError(
             "AMFI returned no NAV history for the portfolio ISINs. Check the ISINs and the date range."
@@ -1010,12 +1061,14 @@ def generate_mis_reports_data(
         )
 
     current = _build_reports(portfolio_df, nav_series, bm_series, flows,
-                             d_end, d_start, d_fy, d_mtd, "14 Fund AR Model Portfolio", d_flow=flow_date)
+                             d_end, d_start, d_fy, d_mtd, "14 Fund AR Model Portfolio", d_flow=flow_date,
+                             d_mis3_start=d_m3_start, d_mis3_end=d_m3_end)
 
     previous = None
     if previous_portfolio_df is not None and not previous_portfolio_df.empty:
         previous = _build_reports(previous_portfolio_df, nav_series, bm_series, flows,
-                                  d_end, d_start, d_fy, d_mtd, "Previous 14 Fund AR Model Portfolio", d_flow=flow_date)
+                                  d_end, d_start, d_fy, d_mtd, "Previous 14 Fund AR Model Portfolio", d_flow=flow_date,
+                                  d_mis3_start=d_m3_start, d_mis3_end=d_m3_end)
 
     warnings: List[str] = list(current["warnings"])
     if nifty_fallback_note:
@@ -1059,6 +1112,8 @@ def generate_mis_reports_data(
             "start_date": d_start,
             "end_date": d_end,
             "fy_start": d_fy,
+            "mis3_start": d_m3_start,
+            "mis3_end": d_m3_end,
             "mtd_start": d_mtd,
         },
         "include_flows": include_flows,
@@ -1702,6 +1757,26 @@ def render_mis_generator_page():
         if start_date > end_date:
             st.error("Period Start Date must be on or before the Report Date.")
 
+        use_own_m3 = st.checkbox(
+            "Use a separate date range for MIS 3",
+            value=False, key="mis3_own_range",
+            help="MIS 3 defaults to the financial year (1 April) through the Report Date.",
+        )
+        mis3_start = mis3_end = None
+        if use_own_m3:
+            m3c1, m3c2 = st.columns(2)
+            with m3c1:
+                mis3_start = st.date_input(
+                    "MIS 3 Start Date", value=get_fy_start_date(end_date),
+                    max_value=today, key="mis3_start_date",
+                )
+            with m3c2:
+                mis3_end = st.date_input(
+                    "MIS 3 End Date", value=end_date, max_value=today, key="mis3_end_date",
+                )
+            if mis3_start > mis3_end:
+                st.error("MIS 3 Start Date must be on or before its End Date.")
+
         if st.button("⚡ Generate MIS Reports", type="primary", use_container_width=True):
             if clean_df.empty:
                 st.error("Cannot generate MIS reports without valid portfolio input.")
@@ -1727,6 +1802,8 @@ def render_mis_generator_page():
                         include_flows=include_flows,
                         progress=_report,
                         supplied_levels_df=supplied_levels_df,
+                        mis3_start=mis3_start,
+                        mis3_end=mis3_end,
                     )
                     st.success("MIS reports generated.")
                 except Exception as exc:
