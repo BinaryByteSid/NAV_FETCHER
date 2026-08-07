@@ -457,12 +457,19 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
 
     try:
         df_port = load_portfolio_aum_data()
+        if df_port.empty and notes is not None:
+            notes.append(
+                "The fallback AUM workbook ('portfolio last 6 months.xlsx') was not found, so every "
+                "AUM figure depends on the live AMFI API; any day it declines leaves that scheme's "
+                "Flows, MTD and YTD blank rather than approximate."
+            )
         # One API call per day/category: a financial year is hundreds of them.
         # Bound the wall time and parallelise modestly rather than letting the
         # report hang -- partial live AUM plus a warning beats no report.
         df_aum = populate_actual_aum(
             df_slice, df_port, want_aum=True, fetch_live_aum=True,
-            budget_seconds=AUM_BUDGET_SECONDS, max_workers=4, on_incomplete=_note_partial,
+            budget_seconds=AUM_BUDGET_SECONDS, max_workers=AUM_FETCH_WORKERS,
+            on_incomplete=_note_partial,
         )
         df_flows = calculate_flows_for_dataframe(
             df_aum,
@@ -549,8 +556,12 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
 # apart to be called a daily move.
 MAX_DAILY_GAP_DAYS = 7
 
-# Wall-clock cap on the live-AUM fetch behind the Flows column.
-AUM_BUDGET_SECONDS = 90.0
+# Wall-clock cap on the live-AUM fetch behind the Flows column. A financial
+# year spans ~78 trading days across ~8 equity categories, so a full book is
+# ~600 calls; 90s only got through a third of them, and whichever categories
+# lost the race came back N/A while their neighbours reported numbers.
+AUM_BUDGET_SECONDS = 300.0
+AUM_FETCH_WORKERS = 6
 
 # A daily move smaller than this is too small to tell a stale AUM apart from a
 # genuinely flat one, so staleness is only called above it.

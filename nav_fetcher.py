@@ -93,7 +93,9 @@ def load_portfolio_aum_data() -> pd.DataFrame:
     paths = [
         "../portfolio last 6 months.xlsx",
         "portfolio last 6 months.xlsx",
+        "../Misc/portfolio last 6 months.xlsx",
         "c:/Users/sidha/OneDrive/Desktop/portfolio last 6 months.xlsx",
+        "c:/Users/sidha/OneDrive/Desktop/Misc/portfolio last 6 months.xlsx",
     ]
     for path in paths:
         if os.path.exists(path):
@@ -509,6 +511,27 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
             if perf_rows:
                 perf_lookup[(date_str, asset_class)] = perf_rows
                 fetched += 1
+
+    # Retry whatever AMFI declined. A single failed day/category is not evenly
+    # damaging: MTD and YTD sum many days and barely notice one hole, but the
+    # headline day figure needs its own date and the one before it, so a single
+    # 503 there turns that scheme's Flows into N/A while its neighbours report
+    # numbers. AMFI's failures are transient, so one more pass usually fills it.
+    missing = [(ac, ds) for ac, ds in jobs if (ds, ac) not in perf_lookup]
+    if missing and not _expired():
+        time.sleep(2)
+        for asset_class, date_str in missing:
+            if _expired():
+                break
+            m_id, c_id, s_id = map_section_to_ids(asset_class)
+            try:
+                perf_rows = fetch_performance_data_from_api(date_str, m_id, c_id, s_id)
+            except Exception:
+                perf_rows = None
+            if perf_rows:
+                perf_lookup[(date_str, asset_class)] = perf_rows
+                fetched += 1
+            time.sleep(0.4)
 
     if on_incomplete and fetched < len(jobs):
         on_incomplete(fetched, len(jobs))
