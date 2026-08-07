@@ -221,6 +221,35 @@ def read_portfolio_excel(file_obj) -> pd.DataFrame:
     return df
 
 
+_PORTFOLIO_KEY_COLS = ("Scheme Name", "ISIN", "Allocation (%)", "Benchmark")
+
+
+def _portfolio_signature(df: Optional[pd.DataFrame]) -> tuple:
+    """Order-insensitive fingerprint of a portfolio, for change detection.
+
+    Compares only the four fields that define a holding, as strings, so a
+    Streamlit rerun that reorders rows or re-types a number does not read as an
+    edit. Reordering alone is not a portfolio change, so rows are sorted.
+    """
+    if df is None or df.empty:
+        return ()
+    cols = [c for c in _PORTFOLIO_KEY_COLS if c in df.columns]
+    if not cols:
+        return ()
+    rows = []
+    for _, r in df[cols].iterrows():
+        cells = []
+        for c in cols:
+            v = r[c]
+            if isinstance(v, float):
+                cells.append(f"{v:.6f}")          # 7.0 and 7.000001 are the same holding
+            else:
+                cells.append(str(v).strip().upper())
+        if any(cell not in ("", "NAN", "NONE") for cell in cells):
+            rows.append(tuple(cells))
+    return tuple(sorted(rows))
+
+
 def validate_and_normalize_portfolio(df_input: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], List[str]]:
     """Validate portfolio input and prepare normalized allocations.
 
@@ -1552,18 +1581,80 @@ def render_mis_generator_page():
                 f"**Total allocation:** {clean_df['Allocation (%)'].sum():.2f}%"
             )
 
+        # Remember the version of the current portfolio that was on screen before
+        # this edit, so "Previous Portfolio" can carry it over automatically.
+        cur_sig = _portfolio_signature(current_portfolio_df)
+        if st.session_state.get("mis_current_sig") is None:
+            st.session_state["mis_current_sig"] = cur_sig
+            st.session_state["mis_current_df"] = current_portfolio_df.copy()
+        elif cur_sig != st.session_state["mis_current_sig"]:
+            # The current portfolio just changed: yesterday's current is today's previous.
+            st.session_state["mis_auto_prev_df"] = st.session_state.get("mis_current_df")
+            st.session_state["mis_current_sig"] = cur_sig
+            st.session_state["mis_current_df"] = current_portfolio_df.copy()
+
     with finance_panel("2. Previous Portfolio (optional)"):
         st.caption(
-            "Add the prior portfolio to render the second comparison block that appears beneath each "
-            "MIS table in the reference report. Leave empty to skip it."
+            "Renders the second comparison block that appears beneath each MIS table in the "
+            "reference report. Leave empty to skip it."
         )
-        prev_raw = st.data_editor(
-            st.session_state["prev_portfolio_input_df"], num_rows="dynamic",
-            use_container_width=True, column_config=col_cfg, key="mis_prev_editor",
+        prev_mode = st.radio(
+            "Previous Portfolio Source",
+            ["Auto (carry over previous version)", "Manual Entry / Edit", "Upload Excel File"],
+            horizontal=True, key="mis_prev_mode",
         )
+
+        auto_prev = st.session_state.get("mis_auto_prev_df")
+
+        if prev_mode == "Auto (carry over previous version)":
+            if auto_prev is not None and not auto_prev.empty:
+                st.success(
+                    f"Carried over the {len(auto_prev)}-scheme portfolio that was in section 1 "
+                    f"before your last change."
+                )
+                st.dataframe(auto_prev, use_container_width=True, hide_index=True)
+                prev_raw = auto_prev
+            else:
+                st.info(
+                    "Nothing to carry over yet. Edit or re-upload the portfolio in section 1 and "
+                    "its previous version appears here automatically."
+                )
+                prev_raw = pd.DataFrame(columns=["Scheme Name", "ISIN", "Allocation (%)", "Benchmark"])
+
+        elif prev_mode == "Manual Entry / Edit":
+            seed = st.session_state["prev_portfolio_input_df"]
+            if seed.empty and auto_prev is not None and not auto_prev.empty:
+                seed = auto_prev  # start from the carried-over version rather than blank
+            prev_raw = st.data_editor(
+                seed, num_rows="dynamic",
+                use_container_width=True, column_config=col_cfg, key="mis_prev_editor",
+            )
+
+        else:
+            prev_file = st.file_uploader(
+                "Upload Previous Portfolio Excel (.xlsx)", type=["xlsx", "xls"],
+                help="Columns: Scheme Name, ISIN, Allocation (%), Benchmark",
+                key="mis_prev_upload",
+            )
+            if prev_file is not None:
+                try:
+                    prev_raw = read_portfolio_excel(prev_file)
+                    st.success(f"Loaded {len(prev_raw)} rows.")
+                except Exception as exc:
+                    st.error(f"Error reading previous portfolio file: {exc}")
+                    prev_raw = pd.DataFrame(columns=["Scheme Name", "ISIN", "Allocation (%)", "Benchmark"])
+            else:
+                st.info("Upload an Excel file above, or switch to another source.")
+                prev_raw = pd.DataFrame(columns=["Scheme Name", "ISIN", "Allocation (%)", "Benchmark"])
+
         prev_clean, prev_warns, _prev_errs = validate_and_normalize_portfolio(prev_raw)
         for w in prev_warns:
             st.warning(f"Previous portfolio: {w}")
+        if not prev_clean.empty:
+            st.caption(
+                f"📋 **Previous schemes:** {len(prev_clean)} | "
+                f"**Total allocation:** {prev_clean['Allocation (%)'].sum():.2f}%"
+            )
 
     with finance_panel("3. Benchmark index levels (optional)"):
         st.caption(
