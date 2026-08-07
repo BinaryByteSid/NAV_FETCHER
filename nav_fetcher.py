@@ -553,6 +553,38 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
                 except Exception:
                     pass
                     
+    # AMFI sometimes republishes yesterday's AUM verbatim for a scheme. Left
+    # alone that is poison for flows: the engine reads an unchanged AUM against
+    # a NAV that moved and books the whole difference as a subscription. A
+    # 69,848.88 repeated against a -1.31% NAV day invents ~914cr of inflow.
+    # The derived AUM scales with NAV, so it implies no flow -- the honest
+    # reading when the AUM was simply not updated.
+    # The repair has to stay on the live series' own level. Substituting the
+    # derived AUM here looks reasonable and is badly wrong: the two series sit
+    # ~10% apart (69,848 live vs 63,562 derived for one scheme), so splicing
+    # one day of the other reads as a 6,286cr redemption. Instead carry the
+    # previous day's AUM forward scaled by the NAV move, which is what an
+    # untouched portfolio does and implies no flow.
+    date_col_sort = "NAV Date" if "NAV Date" in df_res.columns else "Date"
+    if {"Scheme Code", "AUM", "NAV"} <= set(df_res.columns):
+        df_res = df_res.sort_values(["Scheme Code", date_col_sort])
+        for _code, idx in df_res.groupby("Scheme Code", sort=False).groups.items():
+            idx = list(idx)
+            for i in range(1, len(idx)):
+                cur, prev = idx[i], idx[i - 1]
+                a_cur, a_prev = df_res.at[cur, "AUM"], df_res.at[prev, "AUM"]
+                n_cur, n_prev = df_res.at[cur, "NAV"], df_res.at[prev, "NAV"]
+                if pd.isna(a_cur) or pd.isna(a_prev) or a_cur != a_prev:
+                    continue
+                if pd.isna(n_cur) or pd.isna(n_prev) or n_prev == 0:
+                    continue
+                # A flat AUM on a flat NAV is unremarkable; only a repeat while
+                # the NAV moved indicates the AUM was never updated.
+                if abs(n_cur - n_prev) <= abs(n_prev) * 1e-6:
+                    continue
+                df_res.at[cur, "AUM"] = a_prev * (n_cur / n_prev)
+        df_res = df_res.sort_index()
+
     # Drop temporary column
     df_res = df_res.drop(columns=["Date_Str_Temp"])
     return df_res
