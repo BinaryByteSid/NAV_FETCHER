@@ -1587,6 +1587,11 @@ def render_mis_generator_page():
         if st.session_state.get("mis_current_sig") is None:
             st.session_state["mis_current_sig"] = cur_sig
             st.session_state["mis_current_df"] = current_portfolio_df.copy()
+            # Seed the previous portfolio with the current one so every report
+            # carries both blocks from the first run. They stay identical until
+            # the current portfolio actually changes, at which point the prior
+            # version takes over below.
+            st.session_state["mis_auto_prev_df"] = current_portfolio_df.copy()
         elif cur_sig != st.session_state["mis_current_sig"]:
             # The current portfolio just changed: yesterday's current is today's previous.
             st.session_state["mis_auto_prev_df"] = st.session_state.get("mis_current_df")
@@ -1608,17 +1613,21 @@ def render_mis_generator_page():
 
         if prev_mode == "Auto (carry over previous version)":
             if auto_prev is not None and not auto_prev.empty:
-                st.success(
-                    f"Carried over the {len(auto_prev)}-scheme portfolio that was in section 1 "
-                    f"before your last change."
-                )
+                unchanged = _portfolio_signature(auto_prev) == _portfolio_signature(current_portfolio_df)
+                if unchanged:
+                    st.info(
+                        f"Same as the current portfolio ({len(auto_prev)} schemes). Both blocks are "
+                        f"written to every report; change section 1 and this holds the prior version."
+                    )
+                else:
+                    st.success(
+                        f"Carried over the {len(auto_prev)}-scheme portfolio that was in section 1 "
+                        f"before your last change."
+                    )
                 st.dataframe(auto_prev, use_container_width=True, hide_index=True)
                 prev_raw = auto_prev
             else:
-                st.info(
-                    "Nothing to carry over yet. Edit or re-upload the portfolio in section 1 and "
-                    "its previous version appears here automatically."
-                )
+                st.info("Add schemes in section 1 and they appear here automatically.")
                 prev_raw = pd.DataFrame(columns=["Scheme Name", "ISIN", "Allocation (%)", "Benchmark"])
 
         elif prev_mode == "Manual Entry / Edit":
