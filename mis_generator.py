@@ -104,6 +104,9 @@ def get_mtd_start_date(target_date: date) -> date:
 Series = Dict[date, float]
 
 
+SKIP_WEEKEND_MARKS = True  # module-level switch, set from the UI each run
+
+
 def _is_skipped_day(d: date) -> bool:
     """True for days whose observations must not anchor a return.
 
@@ -112,6 +115,8 @@ def _is_skipped_day(d: date) -> bool:
     bookkeeping rather than a market move, so those observations are passed
     over. Sunday is excluded for the same reason.
     """
+    if not SKIP_WEEKEND_MARKS:
+        return False
     return d.weekday() >= 5  # 5 = Saturday, 6 = Sunday
 
 
@@ -240,6 +245,20 @@ def read_portfolio_excel(file_obj) -> pd.DataFrame:
 
 
 _PORTFOLIO_KEY_COLS = ("Scheme Name", "ISIN", "Allocation (%)", "Benchmark")
+
+
+def _report_input_signature(current, previous, d_start, d_end, m3_start, m3_end,
+                            include_flows, skip_saturdays) -> tuple:
+    """Everything that changes a report's contents, in one comparable value.
+
+    Used to tell the user their downloads are stale, since the buttons render
+    from the last generated result rather than from what is currently on screen.
+    """
+    return (
+        _portfolio_signature(current),
+        _portfolio_signature(previous),
+        d_start, d_end, m3_start, m3_end, bool(include_flows), bool(skip_saturdays),
+    )
 
 
 def _portfolio_signature(df: Optional[pd.DataFrame]) -> tuple:
@@ -441,6 +460,50 @@ def build_nav_series(df_nav_raw: pd.DataFrame, isin_list: List[str]) -> Dict[str
 
 # ─── Flows ────────────────────────────────────────────────────────────────────
 
+# Quant publishes its AUM a day ahead of the rest of the industry, so the usual
+# pairing measures the wrong interval for their schemes. AMFI names every one of
+# their schemes 'quant <fund>', so a prefix test is enough and will not catch an
+# unrelated fund with 'quant' elsewhere in its name.
+
+
+def _align_quant_nav(df_aum: pd.DataFrame) -> pd.DataFrame:
+    """Pair Quant AMC's AUM with the return that actually spans it.
+
+    Quant publishes AUM a day ahead of the rest of the industry: the figure
+    stamped for day D already reflects day D+1's book. The flow formula
+    AUM_t - AUM_(t-1) * (1 + return) then charges the wrong day's
+    mark-to-market against the pair, which is why Quant Large Cap reported a
+    51.15cr flow where the reference shows 2.04.
+
+    Taking the reported AUM as the previous day's and the next day's as the
+    current one -- with the return otherwise normal -- is the same as pairing
+    the unchanged AUM column with the *preceding* day's return. Shifting the
+    NAV column forward one observation does exactly that, and leaves the AUM
+    figures themselves untouched. Other AMCs are unaffected.
+    """
+    if df_aum.empty or "NAV" not in df_aum.columns or "Scheme Name" not in df_aum.columns:
+        return df_aum
+
+    is_quant = df_aum["Scheme Name"].astype(str).str.lower().str.startswith("quant")
+    if not is_quant.any():
+        return df_aum
+
+    date_col = "NAV Date" if "NAV Date" in df_aum.columns else None
+    if date_col is None:
+        return df_aum
+
+    out = df_aum.copy()
+    for _isin, grp in out[is_quant].groupby("ISIN Div Payout / ISIN Growth"):
+        grp = grp.sort_values(date_col)
+        shifted = grp["NAV"].shift(1)
+        # The first observation has no predecessor; keep its own NAV so the
+        # opening day is simply not counted rather than becoming NaN.
+        shifted.iloc[0] = grp["NAV"].iloc[0]
+        out.loc[grp.index, "NAV"] = shifted.values
+
+    return out
+
+
 def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
                          report_date: date, mtd_start: date, fy_start: date,
                          notes: Optional[List[str]] = None) -> Dict[str, Dict[str, Optional[float]]]:
@@ -520,6 +583,7 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
             budget_seconds=AUM_BUDGET_SECONDS, max_workers=AUM_FETCH_WORKERS,
             on_incomplete=_note_partial,
         )
+        df_aum = _align_quant_nav(df_aum)
         df_flows = calculate_flows_for_dataframe(
             df_aum,
             min(keep),
@@ -545,10 +609,16 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
     stale_days = 0
     stale_names: set = set()
 
+    missing_aum_days = 0
+
     for _, r in df_flows.iterrows():
         flow = r.get("Net flows on current day")
-        if flow is None or pd.isna(flow):
-            continue
+        # No AUM for the day means no flow can be measured. Book zero rather
+        # than dropping the day, so a scheme with a patchy feed still reports a
+        # number instead of N/A -- at the cost of understating a real flow.
+        flow_missing = flow is None or pd.isna(flow)
+        if flow_missing:
+            missing_aum_days += 1
 
         prev_aum = pd.to_numeric(r.get("Closing AUM as on previous day"), errors="coerce")
         curr_aum = pd.to_numeric(r.get("Actual AUM as on current date"), errors="coerce")
@@ -559,7 +629,8 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
         # 913cr "flow" purely because a 69,849cr AUM was served twice while the
         # NAV fell 1.3%. Report those days as a flow of zero.
         aum_stale = (
-            pd.notna(prev_aum) and pd.notna(curr_aum) and pd.notna(day_ret)
+            not flow_missing
+            and pd.notna(prev_aum) and pd.notna(curr_aum) and pd.notna(day_ret)
             and prev_aum == curr_aum
             and abs(float(day_ret)) > STALE_AUM_MIN_MOVE_PCT
         )
@@ -578,7 +649,7 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
             if isin not in result:
                 continue
             bucket = result[isin]
-            val = 0.0 if aum_stale else float(flow)
+            val = 0.0 if (aum_stale or flow_missing) else float(flow)
             if d == flow_date:
                 bucket["day"] = val
             # mtd_start is a baseline date (last day of the previous month), so
@@ -589,6 +660,13 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
             if d >= fy_start:
                 bucket["ytd"] = (bucket["ytd"] or 0.0) + val
             break
+
+    if missing_aum_days and notes is not None:
+        notes.append(
+            f"AMFI served no AUM on {missing_aum_days} scheme-day(s); those days are "
+            f"counted as zero flow, so Flows, MTD and YTD understate any real movement "
+            f"on them."
+        )
 
     if stale_days and notes is not None:
         shown = ", ".join(sorted(n for n in stale_names if n)[:4])
@@ -978,12 +1056,15 @@ def generate_mis_reports_data(
     end_date: date,
     previous_portfolio_df: Optional[pd.DataFrame] = None,
     include_flows: bool = False,
+    skip_saturdays: bool = True,
     progress=None,
     supplied_levels_df: Optional[pd.DataFrame] = None,
     mis3_start: Optional[date] = None,
     mis3_end: Optional[date] = None,
 ) -> Dict[str, Any]:
     """Build the full MIS pack for one (optionally two) portfolios."""
+    global SKIP_WEEKEND_MARKS
+    SKIP_WEEKEND_MARKS = bool(skip_saturdays)
     d_end = end_date
     d_start = start_date
     d_fy = get_fy_start_date(end_date)
@@ -1693,6 +1774,10 @@ def render_mis_generator_page():
                 seed, num_rows="dynamic",
                 use_container_width=True, column_config=col_cfg, key="mis_prev_editor",
             )
+            # Persist edits: the Generate click reruns the script, and without
+            # this the editor is reseeded from the carry-over and the edits are
+            # silently discarded before the report is built.
+            st.session_state["prev_portfolio_input_df"] = prev_raw.copy()
 
         else:
             prev_file = st.file_uploader(
@@ -1703,6 +1788,7 @@ def render_mis_generator_page():
             if prev_file is not None:
                 try:
                     prev_raw = read_portfolio_excel(prev_file)
+                    st.session_state["prev_portfolio_input_df"] = prev_raw.copy()
                     st.success(f"Loaded {len(prev_raw)} rows.")
                 except Exception as exc:
                     st.error(f"Error reading previous portfolio file: {exc}")
@@ -1757,6 +1843,12 @@ def render_mis_generator_page():
         if start_date > end_date:
             st.error("Period Start Date must be on or before the Report Date.")
 
+        skip_saturdays = st.checkbox(
+            "Skip Saturday / Sunday NAV marks", value=True, key="mis_skip_sat",
+            help="Markets are shut at weekends, but some AMCs still stamp a NAV. "
+                 "On: those marks never anchor a return. Off: every published mark is used.",
+        )
+
         use_own_m3 = st.checkbox(
             "Use a separate date range for MIS 3",
             value=False, key="mis3_own_range",
@@ -1796,10 +1888,15 @@ def render_mis_generator_page():
                     )
 
                 try:
+                    st.session_state["mis_inputs_sig"] = _report_input_signature(
+                        clean_df, prev_clean, start_date, end_date, mis3_start, mis3_end,
+                        include_flows, skip_saturdays,
+                    )
                     st.session_state["mis_results"] = generate_mis_reports_data(
                         clean_df, start_date, end_date,
                         previous_portfolio_df=prev_clean if not prev_clean.empty else None,
                         include_flows=include_flows,
+                        skip_saturdays=skip_saturdays,
                         progress=_report,
                         supplied_levels_df=supplied_levels_df,
                         mis3_start=mis3_start,
@@ -1815,6 +1912,20 @@ def render_mis_generator_page():
     res = st.session_state.get("mis_results")
     if not res:
         return
+
+    # The download buttons serve whatever was last generated. If any input has
+    # changed since, say so plainly rather than handing over a file that no
+    # longer matches what is on screen.
+    live_sig = _report_input_signature(
+        clean_df, prev_clean, start_date, end_date, mis3_start, mis3_end,
+        include_flows, skip_saturdays,
+    )
+    if st.session_state.get("mis_inputs_sig") not in (None, live_sig):
+        st.warning(
+            "⚠️ Inputs have changed since this report was generated — the tables and "
+            "downloads below are from the previous run. Click **Generate MIS Reports** "
+            "to rebuild them."
+        )
 
     for w in res.get("warnings", []):
         st.warning(w)
