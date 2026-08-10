@@ -593,3 +593,141 @@ def apply_supplied_levels(
         notes.append(f"Supplied levels for '{key}' matched no benchmark in the portfolio and were ignored.")
 
     return series, notes
+
+
+# ─── NSE Total Return Index (niftyindices.com) ────────────────────────────────
+
+STATUS_TRI = "TRI"  # official Total Return Index — the benchmark itself, not a proxy
+
+# Benchmark key -> the index name niftyindices.com expects. Only NSE indices
+# appear here; BSE ones are not served by this feed and keep the fund proxy.
+NIFTY_TRI_NAMES: Dict[str, str] = {
+    "NIFTY 50": "NIFTY 50",
+    "NIFTY 100": "NIFTY 100",
+    "NIFTY 200": "NIFTY 200",
+    "NIFTY 500": "NIFTY 500",
+    "NIFTY NEXT 50": "NIFTY NEXT 50",
+    "NIFTY MIDCAP 150": "NIFTY MIDCAP 150",
+    "NIFTY MIDCAP 100": "NIFTY MIDCAP 100",
+    "NIFTY SMALLCAP 250": "NIFTY SMALLCAP 250",
+    "NIFTY LARGEMIDCAP 250": "NIFTY LARGEMIDCAP 250",
+    "NIFTY INFRASTRUCTURE": "NIFTY INFRASTRUCTURE",
+    "NIFTY 500 MULTICAP 50:25:25": "NIFTY500 MULTICAP 50:25:25",
+    "NIFTY BANK": "NIFTY BANK",
+}
+
+_TRI_URL = "https://www.niftyindices.com/BackPage/getTotalReturnIndexString"
+_TRI_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+
+def _tri_session():
+    import requests
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": _TRI_UA,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Content-Type": "application/json; charset=utf-8",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://www.niftyindices.com/reports/historical-data",
+        "Origin": "https://www.niftyindices.com",
+    })
+    try:
+        s.get("https://www.niftyindices.com/reports/historical-data", timeout=20)
+    except Exception:
+        pass  # the landing call only warms cookies; the POST works without it
+    return s
+
+
+_TRI_CACHE: Dict[Tuple[str, date, date], Dict[date, float]] = {}
+
+
+def fetch_nifty_tri_series(index_name: str, start_date: date, end_date: date) -> Dict[date, float]:
+    """Daily Total Return Index levels from niftyindices.com.
+
+    This is the actual "TR INR" series the MIS benchmarks name, so it removes
+    the index-fund proxy's TER drag entirely. Verified against the reference
+    report: all six NSE benchmarks reproduce to the decimal over 1 Apr - 23 Jul.
+
+    The endpoint answers with Content-Type text/html while returning a JSON
+    body, so the response is parsed rather than content-sniffed. Returns {} on
+    any failure — callers fall back to the proxy fund rather than fabricating.
+    """
+    import json as _json
+    import requests
+
+    ck = (index_name, start_date, end_date)
+    if ck in _TRI_CACHE:
+        return _TRI_CACHE[ck]
+
+    payload = (
+        "{'name':'%s','startDate':'%s','endDate':'%s','indexName':'%s'}"
+        % (index_name, start_date.strftime("%d-%b-%Y"),
+           end_date.strftime("%d-%b-%Y"), index_name)
+    )
+    try:
+        resp = _tri_session().post(
+            _TRI_URL, data=_json.dumps({"cinfo": payload}), timeout=45
+        )
+    except requests.exceptions.RequestException:
+        return {}
+
+    body = resp.text.strip()
+    if not body.startswith("["):
+        # An error page rather than data; never guess a level.
+        return {}
+    try:
+        rows = _json.loads(body)
+    except ValueError:
+        return {}
+
+    out: Dict[date, float] = {}
+    for row in rows:
+        raw_date = str(row.get("Date", "")).strip()
+        raw_val = str(row.get("TotalReturnsIndex", "")).replace(",", "").strip()
+        if not raw_date or not raw_val or raw_val == "-":
+            continue
+        try:
+            d = datetime.strptime(raw_date, "%d %b %Y").date()
+            val = float(raw_val)
+        except ValueError:
+            continue
+        if val > 0:
+            out[d] = val
+    if out:
+        _TRI_CACHE[ck] = out
+    return out
+
+
+def apply_tri_levels(
+    series: Dict[str, BenchmarkSeries],
+    start_date: date,
+    end_date: date,
+    exclude_keys: Tuple[str, ...] = (),
+) -> Tuple[Dict[str, BenchmarkSeries], List[str]]:
+    """Replace proxy-fund series with the official TRI where one exists.
+
+    Keys in ``exclude_keys`` are left alone — the Nifty 50 comparison column in
+    MIS 1 tracks the price index in the reference report, so switching it to
+    total return would silently change a figure that already reconciles.
+    """
+    notes: List[str] = []
+    for name, bs in list(series.items()):
+        if bs.key in exclude_keys:
+            continue
+        tri_name = NIFTY_TRI_NAMES.get(bs.key)
+        if not tri_name:
+            continue
+        levels = fetch_nifty_tri_series(tri_name, start_date - timedelta(days=20), end_date)
+        if not levels:
+            notes.append(
+                f"'{bs.requested}': NSE total-return feed unavailable; fell back to "
+                f"the {bs.proxy_name or 'index fund'} proxy."
+            )
+            continue
+        series[name] = BenchmarkSeries(
+            bs.requested, bs.key, levels, STATUS_TRI,
+            proxy_name=f"NSE Total Return Index ({tri_name})", proxy_isin="-",
+            note="Official total-return series; no proxy fund used.",
+        )
+    return series, notes

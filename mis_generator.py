@@ -48,6 +48,7 @@ from benchmark_proxy import (
     build_benchmark_series,
     parse_supplied_levels,
     apply_supplied_levels,
+    apply_tri_levels,
     nav_frame_to_isin_series,
     overlay_live_navs,
     describe_gaps,
@@ -1107,13 +1108,21 @@ def generate_mis_reports_data(
     proxy_series = overlay_live_navs(proxy_series, proxy_isins, d_end)
     bm_series = build_benchmark_series(all_benchmarks, proxy_series, earliest, describe_gaps(nav_gaps))
 
+    # Official NSE total-return levels replace the proxy funds where available.
+    # NIFTY_KEY is excluded on purpose: the Nifty comparison column reconciles
+    # against the reference on the *price* index, and switching it to total
+    # return would quietly move a figure that already matches.
+    bm_series, bm_notes = apply_tri_levels(
+        bm_series, earliest, max(d_end, d_m3_end), exclude_keys=(NIFTY_KEY,)
+    )
+
     # User-supplied index levels win over any proxy, including an EXACT one:
     # the report is meant to reconcile to the user's own benchmark source.
     if supplied_levels_df is not None and not supplied_levels_df.empty:
         supplied, supply_problems = parse_supplied_levels(supplied_levels_df)
-        warnings.extend(supply_problems)
+        bm_notes.extend(supply_problems)
         bm_series, supply_notes = apply_supplied_levels(bm_series, supplied)
-        warnings.extend(supply_notes)
+        bm_notes.extend(supply_notes)
 
     # The Nifty column is the headline PRICE index, unlike the schemes' own
     # "TR INR" benchmarks. An index-fund proxy answers the total-return
@@ -1151,7 +1160,7 @@ def generate_mis_reports_data(
                                   d_end, d_start, d_fy, d_mtd, "Previous 14 Fund AR Model Portfolio", d_flow=flow_date,
                                   d_mis3_start=d_m3_start, d_mis3_end=d_m3_end)
 
-    warnings: List[str] = list(current["warnings"])
+    warnings: List[str] = list(bm_notes) + list(current["warnings"])
     if nifty_fallback_note:
         warnings.append(nifty_fallback_note)
     warnings.extend(flow_notes)
