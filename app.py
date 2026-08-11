@@ -986,6 +986,7 @@ def run_historical_export(
     if want_flows:
         want_nav = True
         want_aum = True
+        fetch_live_aum = True
         
     fetch_start_date = start_date
     if want_flows:
@@ -1152,10 +1153,11 @@ def run_historical_export(
                 (df_raw["NAV"] - df_raw["Prev NAV"]) / df_raw["Prev NAV"] * 100
             ).where(df_raw["Prev NAV"].notna() & (df_raw["Prev NAV"] != 0))
             df_raw["Prev AUM"] = df_raw.groupby("Scheme Code")["AUM"].shift(1)
-            df_raw["Flows"] = (
-                df_raw["Daily Return %"] / 100 * df_raw["Prev AUM"]
-            ).where(df_raw["Daily Return %"].notna() & df_raw["Prev AUM"].notna())
-            df_raw.drop(columns=["Prev NAV", "Prev AUM", "Date_parsed"], inplace=True)
+            df_raw["Derived AUM"] = df_raw["Prev AUM"] * (1 + df_raw["Daily Return %"] / 100)
+            df_raw["Flows"] = (df_raw["AUM"] - df_raw["Derived AUM"]).where(
+                df_raw["AUM"].notna() & df_raw["Derived AUM"].notna()
+            )
+            df_raw.drop(columns=["Prev NAV", "Prev AUM", "Derived AUM", "Date_parsed"], inplace=True)
             
         all_dates = pd.date_range(start=fetch_start_date, end=end_date)
     
