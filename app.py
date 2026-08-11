@@ -980,7 +980,8 @@ def run_historical_export(
     want_nav: bool,
     want_aum: bool,
     want_flows: bool,
-    fetch_live_aum: bool = False
+    fetch_live_aum: bool = False,
+    skip_saturdays: bool = True
 ) -> Tuple[pd.DataFrame, bool, str | None]:
     if want_flows:
         want_nav = True
@@ -1160,6 +1161,8 @@ def run_historical_export(
     
         target_dates = []
         for dt in all_dates:
+            if skip_saturdays and dt.weekday() == 5:
+                continue
             if skip_sundays and dt.weekday() == 6:
                 continue
             target_dates.append(dt.strftime("%d-%m-%Y"))
@@ -1695,11 +1698,13 @@ def main() -> None:
         
             isin_input = st.text_area("Target ISINs (one per line or comma-separated)", value=default_isins_str, height=200)
         
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns(3)
             with c1:
                 carry_forward = st.checkbox("Carry forward NAV on holidays/weekends", value=True)
             with c2:
-                skip_sundays = st.checkbox("Skip Sundays", value=True)
+                skip_saturdays = st.checkbox("Skip Saturdays", value=True, key="hist_skip_sat")
+            with c3:
+                skip_sundays = st.checkbox("Skip Sundays", value=True, key="hist_skip_sun")
 
             col_c1, col_c2, col_c3 = st.columns(3)
             with col_c1:
@@ -1755,7 +1760,8 @@ def main() -> None:
                             want_nav=want_nav,
                             want_aum=want_aum,
                             want_flows=want_flows,
-                            fetch_live_aum=fetch_live_aum
+                            fetch_live_aum=fetch_live_aum,
+                            skip_saturdays=skip_saturdays
                         )
                     if err:
                         st.warning(err)
@@ -1856,10 +1862,12 @@ def main() -> None:
                     max_value=datetime.today().date()
                 )
 
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns(3)
             with c1:
                 carry_forward = st.checkbox("Carry forward NAV on holidays/weekends", value=True, key="perf_carry")
             with c2:
+                skip_saturdays = st.checkbox("Skip Saturdays", value=True, key="perf_skip_sat")
+            with c3:
                 skip_sundays = st.checkbox("Skip Sundays", value=True, key="perf_skip")
 
             col_c1, col_c2, col_c3 = st.columns(3)
@@ -1923,7 +1931,8 @@ def main() -> None:
                                     want_nav=want_nav,
                                     want_aum=want_aum,
                                     want_flows=want_flows,
-                                    fetch_live_aum=fetch_live_aum
+                                    fetch_live_aum=fetch_live_aum,
+                                    skip_saturdays=skip_saturdays
                                 )
                             if err:
                                 st.warning(err)

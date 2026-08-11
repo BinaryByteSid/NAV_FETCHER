@@ -1917,13 +1917,15 @@ def fetch_amfi_data_chunked(start_date, end_date, isin_list: List[str] | None = 
     return df_all
 
 
-def build_date_cols(start_date, end_date, skip_sunday: bool) -> List[str]:
+def build_date_cols(start_date, end_date, skip_sunday: bool = True, skip_saturday: bool = False) -> List[str]:
     """Generate sorted list of date strings between start and end."""
     cols = []
     current = start_date
     while current <= end_date:
-        if not (skip_sunday and current.weekday() == 6):
-            cols.append(current.strftime("%d-%m-%Y"))
+        if (skip_saturday and current.weekday() == 5) or (skip_sunday and current.weekday() == 6):
+            current += timedelta(days=1)
+            continue
+        cols.append(current.strftime("%d-%m-%Y"))
         current += timedelta(days=1)
     return cols
 
