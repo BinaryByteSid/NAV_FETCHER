@@ -1878,12 +1878,30 @@ def render_mis_generator_page():
             if mis3_start > mis3_end:
                 st.error("MIS 3 Start Date must be on or before its End Date.")
 
-        if st.button("⚡ Generate MIS Reports", type="primary", use_container_width=True):
+        live_sig = _report_input_signature(
+            clean_df, prev_clean, start_date, end_date, mis3_start, mis3_end,
+            include_flows, skip_saturdays,
+        )
+        # Rebuild automatically once a report exists and any input has moved --
+        # editing either portfolio must reach the on-screen tables and the
+        # downloads without a second click. AMFI responses are cached, so a
+        # composition-only change recomputes rather than refetching.
+        inputs_moved = (
+            st.session_state.get("mis_results") is not None
+            and st.session_state.get("mis_inputs_sig") not in (None, live_sig)
+        )
+        clicked = st.button("⚡ Generate MIS Reports", type="primary", use_container_width=True)
+
+        if clicked or inputs_moved:
             if clean_df.empty:
-                st.error("Cannot generate MIS reports without valid portfolio input.")
+                if clicked:
+                    st.error("Cannot generate MIS reports without valid portfolio input.")
             elif start_date > end_date:
-                st.error("Invalid date range.")
+                if clicked:
+                    st.error("Invalid date range.")
             else:
+                if inputs_moved and not clicked:
+                    st.caption("↻ Inputs changed — rebuilding the report…")
                 # AMFI serves ~25s per month of range on a good day and drops
                 # responses on a bad one, so this runs for minutes. Show the
                 # actual position rather than an indefinite spinner.
@@ -1897,10 +1915,7 @@ def render_mis_generator_page():
                     )
 
                 try:
-                    st.session_state["mis_inputs_sig"] = _report_input_signature(
-                        clean_df, prev_clean, start_date, end_date, mis3_start, mis3_end,
-                        include_flows, skip_saturdays,
-                    )
+                    st.session_state["mis_inputs_sig"] = live_sig
                     st.session_state["mis_results"] = generate_mis_reports_data(
                         clean_df, start_date, end_date,
                         previous_portfolio_df=prev_clean if not prev_clean.empty else None,
@@ -1911,7 +1926,8 @@ def render_mis_generator_page():
                         mis3_start=mis3_start,
                         mis3_end=mis3_end,
                     )
-                    st.success("MIS reports generated.")
+                    if clicked:
+                        st.success("MIS reports generated.")
                 except Exception as exc:
                     st.session_state["mis_results"] = None
                     st.error(f"Failed to generate MIS reports: {exc}")
@@ -1922,18 +1938,13 @@ def render_mis_generator_page():
     if not res:
         return
 
-    # The download buttons serve whatever was last generated. If any input has
-    # changed since, say so plainly rather than handing over a file that no
+    # Inputs are rebuilt automatically above, so reaching here with a mismatch
+    # means the rebuild failed. Say so rather than handing over a file that no
     # longer matches what is on screen.
-    live_sig = _report_input_signature(
-        clean_df, prev_clean, start_date, end_date, mis3_start, mis3_end,
-        include_flows, skip_saturdays,
-    )
     if st.session_state.get("mis_inputs_sig") not in (None, live_sig):
         st.warning(
-            "⚠️ Inputs have changed since this report was generated — the tables and "
-            "downloads below are from the previous run. Click **Generate MIS Reports** "
-            "to rebuild them."
+            "⚠️ The tables and downloads below are from an earlier run — the automatic "
+            "rebuild did not complete. Click **Generate MIS Reports** to retry."
         )
 
     for w in res.get("warnings", []):

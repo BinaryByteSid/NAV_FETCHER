@@ -319,6 +319,9 @@ def clean_name(name: str) -> str:
 API_CACHE = {}
 
 
+# Cached: the MIS re-runs whenever a portfolio is edited, and a financial year
+# of flows is hundreds of these calls. Without this every edit re-fetches them.
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id: int, subcategory_id: int) -> list:
     key = (date_str, maturity_id, category_id, subcategory_id)
     if key in API_CACHE:
