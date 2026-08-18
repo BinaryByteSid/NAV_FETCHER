@@ -593,6 +593,11 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
     return df_res
 
 
+# A daily NAV move smaller than this cannot distinguish a stale AUM from a
+# genuinely flat one, so staleness is only called above it.
+STALE_AUM_MIN_MOVE_PCT = 0.05
+
+
 def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list) -> pd.DataFrame:
     """Calculate the flows format columns for a vertical Mutual Fund DataFrame."""
     df = df.copy()
@@ -633,14 +638,20 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
     
     for scheme_code, group in df.groupby("Scheme Code"):
         indices = group.index
+        # AUM carried forward for the next day's baseline. On a stale or missing
+        # day this holds the mark-to-market value rather than the repeated one,
+        # so the following day is measured against where the fund actually was.
+        # Zeroing the stale day alone would just push its error onto the next.
+        eff_prev = None
         for idx_in_group, idx in enumerate(indices):
             if idx_in_group == 0:
+                eff_prev = df.at[idx, "AUM"]
                 continue
             prev_idx = indices[idx_in_group - 1]
             
             nav_curr = df.at[idx, "NAV"]
             nav_prev = df.at[prev_idx, "NAV"]
-            aum_prev = df.at[prev_idx, "AUM"]
+            aum_prev = eff_prev if eff_prev is not None and pd.notna(eff_prev) else df.at[prev_idx, "AUM"]
             aum_curr = df.at[idx, "AUM"]
             
             df.at[idx, "Closing AUM as on previous day"] = aum_prev
@@ -657,9 +668,33 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
             else:
                 derived_aum = None
                 
-            if pd.notna(aum_curr) and derived_aum is not None:
+            # AMFI does not always publish a fresh AUM. When it repeats the
+            # previous day's figure verbatim while the NAV has moved, the AUM
+            # is stale rather than genuinely flat: an unchanged AUM against a
+            # moved NAV is arithmetically impossible. Charging the whole
+            # mark-to-market move as a subscription is how a 69,849cr AUM
+            # served twice produced a 913cr phantom flow, so book zero and let
+            # the next real AUM pick the movement up.
+            aum_unchanged = (
+                pd.notna(aum_prev) and pd.notna(aum_curr)
+                and float(aum_prev) == float(aum_curr)
+                and daily_return is not None
+                and abs(daily_return * 100) > STALE_AUM_MIN_MOVE_PCT
+            )
+
+            if aum_unchanged:
+                df.at[idx, "Net flows on current day"] = 0.0
+                eff_prev = derived_aum if derived_aum is not None else aum_curr
+            elif pd.notna(aum_curr) and derived_aum is not None:
                 df.at[idx, "Net flows on current day"] = aum_curr - derived_aum
-                
+                eff_prev = aum_curr
+            else:
+                # No AUM to measure against: report no flow rather than a gap,
+                # and carry the mark-to-market value if one can be computed.
+                df.at[idx, "Net flows on current day"] = 0.0
+                eff_prev = derived_aum if derived_aum is not None else eff_prev
+
+
     # Filter only target dates
     start_date_ts = pd.to_datetime(start_date)
     df = df[df["NAV Date_parsed"] >= start_date_ts].reset_index(drop=True)
