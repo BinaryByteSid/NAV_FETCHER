@@ -588,6 +588,54 @@ html, body, [class*="css"] {
     border-color: var(--cyan) !important;
     box-shadow: 0 0 0 3px rgba(0, 242, 254, 0.15) !important;
 }
+
+/* Date picker calendar.
+   The calendar renders in a BaseWeb popover attached to the body, outside
+   every container styled above, so it kept its default light-on-light
+   palette and was unreadable against this theme. Style it explicitly. */
+div[data-baseweb="popover"],
+div[data-baseweb="calendar"] {
+    z-index: 9999 !important;
+}
+div[data-baseweb="calendar"],
+div[data-baseweb="calendar"] > div {
+    background: #0b1220 !important;
+    color: var(--text-primary) !important;
+    border: 1px solid var(--border-subtle) !important;
+    border-radius: var(--radius-sm) !important;
+}
+/* Month/year header and the weekday initials */
+div[data-baseweb="calendar"] [role="presentation"],
+div[data-baseweb="calendar"] [data-baseweb="calendar-header"],
+div[data-baseweb="calendar"] [data-baseweb="calendar-header"] * {
+    background: transparent !important;
+    color: var(--text-primary) !important;
+}
+/* Individual days */
+div[data-baseweb="calendar"] [role="gridcell"] div {
+    color: var(--text-primary) !important;
+    background: transparent !important;
+}
+div[data-baseweb="calendar"] [role="gridcell"] div:hover {
+    background: rgba(0, 242, 254, 0.18) !important;
+    color: #ffffff !important;
+}
+/* Selected day and the range between two selected dates */
+div[data-baseweb="calendar"] [aria-selected="true"] div,
+div[data-baseweb="calendar"] [aria-selected="true"] {
+    background: var(--cyan) !important;
+    color: #04121a !important;
+    font-weight: 600 !important;
+}
+/* Days outside the current month, and disabled days */
+div[data-baseweb="calendar"] [aria-disabled="true"] div {
+    color: rgba(248, 250, 252, 0.35) !important;
+}
+/* Month / year dropdowns inside the calendar header */
+div[data-baseweb="calendar"] [data-baseweb="select"] > div {
+    background: rgba(4, 7, 17, 0.9) !important;
+    color: var(--text-primary) !important;
+}
 .stTextInput input::placeholder,
 .stTextArea textarea::placeholder {
     color: var(--text-muted) !important;

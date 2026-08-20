@@ -1720,6 +1720,41 @@ def style_excel(df: pd.DataFrame, date_cols: List[str], is_aum_only: bool = Fals
     return buf.getvalue()
 
 
+def _map_amfi_columns(header_line: str) -> dict:
+    """Map AMFI's header row to column indices.
+
+    AMFI has changed this layout at least once -- inserting Plan and Option,
+    which shifted the ISINs from columns 2-3 to 4-5 -- so positions are read
+    from the header instead of assumed. An unrecognised header falls back to
+    the historical layout.
+    """
+    names = [h.strip().lower() for h in header_line.split(";")]
+    out: dict = {}
+    for i, h in enumerate(names):
+        if h.startswith("scheme code"):
+            out.setdefault("scheme_code", i)
+        elif "isin" in h and "reinvest" in h:
+            out.setdefault("isin_reinvest", i)
+        elif "isin" in h:
+            out.setdefault("isin_growth", i)
+        elif h in ("scheme name", "nav name") or h.endswith(" name"):
+            out.setdefault("scheme_name", i)
+        elif h == "plan":
+            out.setdefault("plan", i)
+        elif h == "option":
+            out.setdefault("option", i)
+        elif "net asset value" in h:
+            out.setdefault("nav", i)
+        elif h == "date":
+            out.setdefault("date", i)
+
+    defaults = {"scheme_code": 0, "scheme_name": 1, "isin_growth": 2,
+                "isin_reinvest": 3, "nav": 4, "date": 7}
+    for k, v in defaults.items():
+        out.setdefault(k, v)
+    return out
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = None,
                     include_direct: bool = False) -> pd.DataFrame:
@@ -1751,6 +1786,13 @@ def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = N
         # erroring. That page has no column header, which is how we tell a
         # genuine empty range from a failed request.
         header_seen = False
+        # Column positions come from the header rather than being hard-coded.
+        # AMFI moved the ISINs from columns 2-3 to 4-5 when it inserted Plan
+        # and Option, which silently emptied every result: the ISIN filter was
+        # reading Plan/Option, matched nothing, and the header check still
+        # passed, so a broken parse looked like a successful fetch of an empty
+        # date range.
+        cols: dict = {}
 
         for line_bytes in resp.iter_lines():
             if not line_bytes:
@@ -1770,6 +1812,7 @@ def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = N
 
             if not header_seen and line.startswith("Scheme Code"):
                 header_seen = True
+                cols = _map_amfi_columns(line)
                 continue
 
             # Optimize memory & parsing: Skip processing the line if isin_set is provided
@@ -1780,11 +1823,15 @@ def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = N
                     continue
 
             parts = line.split(";")
-            if len(parts) < 8:
+            if len(parts) <= cols.get("date", 7):
                 continue
 
-            isin_growth = parts[2].strip()
-            isin_reinvest = parts[3].strip()
+            def _col(key: str, default: str = "") -> str:
+                i = cols.get(key)
+                return parts[i].strip() if i is not None and i < len(parts) else default
+
+            isin_growth = _col("isin_growth")
+            isin_reinvest = _col("isin_reinvest")
 
             isin_growth_upper = isin_growth.upper() if isin_growth != "-" else ""
             isin_reinvest_upper = isin_reinvest.upper() if isin_reinvest != "-" else ""
@@ -1796,16 +1843,30 @@ def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = N
                 if not (g_match or r_match):
                     continue
 
-            scheme_code = parts[0].strip()
-            scheme_name = parts[1].strip()
-            scheme_name_lower = scheme_name.lower()
-            is_direct = "direct" in scheme_name_lower or re.search(r"\bdir\b", scheme_name_lower)
-            is_idcw = is_idcw_scheme(scheme_name)
+            scheme_code = _col("scheme_code")
+            scheme_name = _col("scheme_name")
+            # AMFI now publishes Plan and Option as their own columns. Prefer
+            # them over inferring the plan and option from the scheme name.
+            plan = _col("plan")
+            option = _col("option")
+
+            if plan:
+                is_direct = "direct" in plan.lower()
+            else:
+                scheme_name_lower = scheme_name.lower()
+                is_direct = "direct" in scheme_name_lower or bool(re.search(r"\bdir\b", scheme_name_lower))
+
+            if option:
+                opt = option.lower()
+                is_idcw = ("idcw" in opt) or ("dividend" in opt) or ("payout" in opt)
+            else:
+                is_idcw = is_idcw_scheme(scheme_name)
+
             if (is_direct and not include_direct) or is_idcw:
                 continue
 
-            nav_value = parts[4].strip()
-            nav_date = parts[7].strip()
+            nav_value = _col("nav")
+            nav_date = _col("date")
 
             scheme_code = scheme_code if scheme_code != "-" else None
             isin_growth_val = isin_growth if isin_growth != "-" else None
