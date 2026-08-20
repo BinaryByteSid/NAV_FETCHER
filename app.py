@@ -892,6 +892,11 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum:
     return df_res
 
 
+# A daily NAV move smaller than this cannot distinguish a stale AUM from a
+# genuinely flat one, so staleness is only called above it.
+STALE_AUM_MIN_MOVE_PCT = 0.05
+
+
 def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list) -> pd.DataFrame:
     """Calculate the flows format columns for a vertical Mutual Fund DataFrame."""
     df = df.copy()
@@ -937,6 +942,21 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
     
     # Calculate net flows: AUM_curr - Derived_AUM
     df["Net flows on current day"] = df["Actual AUM as on current date"] - df["Derived AUM as on curent day"]
+
+    # AMFI does not always publish a fresh AUM. When it repeats the previous
+    # day's figure while the NAV has moved, the subtraction above charges the
+    # whole mark-to-market move as a subscription -- an unchanged AUM against a
+    # moved NAV is arithmetically impossible. Book zero on those days, and on
+    # days with no AUM at all, rather than reporting a phantom flow.
+    _prev_aum = df["Closing AUM as on previous day"]
+    _curr_aum = df["Actual AUM as on current date"]
+    _ret = df["Daily return"]
+    _stale = (
+        _prev_aum.notna() & _curr_aum.notna() & _ret.notna()
+        & (_prev_aum == _curr_aum) & (_ret.abs() > STALE_AUM_MIN_MOVE_PCT)
+    )
+    _no_aum = _curr_aum.isna() | df["Derived AUM as on curent day"].isna()
+    df.loc[_stale | _no_aum, "Net flows on current day"] = 0.0
                 
     # Filter only target dates
     start_date_ts = pd.to_datetime(start_date)
@@ -1031,6 +1051,11 @@ def run_historical_export(
                 
                 chunk_rows = []
                 current_section = "Unknown"
+                # AMFI inserted Plan and Option into the dump, moving the ISINs
+                # from columns 2-3 to 4-5. Read positions from the header rather
+                # than assuming them, or the ISIN filter matches Plan/Option and
+                # silently discards every row.
+                cols = {}
                 for line in content_text.splitlines():
                     if not line:
                         continue
@@ -1043,30 +1068,49 @@ def run_historical_export(
                         ):
                             current_section = line_stripped
                         continue
-                    
-                    parts = line.split(";")
-                    if len(parts) < 8:
+
+                    if not cols and line.startswith("Scheme Code"):
+                        cols = _map_amfi_columns(line)
                         continue
-                        
-                    isin_growth = parts[2].strip()
-                    isin_reinvestment = parts[3].strip()
+
+                    parts = line.split(";")
+                    if len(parts) <= cols.get("date", 7):
+                        continue
+
+                    def _col(key, default=""):
+                        i = cols.get(key)
+                        return parts[i].strip() if i is not None and i < len(parts) else default
+
+                    isin_growth = _col("isin_growth")
+                    isin_reinvestment = _col("isin_reinvest")
                     isin_growth_upper = isin_growth.upper() if isin_growth != "-" else ""
                     isin_reinvest_upper = isin_reinvestment.upper() if isin_reinvestment != "-" else ""
-                    
+
                     g_match = isin_growth_upper and isin_growth_upper in isins_set
                     r_match = isin_reinvest_upper and isin_reinvest_upper in isins_set
-                    
+
                     if g_match or r_match:
-                        scheme_name = parts[1].strip()
-                        scheme_name_lower = scheme_name.lower()
-                        is_direct = "direct" in scheme_name_lower or re.search(r"\bdir\b", scheme_name_lower)
-                        is_idcw = is_idcw_scheme(scheme_name)
+                        scheme_name = _col("scheme_name")
+                        # Plan and Option are their own columns now; prefer them
+                        # over inferring from the scheme name.
+                        plan = _col("plan")
+                        option = _col("option")
+                        if plan:
+                            is_direct = "direct" in plan.lower()
+                        else:
+                            scheme_name_lower = scheme_name.lower()
+                            is_direct = "direct" in scheme_name_lower or bool(re.search(r"\bdir\b", scheme_name_lower))
+                        if option:
+                            opt = option.lower()
+                            is_idcw = ("idcw" in opt) or ("dividend" in opt) or ("payout" in opt)
+                        else:
+                            is_idcw = is_idcw_scheme(scheme_name)
                         if is_direct or is_idcw:
                             continue
-                            
-                        scheme_code = parts[0].strip()
-                        nav_value = parts[4].strip()
-                        nav_date = parts[7].strip()
+
+                        scheme_code = _col("scheme_code")
+                        nav_value = _col("nav")
+                        nav_date = _col("date")
                         
                         scheme_code = scheme_code if scheme_code != "-" else None
                         isin_growth = isin_growth if isin_growth != "-" else None
@@ -1434,7 +1478,10 @@ from amfi_nav import (
     classify_plan_type,
     classify_option_type,
 )
-from nav_fetcher import parse_bucket_input, run_live_portfolio, style_portfolio_excel, is_idcw_scheme
+from nav_fetcher import (
+    parse_bucket_input, run_live_portfolio, style_portfolio_excel, is_idcw_scheme,
+    _map_amfi_columns,
+)
 from ui_theme import (
     finance_panel,
     inject_custom_css,
