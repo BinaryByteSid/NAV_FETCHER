@@ -648,6 +648,20 @@ def run_historical_export(
             del vertical_rows  # free list now it's in a DataFrame
             # NAV Date / AUM Date are already formatted as dd-mm-YYYY strings — skip redundant parse
             df_res_final = df_res_final[ordered_cols]
+
+            # Drop rows carrying no observation at all. With weekend skipping
+            # switched off, a row is scaffolded for every calendar date, and the
+            # non-trading ones have neither a NAV nor an AUM — they render as a
+            # run of "None" cells that reads like a broken report rather than a
+            # closed market. Nothing is lost: these rows never held a value.
+            _obs = [c for c in ("NAV", "AUM") if c in df_res_final.columns]
+            if _obs:
+                _empty = df_res_final[_obs].isna().all(axis=1)
+                if _empty.any():
+                    print(f"Dropped {int(_empty.sum())} row(s) with no NAV or AUM "
+                          f"(non-trading days).")
+                    df_res_final = df_res_final[~_empty].reset_index(drop=True)
+
             df_res_final = df_res_final.sort_values(by=["Asset Class", "Scheme Name"]).reset_index(drop=True)
             if want_flows:
                 df_res_final = calculate_flows_for_dataframe(df_res_final, start_date, ["Asset Class", "Scheme Code", "ISIN Div Payout / ISIN Growth", "ISIN Div Reinvestment", "Scheme Name", "Plan Type", "Option Type"])
