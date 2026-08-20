@@ -237,25 +237,6 @@ def fetch_amfi_chunk_with_cache(c_start, c_end) -> str:
 
 
 
-def load_portfolio_aum_data() -> pd.DataFrame:
-    paths = [
-        "../portfolio last 6 months.xlsx",
-        "portfolio last 6 months.xlsx",
-        "c:/Users/sidha/OneDrive/Desktop/portfolio last 6 months.xlsx",
-    ]
-    for path in paths:
-        if os.path.exists(path):
-            try:
-                df = pd.read_excel(path, header=3)
-                df['SD_Scheme ISIN'] = df['SD_Scheme ISIN'].astype(str).str.strip().str.upper()
-                df['PD_Month End'] = pd.to_numeric(df['PD_Month End'], errors='coerce')
-                df['PD_Scheme AUM'] = pd.to_numeric(df['PD_Scheme AUM'], errors='coerce')
-                return df
-            except Exception:
-                pass
-    return pd.DataFrame()
-
-
 def calculate_aum_for_row(row, df_port: pd.DataFrame) -> float:
     scheme_name = row.get("Scheme Name", "")
     isin_growth = row.get("ISIN Div Payout / ISIN Growth") or row.get("ISIN Div Payout/ ISIN Growth")
@@ -314,135 +295,6 @@ def calculate_aum_for_row(row, df_port: pd.DataFrame) -> float:
         aum_monthly = round(base_aum * aum_multiplier, 4)
         
     return aum_monthly
-
-
-def map_section_to_ids(sec):
-    sec_lower = str(sec).lower()
-    
-    # Maturity Type
-    maturity_id = 1  # Open ended default
-    if "close" in sec_lower:
-        maturity_id = 2
-    elif "interval" in sec_lower:
-        maturity_id = 2
-        
-    # Category
-    cat_id = 1  # Equity default
-    if "debt" in sec_lower:
-        cat_id = 2
-    elif "hybrid" in sec_lower:
-        cat_id = 3
-    elif "solution" in sec_lower:
-        cat_id = 4
-    elif "other" in sec_lower:
-        cat_id = 5
-    elif "gilt" in sec_lower or "money market" in sec_lower or "income" in sec_lower:
-        cat_id = 2
-        
-    # Subcategory defaults
-    if cat_id == 1:
-        sub_id = 1
-    elif cat_id == 2:
-        sub_id = 15
-    elif cat_id == 3:
-        sub_id = 30
-    elif cat_id == 4:
-        sub_id = 36
-    elif cat_id == 5:
-        sub_id = 38
-    else:
-        sub_id = 1
-    
-    # Subcategory mapping rules
-    if cat_id == 1:  # Equity
-        if "large & mid" in sec_lower:
-            sub_id = 2
-        elif "large cap" in sec_lower:
-            sub_id = 1
-        elif "flexi cap" in sec_lower:
-            sub_id = 3
-        elif "multi cap" in sec_lower:
-            sub_id = 4
-        elif "mid cap" in sec_lower:
-            sub_id = 5
-        elif "small cap" in sec_lower:
-            sub_id = 6
-        elif "value" in sec_lower:
-            sub_id = 7
-        elif "elss" in sec_lower:
-            sub_id = 8
-        elif "contra" in sec_lower:
-            sub_id = 9
-        elif "dividend yield" in sec_lower:
-            sub_id = 10
-        elif "focused" in sec_lower:
-            sub_id = 11
-        elif "sectoral" in sec_lower or "thematic" in sec_lower:
-            sub_id = 12
-    elif cat_id == 2:  # Debt
-        if "gilt with 10" in sec_lower or "10 year constant" in sec_lower:
-            sub_id = 29
-        elif "gilt" in sec_lower:
-            sub_id = 28
-        elif "medium to long" in sec_lower:
-            sub_id = 14
-        elif "long duration" in sec_lower:
-            sub_id = 13
-        elif "ultra short" in sec_lower:
-            sub_id = 19
-        elif "short duration" in sec_lower:
-            sub_id = 15
-        elif "medium duration" in sec_lower:
-            sub_id = 16
-        elif "money market" in sec_lower:
-            sub_id = 17
-        elif "low duration" in sec_lower:
-            sub_id = 18
-        elif "liquid" in sec_lower:
-            sub_id = 20
-        elif "overnight" in sec_lower:
-            sub_id = 21
-        elif "dynamic bond" in sec_lower:
-            sub_id = 22
-        elif "corporate bond" in sec_lower:
-            sub_id = 23
-        elif "credit risk" in sec_lower:
-            sub_id = 24
-        elif "banking" in sec_lower or "psu" in sec_lower:
-            sub_id = 25
-        elif "floater" in sec_lower:
-            sub_id = 26
-        elif "fmp" in sec_lower:
-            sub_id = 27
-    elif cat_id == 3:  # Hybrid
-        if "aggressive hybrid" in sec_lower:
-            sub_id = 30
-        elif "conservative hybrid" in sec_lower or "conservative hyrbid" in sec_lower:
-            sub_id = 31
-        elif "equity savings" in sec_lower:
-            sub_id = 32
-        elif "arbitrage" in sec_lower:
-            sub_id = 33
-        elif "multi asset" in sec_lower:
-            sub_id = 34
-        elif "dynamic asset" in sec_lower or "balanced advantage" in sec_lower:
-            sub_id = 35
-        elif "balanced hybrid" in sec_lower:
-            sub_id = 40
-    elif cat_id == 4:  # Solution Oriented
-        if "children" in sec_lower:
-            sub_id = 36
-        elif "retirement" in sec_lower:
-            sub_id = 37
-    elif cat_id == 5:  # Other
-        if "index fund" in sec_lower or "index" in sec_lower:
-            sub_id = 38
-        elif "etf" in sec_lower:
-            sub_id = 38
-        elif "fof" in sec_lower or "fund of funds" in sec_lower:
-            sub_id = 39
-        
-    return maturity_id, cat_id, sub_id
 
 
 def clean_name(name: str) -> str:
@@ -574,42 +426,6 @@ def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id
             delay = min(delay * 2, 20)
 
     return []
-
-
-def find_matching_perf_row(nav_name: str, perf_rows: list) -> dict | None:
-    if not perf_rows:
-        return None
-    cleaned_nav = clean_name(nav_name)
-    if not cleaned_nav:
-        return None
-        
-    # 1. Substring match
-    for p_row in perf_rows:
-        p_name = p_row.get("schemeName") or ""
-        cleaned_perf = clean_name(p_name)
-        if cleaned_perf and (cleaned_perf in cleaned_nav or cleaned_nav in cleaned_perf):
-            return p_row
-            
-    # 2. Token overlap fallback
-    nav_tokens = set(cleaned_nav.split())
-    best_row = None
-    best_score = 0.0
-    for p_row in perf_rows:
-        p_name = p_row.get("schemeName") or ""
-        cleaned_perf = clean_name(p_name)
-        if not cleaned_perf:
-            continue
-        perf_tokens = set(cleaned_perf.split())
-        intersection = nav_tokens.intersection(perf_tokens)
-        if intersection:
-            score = len(intersection) / len(nav_tokens.union(perf_tokens))
-            if score > best_score:
-                best_score = score
-                best_row = p_row
-                
-    if best_score > 0.4:
-        return best_row
-    return None
 
 
 def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum: bool = False) -> pd.DataFrame:
@@ -892,103 +708,6 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, fetch_live_aum:
     return df_res
 
 
-# A daily NAV move smaller than this cannot distinguish a stale AUM from a
-# genuinely flat one, so staleness is only called above it.
-STALE_AUM_MIN_MOVE_PCT = 0.05
-
-
-def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list) -> pd.DataFrame:
-    """Calculate the flows format columns for a vertical Mutual Fund DataFrame."""
-    df = df.copy()
-    
-    # Standardize columns
-    if "NAV" not in df.columns and "NAVs" in df.columns:
-        df = df.rename(columns={"NAVs": "NAV"})
-    if "NAV" not in df.columns:
-        df["NAV"] = None
-    if "AUM" not in df.columns:
-        df["AUM"] = None
-        
-    df["NAV"] = pd.to_numeric(df["NAV"], errors="coerce")
-    df["AUM"] = pd.to_numeric(df["AUM"], errors="coerce")
-    
-    # Standardize date column to 'NAV Date'
-    date_col = None
-    for c in ["NAV Date", "AUM Date", "Date"]:
-        if c in df.columns:
-            date_col = c
-            break
-            
-    if date_col and date_col != "NAV Date":
-        df = df.rename(columns={date_col: "NAV Date"})
-        
-    if "NAV Date" not in df.columns:
-        df["NAV Date"] = None
-        
-    df["NAV Date_parsed"] = parse_amfi_date_series(df["NAV Date"])
-        
-    df = df.sort_values(by=["Scheme Code", "NAV Date_parsed"]).reset_index(drop=True)
-    
-    df["Closing AUM as on previous day"] = df.groupby("Scheme Code")["AUM"].shift(1)
-    df["Actual AUM as on current date"] = df["AUM"]
-    
-    prev_nav = df.groupby("Scheme Code")["NAV"].shift(1)
-    
-    # Calculate daily return: (NAV - prev_nav) / prev_nav * 100
-    df["Daily return"] = ((df["NAV"] - prev_nav) / prev_nav * 100).where(prev_nav.notna() & (prev_nav != 0))
-    
-    # Calculate derived AUM: AUM_prev * (1 + daily_return / 100)
-    df["Derived AUM as on curent day"] = df["Closing AUM as on previous day"] * (1 + df["Daily return"] / 100)
-    
-    # Calculate net flows: AUM_curr - Derived_AUM
-    df["Net flows on current day"] = df["Actual AUM as on current date"] - df["Derived AUM as on curent day"]
-
-    # AMFI does not always publish a fresh AUM. When it repeats the previous
-    # day's figure while the NAV has moved, the subtraction above charges the
-    # whole mark-to-market move as a subscription -- an unchanged AUM against a
-    # moved NAV is arithmetically impossible. Book zero on those days, and on
-    # days with no AUM at all, rather than reporting a phantom flow.
-    _prev_aum = df["Closing AUM as on previous day"]
-    _curr_aum = df["Actual AUM as on current date"]
-    _ret = df["Daily return"]
-    _stale = (
-        _prev_aum.notna() & _curr_aum.notna() & _ret.notna()
-        & (_prev_aum == _curr_aum) & (_ret.abs() > STALE_AUM_MIN_MOVE_PCT)
-    )
-    _no_aum = _curr_aum.isna() | df["Derived AUM as on curent day"].isna()
-    df.loc[_stale | _no_aum, "Net flows on current day"] = 0.0
-                
-    # Filter only target dates
-    start_date_ts = pd.to_datetime(start_date)
-    df = df[df["NAV Date_parsed"] >= start_date_ts].reset_index(drop=True)
-    df = df.drop(columns=["NAV Date_parsed"])
-    
-    df = df.rename(columns={"NAV": "NAVs"})
-    
-    flow_cols = [
-        "NAV Date",
-        "NAVs",
-        "Closing AUM as on previous day",
-        "Actual AUM as on current date",
-        "Daily return",
-        "Derived AUM as on curent day",
-        "Net flows on current day"
-    ]
-    
-    if "NAV Date" in df.columns:
-        parsed = parse_amfi_date_series(df["NAV Date"])
-        df["NAV Date"] = parsed.dt.strftime("%d-%m-%Y")
-        
-    final_cols = list(meta_cols) + flow_cols
-    for col in final_cols:
-        if col not in df.columns:
-            df[col] = None
-            
-    df["NAV Date_parsed"] = parse_amfi_date_series(df["NAV Date"])
-    df = df.sort_values(by=["Asset Class", "Scheme Name", "NAV Date_parsed"]).reset_index(drop=True)
-    df = df.drop(columns=["NAV Date_parsed"])
-    
-    return df[final_cols]
 
 
 def run_historical_export(
@@ -1127,7 +846,12 @@ def run_historical_export(
                             "Date": nav_date
                         })
                 return idx, chunk_rows
-            except Exception:
+            except Exception as exc:
+                # Was a bare `return idx, []`, which made a throttled or failed
+                # chunk indistinguishable from an empty date range and sent
+                # everyone to "check the ISINs and the date range".
+                print(f"NAV chunk {c_start:%d-%b-%Y} to {c_end:%d-%b-%Y} failed: "
+                      f"{type(exc).__name__}: {exc}")
                 return idx, []
 
         # Concurrency is the main speed lever for multi-year ranges (a 10-year
@@ -1481,6 +1205,11 @@ from amfi_nav import (
 from nav_fetcher import (
     parse_bucket_input, run_live_portfolio, style_portfolio_excel, is_idcw_scheme,
     _map_amfi_columns,
+    # Consolidated: app.py used to carry byte-identical (or near-identical)
+    # copies of these, so the AMFI column change and the stale-AUM rule each
+    # had to be fixed twice and the second copy was missed both times.
+    map_section_to_ids, find_matching_perf_row, load_portfolio_aum_data,
+    calculate_flows_for_dataframe, STALE_AUM_MIN_MOVE_PCT,
 )
 from ui_theme import (
     finance_panel,
