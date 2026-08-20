@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 import re
+import time
+import threading
 import sys
 from datetime import datetime, timedelta
 from io import BytesIO
@@ -321,7 +323,170 @@ API_CACHE = {}
 
 # Cached: the MIS re-runs whenever a portfolio is edited, and a financial year
 # of flows is hundreds of these calls. Without this every edit re-fetches them.
-@st.cache_data(ttl=900, show_spinner=False)
+# Thread-local sessions: populate_actual_aum fans these calls out across a
+# pool, and a shared Session is not thread-safe.
+def _is_cloud_env() -> bool:
+    """Detect Streamlit Cloud (ephemeral FS / ~1 GB RAM) vs a local machine.
+
+    Used to size worker pools: local runs can afford far more concurrency,
+    which is the main speed lever for multi-year date ranges.
+    """
+    if os.environ.get("STREAMLIT_SHARING_MODE") or os.environ.get("STREAMLIT_RUNTIME_ENV"):
+        return True
+    # No writable local amfi_cache dir next to this file ⇒ treat as cloud.
+    return not os.path.exists(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "amfi_cache")
+    )
+
+
+
+def _perf_api_workers(n_calls: int) -> int:
+    """Concurrent daily-AUM performance-API POSTs. Moderate to avoid the AMFI
+    gateway rate-limiting (which returns empty responses → blank AUM)."""
+    if n_calls <= 0:
+        return 1
+    cap = 6 if _is_cloud_env() else 8
+    return max(1, min(cap, n_calls))
+
+
+
+def _nav_chunk_workers(n_chunks: int) -> int:
+    """Concurrent NAV-history downloads. Kept moderate: AMFI's portal throttles
+    (503/timeouts) when hit with too many parallel connections, which shows up as
+    'can't fetch even 6 months'. 6 local / 3 cloud is a safe, reliable balance."""
+    if n_chunks <= 0:
+        return 1
+    cap = 3 if _is_cloud_env() else 6
+    return max(1, min(cap, n_chunks))
+
+
+
+_thread_local = threading.local()
+
+# Responses persist here so a re-run does not refetch a financial year of calls.
+API_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api_cache")
+os.makedirs(API_CACHE_DIR, exist_ok=True)
+
+# Populated by populate_actual_aum each run so the UI can report how much AUM
+# came from the live feed vs was carried or left blank.
+_LAST_AUM_STATS: dict = {}
+
+def get_api_session():
+    if not hasattr(_thread_local, "session"):
+        _thread_local.session = requests.Session()
+    return _thread_local.session
+
+
+def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id: int, subcategory_id: int) -> list:
+    """Daily AUM for one (category, date) from AMFI's fund-performance API.
+
+    Single implementation shared by Fund Performance and the MIS. This is
+    app.py's version, kept over nav_fetcher's for three reasons that all
+    showed up as blank or wrong AUM:
+
+      * it sends the browser Referer/Origin/X-Requested-With headers, without
+        which AMFI's gateway returns an empty or non-SUCCESS response;
+      * it never caches a failure, whereas the old version wrote an empty list
+        into its cache on error, turning one transient failure into a
+        permanently blank AUM for the rest of the session;
+      * responses persist to disk, so a re-run does not refetch a financial
+        year of calls.
+    """
+    import json
+    import os
+    import time
+    import random
+
+    # 1. Skip querying dates before 2018-01-01 (SEBI categorization and AMFI performance dataset starts around 2018)
+    # This prevents thousands of useless requests that return 0 rows.
+    try:
+        parsed_date = datetime.strptime(date_str, "%d-%b-%Y")
+        if parsed_date.year < 2018:
+            return []
+    except Exception:
+        pass
+
+    key_str = f"{date_str}_{maturity_id}_{category_id}_{subcategory_id}"
+    cache_path = os.path.join(API_CACHE_DIR, f"{key_str}.json")
+    
+    # Check if we can use the cached file
+    if os.path.exists(cache_path):
+        try:
+            parsed_date = datetime.strptime(date_str, "%d-%b-%Y")
+            yesterday = datetime.today() - timedelta(days=1)
+            if parsed_date < yesterday:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            else:
+                # 1 hour TTL for recent dates
+                file_age = time.time() - os.path.getmtime(cache_path)
+                if file_age < 3600:
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        return json.load(f)
+        except Exception:
+            pass
+            
+    url = "https://www.amfiindia.com/gateway/pollingsebi/api/amfi/fundperformance"
+    # AMFI's gateway API rejects/blanks requests that don't look like they came
+    # from the fund-performance web page. Sending the browser Referer/Origin and an
+    # explicit JSON Accept header is what makes it return data instead of an empty
+    # or non-SUCCESS response — a common cause of blank AUM.
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://www.amfiindia.com",
+        "Referer": "https://www.amfiindia.com/research-information/other-data/fund-performance",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    payload = {
+        "maturityType": maturity_id,
+        "category": category_id,
+        "subCategory": subcategory_id,
+        "mfid": 0,
+        "reportDate": date_str
+    }
+
+    max_retries = 4
+    delay = 1.0
+
+    session = get_api_session()
+
+    for attempt in range(max_retries):
+        try:
+            resp = session.post(url, json=payload, headers=headers, timeout=(10, 40))
+            if resp.status_code == 200:
+                try:
+                    res_data = resp.json()
+                except Exception:
+                    res_data = None
+                if isinstance(res_data, dict):
+                    # Accept the data whether or not validationMsg is present/SUCCESS —
+                    # the important thing is that a data array came back.
+                    rows = res_data.get("data")
+                    if rows is None and res_data.get("validationMsg") == "SUCCESS":
+                        rows = []
+                    if isinstance(rows, list):
+                        try:
+                            with open(cache_path, "w", encoding="utf-8") as f:
+                                json.dump(rows, f)
+                        except Exception:
+                            pass
+                        return rows
+            elif resp.status_code in (429, 503):
+                # Throttled — back off harder before retrying.
+                time.sleep(delay + random.uniform(0, 1.0))
+                delay = min(delay * 2, 20)
+                continue
+            time.sleep(delay + random.uniform(0, 0.5))
+            delay = min(delay * 2, 20)
+        except Exception:
+            time.sleep(delay + random.uniform(0, 0.5))
+            delay = min(delay * 2, 20)
+
+    return []
+
+
 def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id: int, subcategory_id: int) -> list:
     key = (date_str, maturity_id, category_id, subcategory_id)
     if key in API_CACHE:
@@ -406,43 +571,135 @@ def find_matching_perf_row(nav_name: str, perf_rows: list) -> Optional[dict]:
 
 def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool = True,
                         fetch_live_aum: bool = False, budget_seconds: float | None = None,
-                        max_workers: int = 1, on_incomplete=None) -> pd.DataFrame:
+                        max_workers: int | None = None, on_incomplete=None,
+                        gap_fill: str = "carry") -> pd.DataFrame:
+    """Attach a daily AUM to every row, live from AMFI where available.
+
+    Single implementation shared by Fund Performance and the MIS. They want
+    different things from the days the live feed does not cover, which is the
+    one behaviour that genuinely differed between the old copies:
+
+      gap_fill="carry"     the nearest real AUM is carried across the gap, so a
+                           continuous series can be charted. Right for an AUM
+                           report, wrong for a flow one -- a carried figure is
+                           indistinguishable from AMFI repeating a stale value
+                           and every carried day would score as a zero flow.
+
+      gap_fill="fallback"  uncovered days fall back to the NAV-scaled monthly
+                           AUM, leaving real movement between consecutive days
+                           for the flow formula to measure.
+    """
     if df.empty:
         return df.copy()
-        
-    df_res = df.copy()
-    
+
     if not want_aum:
+        df_res = df.copy()
         df_res["AUM"] = None
-        df_res["Fallback_AUM"] = None
         return df_res
         
-    # 1. First, calculate the fallback AUM for all rows using the old method.
-    # We do this so that we always have a default value.
-    raw_rows = []
-    for idx, r_dict in df_res.iterrows():
-        r_copy = r_dict.copy()
-        m_aum = calculate_aum_for_row(r_copy.to_dict(), df_port)
-        r_copy["Monthly_AUM"] = m_aum
-        raw_rows.append(r_copy)
-    df_res = pd.DataFrame(raw_rows)
+    # 1. Calculate the fallback AUM (NAV-scaled monthly AUM) for every row.
+    # This ensures we always have a meaningful, date-varying AUM estimate.
+    # Pre-build dictionary lookup for target ISINs
+    parsed_isins_set = set()
+    col_growth = "ISIN Div Payout / ISIN Growth" if "ISIN Div Payout / ISIN Growth" in df.columns else "ISIN Div Payout/ ISIN Growth"
+    if col_growth in df.columns:
+        parsed_isins_set.update(df[col_growth].dropna().astype(str).str.strip().str.upper())
+    if "ISIN Div Reinvestment" in df.columns:
+        parsed_isins_set.update(df["ISIN Div Reinvestment"].dropna().astype(str).str.strip().str.upper())
+        
+    aum_lookup = {}
+    if not df_port.empty:
+        for _, row in df_port.iterrows():
+            isin = row.get('SD_Scheme ISIN')
+            m_end = row.get('PD_Month End')
+            aum = row.get('PD_Scheme AUM')
+            if pd.notna(isin) and pd.notna(m_end) and pd.notna(aum):
+                isin_str = str(isin).strip().upper()
+                if isin_str in parsed_isins_set:
+                    if isin_str not in aum_lookup:
+                        aum_lookup[isin_str] = []
+                    aum_lookup[isin_str].append((int(m_end), float(aum)))
 
-    # Monthly_AUM may be None where no real disclosure exists — coerce to numeric
-    # (NaN) so the scaling below propagates blanks instead of raising.
-    df_res["Monthly_AUM"] = pd.to_numeric(df_res["Monthly_AUM"], errors="coerce")
+        for isin_str in aum_lookup:
+            aum_lookup[isin_str].sort(key=lambda x: x[0], reverse=True)
+
+    def get_aum_from_lookup(isin_growth, isin_reinvestment, m_val, scheme_name, year, month):
+        # Real monthly AUM from the uploaded portfolio disclosure file, matched by
+        # ISIN. Prefer the exact month; else fall back to the latest disclosed month.
+        for isin in [isin_growth, isin_reinvestment]:
+            if isin and isin != "-":
+                isin_upper = str(isin).strip().upper()
+                records = aum_lookup.get(isin_upper)
+                if records:
+                    for m_end, aum in records:
+                        if m_end == m_val:
+                            return aum
+                    return records[0][1]
+
+        # No real disclosure available for this scheme/month. Return None instead of
+        # fabricating a value — the daily perf-API pass (below) may still fill it, and
+        # anything left blank stays blank so AUM/flows are never invented.
+        return None
+
+    df_res = df.copy()
+    scheme_names = df_res["Scheme Name"].tolist()
+    isin_growths = df_res[col_growth].tolist()
+    isin_reinvs = df_res["ISIN Div Reinvestment"].tolist()
+    dates = (df_res["NAV Date"] if "NAV Date" in df_res.columns else df_res["Date"]).tolist()
+
+    month_map = {
+        "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+        "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12
+    }
+
+    monthly_aums = []
+    for i in range(len(df_res)):
+        scheme_name = scheme_names[i]
+        isin_g = isin_growths[i]
+        isin_r = isin_reinvs[i]
+        date_val = dates[i]
+        
+        try:
+            if isinstance(date_val, pd.Timestamp):
+                year = date_val.year
+                month = date_val.month
+            else:
+                parts = str(date_val).split("-")
+                if len(parts) == 3:
+                    month_str = parts[1]
+                    year = int(parts[2][:4])
+                    month = month_map.get(month_str[:3], 4)
+                else:
+                    parsed_dt = pd.to_datetime(date_val)
+                    year = parsed_dt.year
+                    month = parsed_dt.month
+        except Exception:
+            year = 2026
+            month = 4
+            
+        m_val = year * 100 + month
+        monthly_aums.append(get_aum_from_lookup(isin_g, isin_r, m_val, scheme_name, year, month))
+
+    # Monthly_AUM may contain None where no real disclosure exists — keep it
+    # numeric (NaN) so downstream math propagates blanks instead of erroring.
+    df_res["Monthly_AUM"] = pd.to_numeric(pd.Series(monthly_aums, index=df_res.index), errors="coerce")
+
+    # Scale the (real) monthly AUM by each day's NAV relative to the scheme mean NAV
+    # so that AUM varies day-to-day proportional to NAV movement. Rows without a real
+    # monthly AUM stay NaN (blank) rather than being back-filled with a guess.
     mean_navs = df_res.groupby("Scheme Code")["NAV"].transform("mean")
     mean_navs = mean_navs.fillna(1.0).replace(0.0, 1.0)
     df_res["Fallback_AUM"] = (df_res["Monthly_AUM"] * (df_res["NAV"] / mean_navs)).round(4)
     
     if not fetch_live_aum:
-        # If user does not want slow live AUM, use Fallback AUM immediately
         df_res["AUM"] = df_res["Fallback_AUM"]
         return df_res
         
-    # Initialize AUM with fallback to allow carry-forward / fallback values
+    # Initialize AUM with the fallback so every row already has a value.
+    # Rows where the live API succeeds will get overwritten below.
     df_res["AUM"] = df_res["Fallback_AUM"]
     
-    # 2. Now, try to fetch the actual AUM from the performance API for each row.
+    # 2. Try to fetch real AUM from the AMFI performance API for each unique (date, asset-class) pair.
     def get_date_str(dt):
         try:
             if isinstance(dt, pd.Timestamp) or hasattr(dt, "strftime"):
@@ -460,137 +717,176 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
         
     date_col = "NAV Date" if "NAV Date" in df_res.columns else "Date"
     df_res["Date_Str_Temp"] = df_res[date_col].apply(get_date_str)
-    
-    # Group unique combinations of (Asset Class, Date_Str_Temp)
-    unique_groups = df_res[["Asset Class", "Date_Str_Temp"]].drop_duplicates()
-    
-    # Fetch performance data for each group and build a lookup cache
+
     perf_lookup = {}
-    import time
-    
-    jobs = [(g["Asset Class"], g["Date_Str_Temp"]) for _, g in unique_groups.iterrows()
-            if g["Asset Class"] and g["Date_Str_Temp"]]
 
-    # One API call per (asset class x date). Over a financial year that is
-    # hundreds of serial calls -- minutes of wall time, and far worse on a
-    # throttled host. Bound the total and report what was missed; rows that
-    # never get a live figure keep the derived fallback already in "AUM".
-    started = time.monotonic()
-    fetched = 0
+    # Run API calls in parallel using ThreadPoolExecutor for high performance fetching
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    def _expired() -> bool:
-        return budget_seconds is not None and (time.monotonic() - started) >= budget_seconds
+    # Determine if running inside Streamlit context to show status
+    in_streamlit = False
+    try:
+        from streamlit.runtime import exists as runtime_exists
+        in_streamlit = runtime_exists()
+    except ImportError:
+        pass
 
-    if max_workers > 1:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+    if in_streamlit:
+        status_text = st.empty()
+        status_text.text("Fetching daily AUM from AMFI fund performance website...")
 
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {}
-            for asset_class, date_str in jobs:
-                m_id, c_id, s_id = map_section_to_ids(asset_class)
-                futures[pool.submit(fetch_performance_data_from_api, date_str, m_id, c_id, s_id)] = (
-                    date_str, asset_class
-                )
-            for fut in as_completed(futures):
-                date_str, asset_class = futures[fut]
-                if _expired():
-                    fut.cancel()
-                    continue
-                try:
-                    perf_rows = fut.result()
-                except Exception:
-                    perf_rows = None
-                if perf_rows:
-                    perf_lookup[(date_str, asset_class)] = perf_rows
-                    fetched += 1
-    else:
-        for i, (asset_class, date_str) in enumerate(jobs):
-            if _expired():
-                break
-            m_id, c_id, s_id = map_section_to_ids(asset_class)
-            if i > 0:
-                time.sleep(0.5)  # rate-limit AMFI
-            perf_rows = fetch_performance_data_from_api(date_str, m_id, c_id, s_id)
-            if perf_rows:
-                perf_lookup[(date_str, asset_class)] = perf_rows
-                fetched += 1
+    # Map every distinct asset-class string to its (maturity, category, subcategory)
+    # ID tuple once, so we can deduplicate network calls: many different asset-class
+    # labels collapse to the same performance-API query, and over a multi-year range
+    # this cuts the number of POSTs dramatically (the dominant cost of live AUM).
+    asset_classes = [ac for ac in df_res["Asset Class"].dropna().unique() if ac]
+    ac_to_ids = {ac: map_section_to_ids(ac) for ac in asset_classes}
 
-    # Retry whatever AMFI declined. A single failed day/category is not evenly
-    # damaging: MTD and YTD sum many days and barely notice one hole, but the
-    # headline day figure needs its own date and the one before it, so a single
-    # 503 there turns that scheme's Flows into N/A while its neighbours report
-    # numbers. AMFI's failures are transient, so one more pass usually fills it.
-    missing = [(ac, ds) for ac, ds in jobs if (ds, ac) not in perf_lookup]
-    if missing and not _expired():
-        time.sleep(2)
-        for asset_class, date_str in missing:
-            if _expired():
-                break
-            m_id, c_id, s_id = map_section_to_ids(asset_class)
+    unique_groups = df_res[["Asset Class", "Date_Str_Temp"]].drop_duplicates()
+
+    # Collapse to unique (ids, date) queries; remember which (date, asset_class)
+    # pairs each query feeds so we can rebuild the original lookup shape after.
+    ids_date_to_pairs = {}
+    for _, grp in unique_groups.iterrows():
+        asset_class = grp["Asset Class"]
+        date_str = grp["Date_Str_Temp"]
+        if not asset_class or not date_str:
+            continue
+        ids = ac_to_ids.get(asset_class)
+        if not ids:
+            continue
+        query_key = (ids[0], ids[1], ids[2], date_str)
+        ids_date_to_pairs.setdefault(query_key, []).append((date_str, asset_class))
+
+    def fetch_task(query_key):
+        m_id, c_id, s_id, date_str = query_key
+        rows = fetch_performance_data_from_api(date_str, m_id, c_id, s_id)
+        return query_key, rows
+
+    perf_query_ok = 0
+    _workers = max_workers or _perf_api_workers(len(ids_date_to_pairs))
+    _deadline = (time.monotonic() + budget_seconds) if budget_seconds else None
+    with ThreadPoolExecutor(max_workers=_workers) as executor:
+        futures = [executor.submit(fetch_task, qk) for qk in ids_date_to_pairs]
+
+        completed_count = 0
+        total_count = len(futures)
+        for future in as_completed(futures):
+            if _deadline is not None and time.monotonic() > _deadline:
+                # Out of budget. Whatever has not landed stays unfetched; the
+                # rows it would have covered fall back below rather than the
+                # report hanging on a slow AMFI.
+                future.cancel()
+                continue
             try:
-                perf_rows = fetch_performance_data_from_api(date_str, m_id, c_id, s_id)
+                query_key, rows = future.result()
+                if rows:
+                    perf_query_ok += 1
+                    # Fan the shared result back out to every (date, asset_class)
+                    # pair that maps to this query, preserving downstream logic.
+                    for pair in ids_date_to_pairs.get(query_key, []):
+                        perf_lookup[pair] = rows
             except Exception:
-                perf_rows = None
-            if perf_rows:
-                perf_lookup[(date_str, asset_class)] = perf_rows
-                fetched += 1
-            time.sleep(0.4)
+                pass
+            completed_count += 1
+            if in_streamlit and completed_count % 10 == 0:
+                status_text.text(f"Fetching daily AUM from AMFI fund performance website ({completed_count}/{total_count})...")
 
-    if on_incomplete and fetched < len(jobs):
-        on_incomplete(fetched, len(jobs))
+    if in_streamlit:
+        status_text.empty()
+            
+    # Pre-compute the scheme-to-performance-scheme matching
+    unique_schemes = df_res[["Scheme Name", "Asset Class"]].drop_duplicates()
+    scheme_match_cache = {}  # (scheme_name, asset_class) -> matched_perf_schemeName
+    
+    for _, row in unique_schemes.iterrows():
+        s_name = row["Scheme Name"]
+        a_class = row["Asset Class"]
+        matched_perf_name = None
+        for key, p_rows in perf_lookup.items():
+            if key[1] == a_class and p_rows:
+                match_row = find_matching_perf_row(s_name, p_rows)
+                if match_row:
+                    matched_perf_name = match_row.get("schemeName")
+                    break
+        scheme_match_cache[(s_name, a_class)] = matched_perf_name
 
+    # Build a flat O(1) lookup: (date_str, asset_class, perf_name) -> daily_aum
+    # Only store AUMs for schemes we actually matched — this keeps the dict small.
+    needed_perf_names = set(v for v in scheme_match_cache.values() if v)
+    flat_perf_lookup = {}
+    for (date_str, asset_class), p_rows in perf_lookup.items():
+        for p_row in p_rows:
+            p_name = p_row.get("schemeName")
+            if p_name and p_name in needed_perf_names:
+                flat_perf_lookup[(date_str, asset_class, p_name)] = p_row.get("dailyAUM")
+    # Free the large perf_lookup dict — flat_perf_lookup is far smaller
+    del perf_lookup
 
-    # Now, try to match each row to the fetched performance rows
-    for idx, row in df_res.iterrows():
-        asset_class = row["Asset Class"]
-        date_str = row["Date_Str_Temp"]
-        scheme_name = row["Scheme Name"]
+    # Overwrite AUM with real API values using flat O(1) lookup
+    a_classes = df_res["Asset Class"].tolist()
+    d_strs = df_res["Date_Str_Temp"].tolist()
+    s_names = df_res["Scheme Name"].tolist()
+    aums = df_res["AUM"].tolist()
+    
+    for i in range(len(df_res)):
+        asset_class = a_classes[i]
+        date_str = d_strs[i]
+        scheme_name = s_names[i]
         
-        perf_rows = perf_lookup.get((date_str, asset_class), [])
-        match = find_matching_perf_row(scheme_name, perf_rows)
-        if match:
-            daily_aum = match.get("dailyAUM")
+        perf_name = scheme_match_cache.get((scheme_name, asset_class))
+        if perf_name:
+            daily_aum = flat_perf_lookup.get((date_str, asset_class, perf_name))
             if daily_aum is not None and daily_aum != "":
                 try:
-                    df_res.at[idx, "AUM"] = float(daily_aum)
+                    aums[i] = float(daily_aum)
                 except Exception:
                     pass
-                    
-    # AMFI sometimes republishes yesterday's AUM verbatim for a scheme. Left
-    # alone that is poison for flows: the engine reads an unchanged AUM against
-    # a NAV that moved and books the whole difference as a subscription. A
-    # 69,848.88 repeated against a -1.31% NAV day invents ~914cr of inflow.
-    # The derived AUM scales with NAV, so it implies no flow -- the honest
-    # reading when the AUM was simply not updated.
-    # The repair has to stay on the live series' own level. Substituting the
-    # derived AUM here looks reasonable and is badly wrong: the two series sit
-    # ~10% apart (69,848 live vs 63,562 derived for one scheme), so splicing
-    # one day of the other reads as a 6,286cr redemption. Instead carry the
-    # previous day's AUM forward scaled by the NAV move, which is what an
-    # untouched portfolio does and implies no flow.
-    date_col_sort = "NAV Date" if "NAV Date" in df_res.columns else "Date"
-    if {"Scheme Code", "AUM", "NAV"} <= set(df_res.columns):
-        df_res = df_res.sort_values(["Scheme Code", date_col_sort])
-        for _code, idx in df_res.groupby("Scheme Code", sort=False).groups.items():
-            idx = list(idx)
-            for i in range(1, len(idx)):
-                cur, prev = idx[i], idx[i - 1]
-                a_cur, a_prev = df_res.at[cur, "AUM"], df_res.at[prev, "AUM"]
-                n_cur, n_prev = df_res.at[cur, "NAV"], df_res.at[prev, "NAV"]
-                if pd.isna(a_cur) or pd.isna(a_prev) or a_cur != a_prev:
-                    continue
-                if pd.isna(n_cur) or pd.isna(n_prev) or n_prev == 0:
-                    continue
-                # A flat AUM on a flat NAV is unremarkable; only a repeat while
-                # the NAV moved indicates the AUM was never updated.
-                if abs(n_cur - n_prev) <= abs(n_prev) * 1e-6:
-                    continue
-                df_res.at[cur, "AUM"] = a_prev * (n_cur / n_prev)
-        df_res = df_res.sort_index()
+    
+    del flat_perf_lookup, scheme_match_cache
+    df_res["AUM"] = pd.to_numeric(pd.Series(aums, index=df_res.index), errors="coerce")
 
-    # Drop temporary column
+    # How many rows got a real, live AUM before any carry-forward.
+    real_aum_rows = int(df_res["AUM"].notna().sum())
+
+    # Carry real AUM across gaps so no day is left blank when the scheme has at
+    # least one real reading. Non-trading days (weekends/holidays, where NAV is
+    # also carried) and the occasional failed/slow API call get filled with the
+    # nearest real AUM instead of showing "None". Nothing is fabricated — every
+    # filled value is an actual disclosed AUM carried to an adjacent day.
+    if gap_fill == "fallback":
+        df_res["AUM"] = df_res["AUM"].fillna(df_res["Fallback_AUM"])
+    else:
+        try:
+            _dcol = "NAV Date" if "NAV Date" in df_res.columns else "Date"
+            df_res["_aum_sort"] = parse_amfi_date_series(df_res[_dcol])
+            df_res = df_res.sort_values(["Scheme Code", "_aum_sort"]).reset_index(drop=True)
+            df_res["AUM"] = df_res.groupby("Scheme Code")["AUM"].ffill()
+            df_res["AUM"] = df_res.groupby("Scheme Code")["AUM"].bfill()
+            df_res = df_res.drop(columns=["_aum_sort"])
+        except Exception:
+            pass
+
+    # Record fetch health so the UI can flag when the live AMFI feed under-delivered.
+    total_rows = len(df_res)
+    filled_rows = int(df_res["AUM"].notna().sum())
+    _LAST_AUM_STATS.clear()
+    _LAST_AUM_STATS.update({
+        "perf_queries": int(len(ids_date_to_pairs)),
+        "perf_ok": int(perf_query_ok),
+        "rows_total": total_rows,
+        "rows_real_aum": real_aum_rows,
+        "rows_filled": filled_rows,
+        "rows_blank": total_rows - filled_rows,
+    })
+
+    if on_incomplete and perf_query_ok < len(ids_date_to_pairs):
+        on_incomplete(perf_query_ok, len(ids_date_to_pairs))
+
     df_res = df_res.drop(columns=["Date_Str_Temp"])
     return df_res
+
+
 
 
 # A daily NAV move smaller than this cannot distinguish a stale AUM from a

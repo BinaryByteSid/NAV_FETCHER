@@ -583,6 +583,10 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
             df_slice, df_port, want_aum=True, fetch_live_aum=True,
             budget_seconds=AUM_BUDGET_SECONDS, max_workers=AUM_FETCH_WORKERS,
             on_incomplete=_note_partial,
+            # Flows measure AUM movement between consecutive days. A carried
+            # figure is indistinguishable from AMFI repeating a stale one, so
+            # every carried day would be scored as a zero flow.
+            gap_fill="fallback",
         )
         df_aum = _align_quant_nav(df_aum)
         df_flows = calculate_flows_for_dataframe(
