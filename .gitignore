@@ -1,0 +1,6 @@
+# Saved MIS reports are user data, not source.
+mis_history/
+__pycache__/
+*.pyc
+api_cache/
+amfi_cache/

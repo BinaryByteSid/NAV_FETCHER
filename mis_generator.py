@@ -60,6 +60,7 @@ from benchmark_proxy import (
     STATUS_NONE,
     DEFAULT_BENCHMARK,
 )
+import mis_history
 from ui_theme import render_section_header, render_info_card, finance_panel
 
 # ─── Default Sample Portfolio ──────────────────────────────────────────────────
@@ -1819,6 +1820,80 @@ def render_mis_generator_page():
                 f"**Total allocation:** {prev_clean['Allocation (%)'].sum():.2f}%"
             )
 
+    with finance_panel("2b. Saved MIS History"):
+        saved = mis_history.list_reports()
+        n_saved, mb = mis_history.history_size()
+        st.caption(
+            f"Every report you generate is kept here — {n_saved} saved, {mb:.1f} MB. "
+            + mis_history.EPHEMERAL_NOTE
+        )
+
+        if not saved:
+            st.info("No saved reports yet. Generate one below and it appears here.")
+        else:
+            index = {
+                f"{m.get('label', m['id'])}  ·  {m.get('scheme_count', 0)} schemes  "
+                f"·  saved {str(m.get('saved_at', ''))[:16].replace('T', ' ')}": m["id"]
+                for m in saved
+            }
+            chosen_label = st.selectbox("Saved reports", list(index), key="mis_hist_pick")
+            chosen_id = index[chosen_label]
+            meta, xlsx = mis_history.load_report(chosen_id)
+
+            if meta is None:
+                st.error("That saved report could not be read.")
+            else:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Period", f"{meta.get('period_start')} → {meta.get('period_end')}")
+                c2.metric("Schemes", meta.get("scheme_count", 0))
+                c3.metric("Flows", "included" if meta.get("include_flows") else "off")
+
+                with st.expander("Portfolio as reported", expanded=False):
+                    st.dataframe(
+                        mis_history.portfolio_frame(meta.get("portfolio", [])),
+                        use_container_width=True, hide_index=True,
+                    )
+                    prev_rows = meta.get("previous_portfolio") or []
+                    if prev_rows:
+                        st.caption("Previous portfolio")
+                        st.dataframe(
+                            mis_history.portfolio_frame(prev_rows),
+                            use_container_width=True, hide_index=True,
+                        )
+                    for w in (meta.get("warnings") or [])[:4]:
+                        st.caption(f"⚠️ {w[:200]}")
+
+                b1, b2, b3 = st.columns(3)
+                with b1:
+                    if xlsx:
+                        st.download_button(
+                            "⬇️ Download this report", data=xlsx,
+                            file_name=f"{meta.get('id')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True, key="mis_hist_dl",
+                        )
+                    else:
+                        st.caption("Workbook file missing.")
+                with b2:
+                    # Load the saved portfolio back into the editors so an old
+                    # report can be reissued against today's NAVs.
+                    if st.button("↩️ Load portfolio into editor", use_container_width=True,
+                                 key="mis_hist_load"):
+                        st.session_state["portfolio_input_df"] = mis_history.portfolio_frame(
+                            meta.get("portfolio", [])
+                        )
+                        prev_rows = meta.get("previous_portfolio") or []
+                        if prev_rows:
+                            st.session_state["prev_portfolio_input_df"] = mis_history.portfolio_frame(prev_rows)
+                        # Force section 1 to re-seed from the restored frame.
+                        st.session_state.pop("mis_manual_editor", None)
+                        st.session_state["mis_current_sig"] = None
+                        st.rerun()
+                with b3:
+                    if st.button("🗑️ Delete", use_container_width=True, key="mis_hist_del"):
+                        mis_history.delete_report(chosen_id)
+                        st.rerun()
+
     with finance_panel("3. Benchmark index levels (optional)"):
         st.caption(
             "Upload your own index levels to override the proxy funds. Columns: **Benchmark**, "
@@ -1932,6 +2007,17 @@ def render_mis_generator_page():
                     )
                     if clicked:
                         st.success("MIS reports generated.")
+                        try:
+                            entry_id = mis_history.save_report(
+                                st.session_state["mis_results"],
+                                export_mis_to_excel(st.session_state["mis_results"]),
+                                clean_df,
+                                prev_clean if not prev_clean.empty else None,
+                            )
+                            st.caption(f"💾 Saved to history as `{entry_id}`")
+                        except Exception as exc:
+                            # A history failure must not cost the user the report.
+                            st.caption(f"⚠️ Could not save to history: {exc}")
                 except Exception as exc:
                     st.session_state["mis_results"] = None
                     st.error(f"Failed to generate MIS reports: {exc}")

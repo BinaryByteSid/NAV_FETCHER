@@ -8,3 +8,4 @@ scratch/
 .venv/
 .git/
 .pytest_cache/
+mis_history/
