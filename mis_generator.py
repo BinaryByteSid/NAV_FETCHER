@@ -1795,6 +1795,21 @@ def render_mis_generator_page():
             ):
                 st.session_state["mis_workspace_sig"] = _ws_sig
 
+        # Report what is genuinely on disk, read back rather than assumed, so a
+        # failed write shows up here instead of at the next reload.
+        _disk = mis_history.load_workspace()
+        if _disk["current"] is not None:
+            _match = _portfolio_signature(_disk["current"]) == cur_sig
+            _when = str(_disk.get("saved_at") or "")[:16].replace("T", " ")
+            st.caption(
+                f"💾 Saved to disk at {_when} — survives refresh and restart."
+                if _match else
+                "⚠️ On-disk copy is out of step with the editor. Click "
+                "**Generate MIS Reports** to force a save."
+            )
+        else:
+            st.caption("⚠️ Nothing saved to disk yet — this portfolio will not survive a reload.")
+
     with finance_panel("2. Previous Portfolio (optional)"):
         st.caption(
             "Renders the second comparison block that appears beneath each MIS table in the "
@@ -2048,6 +2063,16 @@ def render_mis_generator_page():
                     )
 
                 try:
+                    # Whatever a report is generated from is by definition what
+                    # the user meant to keep. Save it unconditionally, so a
+                    # generated portfolio can never be lost to a reload even if
+                    # an editor edit failed to persist on its own rerun.
+                    mis_history.save_workspace(
+                        current_portfolio_df,
+                        st.session_state.get("prev_portfolio_input_df"),
+                        st.session_state.get("mis_auto_prev_df"),
+                        st.session_state.get("mis_prev_mode", ""),
+                    )
                     st.session_state["mis_inputs_sig"] = live_sig
                     st.session_state["mis_results"] = generate_mis_reports_data(
                         clean_df, start_date, end_date,
