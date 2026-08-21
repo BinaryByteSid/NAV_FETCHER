@@ -1663,6 +1663,13 @@ def _render_block(block: Dict[str, Any], key: str):
                 )
 
 
+_PREV_MODES = [
+    "Auto (carry over previous version)",
+    "Manual Entry / Edit",
+    "Upload Excel File",
+]
+
+
 def render_mis_generator_page():
     """Render the full interactive MIS Generator Streamlit page."""
     render_section_header(
@@ -1677,6 +1684,30 @@ def render_mis_generator_page():
         "same AMFI feed — so every figure traces to real data. Where a benchmark cannot be sourced the report "
         "shows <code>N/A</code> rather than a substituted number."
     )
+
+    # Restore the portfolios from disk before falling back to the sample
+    # template. Streamlit's session state is memory-only, so without this a
+    # refresh or a redeploy silently replaces a hand-entered portfolio with the
+    # sample -- and the MIS portfolio is edited about once a year, so that edit
+    # is exactly the thing that must not be lost.
+    if "mis_workspace_loaded" not in st.session_state:
+        saved = mis_history.load_workspace()
+        st.session_state["portfolio_input_df"] = (
+            saved["current"] if saved["current"] is not None
+            else pd.DataFrame(DEFAULT_SAMPLE_PORTFOLIO)
+        )
+        st.session_state["prev_portfolio_input_df"] = (
+            saved["previous"] if saved["previous"] is not None
+            else pd.DataFrame(columns=["Scheme Name", "ISIN", "Allocation (%)", "Benchmark"])
+        )
+        if saved["auto_previous"] is not None:
+            st.session_state["mis_auto_prev_df"] = saved["auto_previous"]
+        # Seed the radio's key before the widget exists so the saved choice is
+        # what renders; setting it afterwards would be ignored for this run.
+        if saved["prev_mode"] in _PREV_MODES:
+            st.session_state["mis_prev_mode"] = saved["prev_mode"]
+        st.session_state["mis_workspace_restored_at"] = saved["saved_at"]
+        st.session_state["mis_workspace_loaded"] = True
 
     if "portfolio_input_df" not in st.session_state:
         st.session_state["portfolio_input_df"] = pd.DataFrame(DEFAULT_SAMPLE_PORTFOLIO)
@@ -1697,8 +1728,11 @@ def render_mis_generator_page():
 
         if input_mode == "Manual Entry / Edit":
             if st.button("🔄 Reset Sample Template"):
+                mis_history.clear_workspace()
                 st.session_state["portfolio_input_df"] = pd.DataFrame(DEFAULT_SAMPLE_PORTFOLIO)
                 st.session_state["mis_results"] = None
+                st.session_state.pop("mis_manual_editor", None)
+                st.session_state["mis_current_sig"] = None
                 st.rerun()
             current_portfolio_df = st.data_editor(
                 st.session_state["portfolio_input_df"], num_rows="dynamic",
@@ -1748,14 +1782,26 @@ def render_mis_generator_page():
             st.session_state["mis_current_sig"] = cur_sig
             st.session_state["mis_current_df"] = current_portfolio_df.copy()
 
+        # Keep the on-disk copy in step with the editors. Written only when the
+        # content actually differs, so a plain rerun does not rewrite the file.
+        st.session_state["portfolio_input_df"] = current_portfolio_df.copy()
+        _ws_sig = (cur_sig, _portfolio_signature(st.session_state.get("mis_auto_prev_df")))
+        if st.session_state.get("mis_workspace_sig") != _ws_sig:
+            if mis_history.save_workspace(
+                current_portfolio_df,
+                st.session_state.get("prev_portfolio_input_df"),
+                st.session_state.get("mis_auto_prev_df"),
+                st.session_state.get("mis_prev_mode", ""),
+            ):
+                st.session_state["mis_workspace_sig"] = _ws_sig
+
     with finance_panel("2. Previous Portfolio (optional)"):
         st.caption(
             "Renders the second comparison block that appears beneath each MIS table in the "
             "reference report. Leave empty to skip it."
         )
         prev_mode = st.radio(
-            "Previous Portfolio Source",
-            ["Auto (carry over previous version)", "Manual Entry / Edit", "Upload Excel File"],
+            "Previous Portfolio Source", _PREV_MODES,
             horizontal=True, key="mis_prev_mode",
         )
 
@@ -1792,6 +1838,10 @@ def render_mis_generator_page():
             # this the editor is reseeded from the carry-over and the edits are
             # silently discarded before the report is built.
             st.session_state["prev_portfolio_input_df"] = prev_raw.copy()
+            mis_history.save_workspace(
+                st.session_state.get("portfolio_input_df"), prev_raw,
+                st.session_state.get("mis_auto_prev_df"), prev_mode,
+            )
 
         else:
             prev_file = st.file_uploader(
@@ -1803,6 +1853,10 @@ def render_mis_generator_page():
                 try:
                     prev_raw = read_portfolio_excel(prev_file)
                     st.session_state["prev_portfolio_input_df"] = prev_raw.copy()
+                    mis_history.save_workspace(
+                        st.session_state.get("portfolio_input_df"), prev_raw,
+                        st.session_state.get("mis_auto_prev_df"), prev_mode,
+                    )
                     st.success(f"Loaded {len(prev_raw)} rows.")
                 except Exception as exc:
                     st.error(f"Error reading previous portfolio file: {exc}")

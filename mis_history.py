@@ -190,3 +190,82 @@ def clear_history() -> None:
     """Delete every saved report."""
     if HISTORY_DIR.exists():
         shutil.rmtree(HISTORY_DIR, ignore_errors=True)
+
+
+# ─── Working portfolios ───────────────────────────────────────────────────────
+# The MIS portfolio changes about once a year, so an edit is a deliberate act
+# that must outlive the browser session. Streamlit keeps widget state in memory
+# only: a refresh, a redeploy or an idle timeout drops it and the editors reseed
+# from the sample template, silently discarding the real portfolio. These are
+# kept on disk instead, in their own directory so clearing report history never
+# touches them.
+
+STATE_DIR = Path(__file__).resolve().parent / "mis_state"
+WORKSPACE_PATH = STATE_DIR / "workspace.json"
+
+
+def save_workspace(
+    current: Optional[pd.DataFrame],
+    previous: Optional[pd.DataFrame] = None,
+    auto_previous: Optional[pd.DataFrame] = None,
+    prev_mode: str = "",
+) -> bool:
+    """Persist the portfolios currently being edited. False if it could not."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "current": _portfolio_records(current),
+            "previous": _portfolio_records(previous),
+            "auto_previous": _portfolio_records(auto_previous),
+            "prev_mode": str(prev_mode or ""),
+        }
+        # Write via a temporary file: a crash mid-write would otherwise leave a
+        # truncated JSON that reads back as "no saved portfolio" and silently
+        # restores the template.
+        tmp = WORKSPACE_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(WORKSPACE_PATH)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def load_workspace() -> Dict[str, Any]:
+    """Restore saved portfolios.
+
+    Returns {"current": df|None, "previous": df|None, "auto_previous": df|None,
+    "prev_mode": str, "saved_at": str|None}. Everything is None when nothing has
+    been saved, which is the caller's signal to fall back to the template.
+    """
+    blank = {"current": None, "previous": None, "auto_previous": None,
+             "prev_mode": "", "saved_at": None}
+    if not WORKSPACE_PATH.exists():
+        return blank
+    try:
+        raw = json.loads(WORKSPACE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return blank
+
+    def frame(key: str) -> Optional[pd.DataFrame]:
+        recs = raw.get(key) or []
+        if not recs:
+            return None
+        df = portfolio_frame(recs)
+        return df if not df.empty else None
+
+    return {
+        "current": frame("current"),
+        "previous": frame("previous"),
+        "auto_previous": frame("auto_previous"),
+        "prev_mode": str(raw.get("prev_mode") or ""),
+        "saved_at": raw.get("saved_at"),
+    }
+
+
+def clear_workspace() -> None:
+    """Forget the saved portfolios so the editors fall back to the template."""
+    try:
+        WORKSPACE_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
