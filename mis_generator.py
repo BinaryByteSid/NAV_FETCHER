@@ -1890,12 +1890,24 @@ def render_mis_generator_page():
             )
 
     with finance_panel("2b. Saved MIS History"):
+        # Clear anything an interrupted save left behind before counting.
+        mis_history.prune_orphans()
         saved = mis_history.list_reports()
         n_saved, mb = mis_history.history_size()
-        st.caption(
-            f"Every report you generate is kept here — {n_saved} saved, {mb:.1f} MB. "
-            + mis_history.EPHEMERAL_NOTE
-        )
+
+        # Count what is actually readable, not just what is listed: a sidecar
+        # can survive while its workbook does not.
+        n_ok = sum(1 for m in saved if mis_history.load_report(m["id"])[1] is not None)
+        if n_ok == n_saved:
+            st.caption(
+                f"Every report you generate is kept here — **{n_saved} saved**, {mb:.1f} MB, "
+                f"all readable. " + mis_history.EPHEMERAL_NOTE
+            )
+        else:
+            st.warning(
+                f"{n_saved} report(s) saved but only {n_ok} have a readable workbook. "
+                f"The rest were interrupted mid-save and can be deleted."
+            )
 
         if not saved:
             st.info("No saved reports yet. Generate one below and it appears here.")
@@ -2095,8 +2107,12 @@ def render_mis_generator_page():
                             )
                             st.caption(f"💾 Saved to history as `{entry_id}`")
                         except Exception as exc:
-                            # A history failure must not cost the user the report.
-                            st.caption(f"⚠️ Could not save to history: {exc}")
+                            # A history failure must not cost the user the report,
+                            # but it must not pass unnoticed either.
+                            st.warning(
+                                f"⚠️ Report generated but NOT saved to history: {exc}. "
+                                f"Download it below if you need to keep it."
+                            )
                 except Exception as exc:
                     st.session_state["mis_results"] = None
                     st.error(f"Failed to generate MIS reports: {exc}")

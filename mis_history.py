@@ -35,6 +35,19 @@ EPHEMERAL_NOTE = (
 _ID_SAFE = re.compile(r"[^0-9A-Za-z_-]+")
 
 
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write via a temporary file and rename, so readers never see a partial file."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(data)
+    tmp.replace(path)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
 def _ensure_dir() -> Path:
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     return HISTORY_DIR
@@ -97,7 +110,10 @@ def save_report(
     entry_id = _ID_SAFE.sub("-", f"{now:%Y%m%d-%H%M%S}_{start}_to_{end}")
 
     xlsx_path = HISTORY_DIR / f"{entry_id}.xlsx"
-    xlsx_path.write_bytes(excel_bytes)
+    # Temp file then rename, as for the workspace. A crash or a full disk
+    # partway through a direct write leaves a truncated workbook that still
+    # looks like a saved report until someone opens it.
+    _atomic_write_bytes(xlsx_path, excel_bytes)
 
     meta = {
         "id": entry_id,
@@ -117,9 +133,17 @@ def save_report(
         "xlsx": xlsx_path.name,
         "xlsx_bytes": len(excel_bytes),
     }
-    (HISTORY_DIR / f"{entry_id}.json").write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    # The sidecar is written last: list_reports() keys off it, so a report only
+    # becomes visible once its workbook is already safely on disk.
+    meta_path = HISTORY_DIR / f"{entry_id}.json"
+    _atomic_write_text(meta_path, json.dumps(meta, indent=2, ensure_ascii=False))
+
+    # Read back rather than trusting the write. A save that did not land should
+    # fail here, where the caller can say so, not silently at the next reload.
+    check_meta, check_bytes = load_report(entry_id)
+    if check_meta is None or check_bytes is None or len(check_bytes) != len(excel_bytes):
+        raise OSError(f"report {entry_id} did not verify after saving")
+
     return entry_id
 
 
@@ -176,6 +200,31 @@ def portfolio_frame(records: List[Dict[str, Any]]) -> pd.DataFrame:
             df[c] = "" if c != "Allocation (%)" else 0.0
     df["Allocation (%)"] = pd.to_numeric(df["Allocation (%)"], errors="coerce").fillna(0.0)
     return df[cols]
+
+
+def prune_orphans() -> int:
+    """Delete workbooks and temp files with no readable sidecar.
+
+    An interrupted save can leave a .xlsx or a .tmp behind. They are invisible
+    to the history list but still consume disk, so they are cleaned up rather
+    than accumulating silently.
+    """
+    if not HISTORY_DIR.exists():
+        return 0
+    known = {p.stem for p in HISTORY_DIR.glob("*.json")}
+    removed = 0
+    for path in HISTORY_DIR.iterdir():
+        if not path.is_file():
+            continue
+        if path.suffix == ".json":
+            continue
+        if path.name.endswith(".tmp") or path.stem not in known:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
 
 
 def history_size() -> Tuple[int, float]:
