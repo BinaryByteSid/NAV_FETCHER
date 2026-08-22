@@ -82,6 +82,13 @@ DEFAULT_SAMPLE_PORTFOLIO = [
     {"Scheme Name": "HDFC Small Cap Gr",               "ISIN": "INF179KA1RZ8", "Allocation (%)": 5.0,  "Benchmark": "S&P BSE 250 SmallCap TR INR"},
 ]
 
+# Reports carry full working precision in the cell and show two decimals.
+# Rounding the stored value to two threw the precision away in the file, so a
+# figure could not be re-derived or reconciled from the workbook afterwards;
+# the number format governs display only.
+STORE_DP = 5
+DISPLAY_FMT = "0.00"
+
 NIFTY_KEY = "NIFTY 50"
 
 
@@ -1295,13 +1302,13 @@ def _write_mis_block(ws, spec: Dict[str, Any], start_row: int) -> int:
                     cell.value = "N/A"
                     cell.alignment = ALIGN_R
                 else:
-                    cell.value = round(float(val), 2)
-                    cell.number_format = "0.00"
+                    cell.value = round(float(val), STORE_DP)
+                    cell.number_format = DISPLAY_FMT
                     cell.alignment = ALIGN_R
                     if c in colour:
                         cell.fill = GREEN_FILL if float(val) >= 0 else RED_FILL
             elif c in alloc:
-                cell.value = (float(val) / 100.0) if pd.notna(val) else 0.0
+                cell.value = round(float(val), STORE_DP) / 100.0 if pd.notna(val) else 0.0
                 cell.number_format = "0.00%"
                 cell.alignment = ALIGN_R
             elif c == "S.No":
@@ -1326,13 +1333,13 @@ def _write_mis_block(ws, spec: Dict[str, Any], start_row: int) -> int:
                 if val is None or pd.isna(val):
                     cell.value = "N/A"
                 else:
-                    cell.value = round(float(val), 2)
-                    cell.number_format = "0.00"
+                    cell.value = round(float(val), STORE_DP)
+                    cell.number_format = DISPLAY_FMT
                     if c in colour:
                         cell.fill = GREEN_FILL if float(val) >= 0 else RED_FILL
                 cell.alignment = ALIGN_R
             elif c in alloc:
-                cell.value = (float(val) / 100.0) if val not in (None, "") and pd.notna(val) else None
+                cell.value = (round(float(val), STORE_DP) / 100.0) if val not in (None, "") and pd.notna(val) else None
                 cell.number_format = "0.00%"
                 cell.alignment = ALIGN_R
             else:
@@ -1377,8 +1384,8 @@ def _write_mis_block(ws, spec: Dict[str, Any], start_row: int) -> int:
             if value is None or pd.isna(value):
                 vcell.value = "N/A"
             else:
-                vcell.value = round(float(value), 2)
-                vcell.number_format = "0.00"
+                vcell.value = round(float(value), STORE_DP)
+                vcell.number_format = DISPLAY_FMT
                 if coloured:
                     vcell.fill = GREEN_FILL if float(value) >= 0 else RED_FILL
             vcell.font = Font(name=FONT, size=9, bold=True)
@@ -1656,9 +1663,12 @@ def _render_block(block: Dict[str, Any], key: str):
                 continue
             with col:
                 st.caption(heading)
+                foot = pd.DataFrame(
+                    [{"Measure": l, "Value": (None if v is None or pd.isna(v) else round(v, STORE_DP))}
+                     for l, v in items]
+                )
                 st.dataframe(
-                    pd.DataFrame([{"Measure": l, "Value": (None if v is None or pd.isna(v) else round(v, 2))}
-                                  for l, v in items]),
+                    foot.style.format({"Value": "{:.2f}"}, na_rep="N/A"),
                     use_container_width=True, hide_index=True,
                 )
 
