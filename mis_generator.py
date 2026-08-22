@@ -868,6 +868,15 @@ def _build_reports(portfolio_df: pd.DataFrame, nav_series: Dict[str, Series],
         bm_levels = bser.levels if bser is not None else {}
         bm = _scheme_metrics(bm_levels, d_end, d_period_base, d_fy_base, d_mtd)
 
+        # One benchmark number per window, used both for the reported column and
+        # for the excess derived from it. Computing them separately is how a row
+        # ended up showing 0.98 against 0.48 with an excess of 0.40.
+        bm_day = _first_not_none(_supplied(d_end, d_end), bm["day"])
+        bm_period = _first_not_none(_supplied(d_start, d_end), bm["period"])
+        bm_fy = _first_not_none(
+            _supplied(d_m3_start, d_m3_end), _window_return(bm_levels, d_m3_base, d_m3_end)
+        )
+
         rows.append({
             "Scheme Name": r["Scheme Name"],
             "ISIN": isin,
@@ -878,24 +887,23 @@ def _build_reports(portfolio_df: pd.DataFrame, nav_series: Dict[str, Series],
             "Day Scheme Return": sm["day"],
             "Day Nifty Return": n_metrics["day"],
             "Day Excess vs Nifty": _diff(sm["day"], n_metrics["day"]),
-            "Day Benchmark Return": _first_not_none(_supplied(d_end, d_end), bm["day"]),
-            "Day Excess vs Benchmark": _diff(sm["day"], bm["day"]),
+            "Day Benchmark Return": bm_day,
+            "Day Excess vs Benchmark": _diff(sm["day"], bm_day),
             # period
             "Period Scheme Return": sm["period"],
             "Period Nifty Return": n_metrics["period"],
             "Period Excess vs Nifty": _diff(sm["period"], n_metrics["period"]),
-            "Period Benchmark Return": _first_not_none(_supplied(d_start, d_end), bm["period"]),
-            "Period Excess vs Benchmark": _diff(sm["period"], bm["period"]),
+            "Period Benchmark Return": bm_period,
+            "Period Excess vs Benchmark": _diff(sm["period"], bm_period),
             # MIS 3 window — the financial year unless a separate range is set.
             # The "since 1st April" footers on MIS 1/2 keep using sm["fy"].
             "FY Scheme Return": _window_return(nav_series.get(isin, {}), d_m3_base, d_m3_end),
             "FY Nifty Return": _window_return(nifty_levels, d_m3_base, d_m3_end),
             "FY Excess vs Nifty": _diff(_window_return(nav_series.get(isin, {}), d_m3_base, d_m3_end),
                                         _window_return(nifty_levels, d_m3_base, d_m3_end)),
-            "FY Benchmark Return": _first_not_none(
-                _supplied(d_m3_start, d_m3_end), _window_return(bm_levels, d_m3_base, d_m3_end)),
-            "FY Excess vs Benchmark": _diff(_window_return(nav_series.get(isin, {}), d_m3_base, d_m3_end),
-                                            _window_return(bm_levels, d_m3_base, d_m3_end)),
+            "FY Benchmark Return": bm_fy,
+            "FY Excess vs Benchmark": _diff(
+                _window_return(nav_series.get(isin, {}), d_m3_base, d_m3_end), bm_fy),
             # Supplementary flow columns, in crores — these mirror the
             # reference report, where MTD and YTD are cumulative net flows
             # rather than returns.
