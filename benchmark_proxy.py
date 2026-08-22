@@ -731,3 +731,107 @@ def apply_tri_levels(
             note="Official total-return series; no proxy fund used.",
         )
     return series, notes
+
+
+# ─── User-supplied benchmark returns ──────────────────────────────────────────
+
+# A date cell holding a window rather than a single day: "01-04-2026 - 20-08-2026".
+_RANGE_RE = re.compile(
+    r"^\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:-|–|—|to)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*$",
+    re.I,
+)
+
+
+def looks_like_returns_sheet(df: pd.DataFrame) -> bool:
+    """True if the Date column holds windows rather than single dates.
+
+    Distinguishes a sheet of pre-computed returns from one of daily index
+    levels, so a single uploader can accept either.
+    """
+    if df is None or df.empty:
+        return False
+    for col in df.columns:
+        if "date" in str(col).strip().lower():
+            for v in df[col].head(10):
+                if _RANGE_RE.match(str(v)):
+                    return True
+    return False
+
+
+def parse_supplied_returns(
+    df: pd.DataFrame,
+) -> Tuple[Dict[str, Dict[Tuple[date, date], float]], List[str]]:
+    """Read a sheet of benchmark returns keyed by date window.
+
+    Expects Benchmark, a Date column of ``from - to`` windows, and a value
+    column (Return, Close, Level or Value). A single-day window such as
+    ``20-08-2026 - 20-08-2026`` supplies that day's return.
+
+    This is what a benchmark provider's own export looks like, and it avoids
+    needing a full daily level series just to state three figures.
+
+    Returns ({benchmark_key: {(from, to): percent}}, problems).
+    """
+    problems: List[str] = []
+    out: Dict[str, Dict[Tuple[date, date], float]] = {}
+    if df is None or df.empty:
+        return {}, problems
+
+    def find(*cands) -> Optional[str]:
+        for c in df.columns:
+            cl = str(c).strip().lower()
+            if any(t == cl or t in cl for t in cands):
+                return c
+        return None
+
+    name_col = find("benchmark", "index name", "index")
+    date_col = find("date", "period", "window")
+    val_col = find("return", "close", "level", "value")
+
+    missing = [lbl for lbl, col in
+               (("Benchmark", name_col), ("Date", date_col), ("Return/Close", val_col))
+               if col is None]
+    if missing:
+        problems.append(
+            f"Benchmark returns sheet is missing column(s): {', '.join(missing)}."
+        )
+        return {}, problems
+
+    unparsed = 0
+    for _, row in df.iterrows():
+        raw_name = str(row[name_col]).strip()
+        if not raw_name or raw_name.lower() in ("nan", "none", "-"):
+            continue
+        m = _RANGE_RE.match(str(row[date_col]))
+        if not m:
+            unparsed += 1
+            continue
+        try:
+            d_from = pd.to_datetime(m.group(1), dayfirst=True).date()
+            d_to = pd.to_datetime(m.group(2), dayfirst=True).date()
+        except (ValueError, TypeError):
+            unparsed += 1
+            continue
+        val = pd.to_numeric(row[val_col], errors="coerce")
+        if pd.isna(val):
+            unparsed += 1
+            continue
+        out.setdefault(normalize_benchmark_name(raw_name), {})[(d_from, d_to)] = float(val)
+
+    if unparsed:
+        problems.append(
+            f"{unparsed} row(s) in the benchmark returns sheet could not be read "
+            f"and were ignored. Dates must be a window such as '01-04-2026 - 20-08-2026'."
+        )
+    return out, problems
+
+
+def describe_supplied_returns(supplied: Dict[str, Dict[Tuple[date, date], float]]) -> List[str]:
+    """One human-readable line per supplied benchmark, for the report notes."""
+    lines: List[str] = []
+    for key, windows in sorted(supplied.items()):
+        spans = ", ".join(
+            f"{a:%d-%b-%Y} to {b:%d-%b-%Y} = {v:.4f}%" for (a, b), v in sorted(windows.items())
+        )
+        lines.append(f"'{key}' supplied returns: {spans}")
+    return lines

@@ -49,6 +49,10 @@ from benchmark_proxy import (
     parse_supplied_levels,
     apply_supplied_levels,
     apply_tri_levels,
+    looks_like_returns_sheet,
+    parse_supplied_returns,
+    describe_supplied_returns,
+    normalize_benchmark_name,
     nav_frame_to_isin_series,
     overlay_live_navs,
     describe_gaps,
@@ -729,6 +733,14 @@ AUM_FETCH_WORKERS = 6
 STALE_AUM_MIN_MOVE_PCT = 0.05
 
 
+def _first_not_none(*values):
+    """First value that is neither None nor NaN."""
+    for v in values:
+        if v is not None and not (isinstance(v, float) and pd.isna(v)):
+            return v
+    return None
+
+
 def _window_return(series: Optional[Series], d_base: date, d_to: date) -> Optional[float]:
     """Return over (d_base, d_to], both ends resolved to real observations.
 
@@ -805,7 +817,9 @@ def _build_reports(portfolio_df: pd.DataFrame, nav_series: Dict[str, Series],
                    d_end: date, d_start: date, d_fy: date, d_mtd: date,
                    label: str, d_flow: Optional[date] = None,
                    d_mis3_start: Optional[date] = None,
-                   d_mis3_end: Optional[date] = None) -> Dict[str, Any]:
+                   d_mis3_end: Optional[date] = None,
+                   supplied_returns: Optional[Dict[str, Dict[Tuple[date, date], float]]] = None,
+                   ) -> Dict[str, Any]:
     """Assemble MIS 1, 2 and 3 for one portfolio.
 
     ``d_flow`` is the day the Flows/MTD/YTD figures run to -- a day behind
@@ -836,6 +850,20 @@ def _build_reports(portfolio_df: pd.DataFrame, nav_series: Dict[str, Series],
         sm = _scheme_metrics(nav_series.get(isin, {}), d_end, d_period_base, d_fy_base, d_mtd)
 
         bm_name = r["Benchmark"]
+
+        def _supplied(d_from: date, d_to: date) -> Optional[float]:
+            """A user-supplied return for exactly this window, if one was given.
+
+            Matched on the window rather than interpolated: a provider's figure
+            covers the span it names, and deriving a different span from it
+            would be inventing a number.
+            """
+            if not supplied_returns:
+                return None
+            bser_key = bm_series.get(bm_name)
+            key = bser_key.key if bser_key is not None else normalize_benchmark_name(str(bm_name))
+            return (supplied_returns.get(key) or {}).get((d_from, d_to))
+
         bser = bm_series.get(bm_name)
         bm_levels = bser.levels if bser is not None else {}
         bm = _scheme_metrics(bm_levels, d_end, d_period_base, d_fy_base, d_mtd)
@@ -850,13 +878,13 @@ def _build_reports(portfolio_df: pd.DataFrame, nav_series: Dict[str, Series],
             "Day Scheme Return": sm["day"],
             "Day Nifty Return": n_metrics["day"],
             "Day Excess vs Nifty": _diff(sm["day"], n_metrics["day"]),
-            "Day Benchmark Return": bm["day"],
+            "Day Benchmark Return": _first_not_none(_supplied(d_end, d_end), bm["day"]),
             "Day Excess vs Benchmark": _diff(sm["day"], bm["day"]),
             # period
             "Period Scheme Return": sm["period"],
             "Period Nifty Return": n_metrics["period"],
             "Period Excess vs Nifty": _diff(sm["period"], n_metrics["period"]),
-            "Period Benchmark Return": bm["period"],
+            "Period Benchmark Return": _first_not_none(_supplied(d_start, d_end), bm["period"]),
             "Period Excess vs Benchmark": _diff(sm["period"], bm["period"]),
             # MIS 3 window — the financial year unless a separate range is set.
             # The "since 1st April" footers on MIS 1/2 keep using sm["fy"].
@@ -864,7 +892,8 @@ def _build_reports(portfolio_df: pd.DataFrame, nav_series: Dict[str, Series],
             "FY Nifty Return": _window_return(nifty_levels, d_m3_base, d_m3_end),
             "FY Excess vs Nifty": _diff(_window_return(nav_series.get(isin, {}), d_m3_base, d_m3_end),
                                         _window_return(nifty_levels, d_m3_base, d_m3_end)),
-            "FY Benchmark Return": _window_return(bm_levels, d_m3_base, d_m3_end),
+            "FY Benchmark Return": _first_not_none(
+                _supplied(d_m3_start, d_m3_end), _window_return(bm_levels, d_m3_base, d_m3_end)),
             "FY Excess vs Benchmark": _diff(_window_return(nav_series.get(isin, {}), d_m3_base, d_m3_end),
                                             _window_return(bm_levels, d_m3_base, d_m3_end)),
             # Supplementary flow columns, in crores — these mirror the
@@ -1146,11 +1175,20 @@ def generate_mis_reports_data(
 
     # User-supplied index levels win over any proxy, including an EXACT one:
     # the report is meant to reconcile to the user's own benchmark source.
+    supplied_returns: Dict[str, Dict[Tuple[date, date], float]] = {}
     if supplied_levels_df is not None and not supplied_levels_df.empty:
-        supplied, supply_problems = parse_supplied_levels(supplied_levels_df)
-        bm_notes.extend(supply_problems)
-        bm_series, supply_notes = apply_supplied_levels(bm_series, supplied)
-        bm_notes.extend(supply_notes)
+        # One uploader takes either shape: a daily level series, or a sheet of
+        # returns already computed over named windows, which is what a
+        # benchmark provider's own export tends to look like.
+        if looks_like_returns_sheet(supplied_levels_df):
+            supplied_returns, ret_problems = parse_supplied_returns(supplied_levels_df)
+            bm_notes.extend(ret_problems)
+            bm_notes.extend(describe_supplied_returns(supplied_returns))
+        else:
+            supplied, supply_problems = parse_supplied_levels(supplied_levels_df)
+            bm_notes.extend(supply_problems)
+            bm_series, supply_notes = apply_supplied_levels(bm_series, supplied)
+            bm_notes.extend(supply_notes)
 
     # The Nifty column is the headline PRICE index, unlike the schemes' own
     # "TR INR" benchmarks. An index-fund proxy answers the total-return
@@ -1180,13 +1218,15 @@ def generate_mis_reports_data(
 
     current = _build_reports(portfolio_df, nav_series, bm_series, flows,
                              d_end, d_start, d_fy, d_mtd, "14 Fund AR Model Portfolio", d_flow=flow_date,
-                             d_mis3_start=d_m3_start, d_mis3_end=d_m3_end)
+                             d_mis3_start=d_m3_start, d_mis3_end=d_m3_end,
+                             supplied_returns=supplied_returns)
 
     previous = None
     if previous_portfolio_df is not None and not previous_portfolio_df.empty:
         previous = _build_reports(previous_portfolio_df, nav_series, bm_series, flows,
                                   d_end, d_start, d_fy, d_mtd, "Previous 14 Fund AR Model Portfolio", d_flow=flow_date,
-                                  d_mis3_start=d_m3_start, d_mis3_end=d_m3_end)
+                                  d_mis3_start=d_m3_start, d_mis3_end=d_m3_end,
+                                  supplied_returns=supplied_returns)
 
     warnings: List[str] = list(bm_notes) + list(current["warnings"])
     if nifty_fallback_note:
@@ -1207,7 +1247,10 @@ def generate_mis_reports_data(
             f"are measured from the nearest earlier NAV instead — re-run in a few minutes for complete data."
         )
 
-    approx = [s.requested for s in bm_series.values() if s.status == STATUS_APPROX]
+    approx = [
+        s.requested for s in bm_series.values()
+        if s.status == STATUS_APPROX and s.key not in supplied_returns
+    ]
     if approx:
         warnings.append(
             "These benchmarks have no matching index fund, so the closest available index was used as a "
@@ -2033,10 +2076,20 @@ def render_mis_generator_page():
 
     with finance_panel("3. Benchmark index levels (optional)"):
         st.caption(
-            "Upload your own index levels to override the proxy funds. Columns: **Benchmark**, "
-            "**Date**, **Close**. Use this for benchmarks a proxy can only approximate — a "
-            "Morningstar TR INR series, or an index with no tracker such as S&P BSE 250 SmallCap. "
-            "Supplied levels take precedence over every proxy."
+            "Override the proxy funds with your own benchmark figures. Two shapes are "
+            "accepted, both with columns **Benchmark**, **Date**, **Close**:
+
+"
+            "• **Returns per window** — Date holds a span such as `01/04/2026 - 20/08/2026`, "
+            "Close holds the return in percent. A same-day span gives that day's return. "
+            "This is what a provider's own export usually looks like.
+
+"
+            "• **Daily index levels** — Date holds a single date, Close holds the index level.
+
+"
+            "Either takes precedence over every proxy. Use it for a benchmark a proxy can only "
+            "approximate, such as S&P BSE 250 SmallCap, which no Indian fund tracks."
         )
         levels_file = st.file_uploader(
             "Index levels (.xlsx / .csv)", type=["xlsx", "xls", "csv"], key="mis_levels_upload",
