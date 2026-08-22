@@ -1795,7 +1795,16 @@ def render_mis_generator_page():
         # Keep the on-disk copy in step with the editors. Written only when the
         # content actually differs, so a plain rerun does not rewrite the file.
         st.session_state["portfolio_input_df"] = current_portfolio_df.copy()
-        _ws_sig = (cur_sig, _portfolio_signature(st.session_state.get("mis_auto_prev_df")))
+        # The previous portfolio and its source mode belong in the signature too.
+        # Switching source without touching the current portfolio is still a
+        # change worth persisting, and without them here it would not be saved
+        # until something else happened to move.
+        _ws_sig = (
+            cur_sig,
+            _portfolio_signature(st.session_state.get("mis_auto_prev_df")),
+            _portfolio_signature(st.session_state.get("prev_portfolio_input_df")),
+            st.session_state.get("mis_prev_mode", ""),
+        )
         if st.session_state.get("mis_workspace_sig") != _ws_sig:
             if mis_history.save_workspace(
                 current_portfolio_df,
@@ -1897,6 +1906,27 @@ def render_mis_generator_page():
             st.caption(
                 f"📋 **Previous schemes:** {len(prev_clean)} | "
                 f"**Total allocation:** {prev_clean['Allocation (%)'].sum():.2f}%"
+            )
+
+        # Same read-back confirmation the current portfolio gets. Which frame is
+        # the one that must persist depends on the source: Auto carries a
+        # snapshot, the other two carry what was typed or uploaded.
+        _prev_live = auto_prev if prev_mode.startswith("Auto") else prev_raw
+        _prev_sig = _portfolio_signature(_prev_live)
+        _pdisk = mis_history.load_workspace()
+        _pstored = _pdisk["auto_previous"] if prev_mode.startswith("Auto") else _pdisk["previous"]
+
+        if _prev_sig == ():
+            st.caption("Nothing to save — the previous portfolio is empty.")
+        elif _pstored is None:
+            st.caption("⚠️ Nothing saved to disk yet — this previous portfolio will not survive a reload.")
+        elif _portfolio_signature(_pstored) == _prev_sig:
+            _pwhen = str(_pdisk.get("saved_at") or "")[:16].replace("T", " ")
+            st.caption(f"💾 Saved to disk at {_pwhen} — survives refresh and restart.")
+        else:
+            st.caption(
+                "⚠️ On-disk copy is out of step with the editor. Click "
+                "**Generate MIS Reports** to force a save."
             )
 
     with finance_panel("2b. Saved MIS History"):
