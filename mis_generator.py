@@ -256,17 +256,33 @@ def read_portfolio_excel(file_obj) -> pd.DataFrame:
 _PORTFOLIO_KEY_COLS = ("Scheme Name", "ISIN", "Allocation (%)", "Benchmark")
 
 
+def _levels_signature(df: Optional[pd.DataFrame]) -> tuple:
+    """Fingerprint of an uploaded benchmark-levels sheet.
+
+    Uploading levels changes the report but nothing about the portfolios or the
+    dates, so without this the rebuild is never triggered and the user keeps
+    seeing the previous report -- still carrying the APPROX warning the upload
+    was meant to clear.
+    """
+    if df is None or df.empty:
+        return ()
+    return (len(df), tuple(str(c) for c in df.columns),
+            tuple(str(v) for v in df.iloc[0].tolist()),
+            tuple(str(v) for v in df.iloc[-1].tolist()))
+
+
 def _report_input_signature(current, previous, d_start, d_end, m3_start, m3_end,
-                            include_flows, skip_saturdays) -> tuple:
+                            include_flows, skip_saturdays, levels=None) -> tuple:
     """Everything that changes a report's contents, in one comparable value.
 
-    Used to tell the user their downloads are stale, since the buttons render
-    from the last generated result rather than from what is currently on screen.
+    Used to decide when to rebuild, since the tables and downloads render from
+    the last generated result rather than from what is currently on screen.
     """
     return (
         _portfolio_signature(current),
         _portfolio_signature(previous),
         d_start, d_end, m3_start, m3_end, bool(include_flows), bool(skip_saturdays),
+        _levels_signature(levels),
     )
 
 
@@ -2080,7 +2096,7 @@ def render_mis_generator_page():
 
         live_sig = _report_input_signature(
             clean_df, prev_clean, start_date, end_date, mis3_start, mis3_end,
-            include_flows, skip_saturdays,
+            include_flows, skip_saturdays, supplied_levels_df,
         )
         # Rebuild automatically once a report exists and any input has moved --
         # editing either portfolio must reach the on-screen tables and the

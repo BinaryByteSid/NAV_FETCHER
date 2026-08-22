@@ -978,7 +978,23 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
                 and abs(daily_return * 100) > STALE_AUM_MIN_MOVE_PCT
             )
 
-            if aum_unchanged:
+            # A zero previous-day AUM cannot anchor a flow. The formula would
+            # measure the whole of today's AUM as a subscription -- a fund with
+            # 3,500cr and no published AUM yesterday would report a 3,500cr
+            # inflow. Zero here means "not reported", not "the fund was empty".
+            prev_is_zero = pd.notna(aum_prev) and float(aum_prev) == 0.0
+            curr_is_zero = pd.notna(aum_curr) and float(aum_curr) == 0.0
+
+            if curr_is_zero:
+                # Nothing to measure today either: a zero on the current side
+                # would otherwise book the fund's entire AUM as a redemption.
+                df.at[idx, "Net flows on current day"] = 0.0
+                eff_prev = None
+            elif prev_is_zero:
+                df.at[idx, "Net flows on current day"] = 0.0
+                # Today's AUM still anchors tomorrow, if there is one.
+                eff_prev = aum_curr if pd.notna(aum_curr) and float(aum_curr) != 0.0 else None
+            elif aum_unchanged:
                 df.at[idx, "Net flows on current day"] = 0.0
                 eff_prev = derived_aum if derived_aum is not None else aum_curr
             elif pd.notna(aum_curr) and derived_aum is not None:
