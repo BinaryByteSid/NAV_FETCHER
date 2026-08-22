@@ -2077,17 +2077,10 @@ def render_mis_generator_page():
     with finance_panel("3. Benchmark index levels (optional)"):
         st.caption(
             "Override the proxy funds with your own benchmark figures. Two shapes are "
-            "accepted, both with columns **Benchmark**, **Date**, **Close**:
-
-"
-            "• **Returns per window** — Date holds a span such as `01/04/2026 - 20/08/2026`, "
-            "Close holds the return in percent. A same-day span gives that day's return. "
-            "This is what a provider's own export usually looks like.
-
-"
-            "• **Daily index levels** — Date holds a single date, Close holds the index level.
-
-"
+            "accepted, both with columns **Benchmark**, **Date**, **Close**. "
+            "**Returns per window:** Date holds a span such as `01/04/2026 - 20/08/2026` and "
+            "Close holds the return in percent; a same-day span gives that day's return. "
+            "**Daily index levels:** Date holds a single date and Close holds the index level. "
             "Either takes precedence over every proxy. Use it for a benchmark a proxy can only "
             "approximate, such as S&P BSE 250 SmallCap, which no Indian fund tracks."
         )
