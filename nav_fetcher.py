@@ -939,6 +939,11 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
         # so the following day is measured against where the fund actually was.
         # Zeroing the stale day alone would just push its error onto the next.
         eff_prev = None
+        # A day whose AUM never updated leaves the next day's change spanning
+        # two days, so that day cannot be attributed either. Both are reported
+        # as zero and normal measurement resumes on the day after, anchored to
+        # a real published AUM.
+        zero_next = False
         for idx_in_group, idx in enumerate(indices):
             if idx_in_group == 0:
                 eff_prev = df.at[idx, "AUM"]
@@ -985,26 +990,24 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
             prev_is_zero = pd.notna(aum_prev) and float(aum_prev) == 0.0
             curr_is_zero = pd.notna(aum_curr) and float(aum_curr) == 0.0
 
-            if curr_is_zero:
-                # Nothing to measure today either: a zero on the current side
-                # would otherwise book the fund's entire AUM as a redemption.
+            unmeasurable = curr_is_zero or prev_is_zero or aum_unchanged or derived_aum is None                 or pd.isna(aum_curr)
+
+            if zero_next and not unmeasurable:
+                # The day after an unmeasurable one. Its AUM change covers both
+                # days, so attributing it to today would be a guess; report zero
+                # and anchor tomorrow to today's real AUM.
                 df.at[idx, "Net flows on current day"] = 0.0
-                eff_prev = None
-            elif prev_is_zero:
+                eff_prev = aum_curr
+                zero_next = False
+            elif unmeasurable:
                 df.at[idx, "Net flows on current day"] = 0.0
-                # Today's AUM still anchors tomorrow, if there is one.
-                eff_prev = aum_curr if pd.notna(aum_curr) and float(aum_curr) != 0.0 else None
-            elif aum_unchanged:
-                df.at[idx, "Net flows on current day"] = 0.0
-                eff_prev = derived_aum if derived_aum is not None else aum_curr
-            elif pd.notna(aum_curr) and derived_aum is not None:
+                zero_next = True
+                # Anchor to whatever real AUM exists; the next day is zeroed
+                # regardless, so this only sets the baseline for the day after.
+                eff_prev = aum_curr if (pd.notna(aum_curr) and float(aum_curr) != 0.0) else eff_prev
+            else:
                 df.at[idx, "Net flows on current day"] = aum_curr - derived_aum
                 eff_prev = aum_curr
-            else:
-                # No AUM to measure against: report no flow rather than a gap,
-                # and carry the mark-to-market value if one can be computed.
-                df.at[idx, "Net flows on current day"] = 0.0
-                eff_prev = derived_aum if derived_aum is not None else eff_prev
 
 
     # Filter only target dates
