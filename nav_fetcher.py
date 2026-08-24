@@ -533,6 +533,41 @@ def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id
     return []
 
 
+def find_perf_row_by_nav(nav_value, perf_rows: list, plan: str = "Regular") -> Optional[dict]:
+    """Locate a scheme's performance row by its NAV on that date.
+
+    The fund-performance API carries no ISIN and no scheme code, so a row can
+    only be tied to a scheme by name -- which is fuzzy, and quietly attaches the
+    wrong AUM when two schemes share most of their words. The NAV is a far
+    stronger key: it comes from the same AMFI feed on the same date, and two
+    funds matching to four decimals is rare enough to detect and reject.
+
+    Returns None when nothing matches, or when more than one row does.
+    """
+    if nav_value is None or pd.isna(nav_value):
+        return None
+    try:
+        target = round(float(nav_value), 4)
+    except (TypeError, ValueError):
+        return None
+
+    field = "navDirect" if str(plan).strip().lower().startswith("direct") else "navRegular"
+    hits = []
+    for row in perf_rows or []:
+        raw = row.get(field)
+        if raw in (None, ""):
+            continue
+        try:
+            if round(float(raw), 4) == target:
+                hits.append(row)
+        except (TypeError, ValueError):
+            continue
+
+    # Exactly one match is a real identification; several is a coincidence the
+    # caller should resolve by name rather than a coin toss.
+    return hits[0] if len(hits) == 1 else None
+
+
 def find_matching_perf_row(nav_name: str, perf_rows: list) -> Optional[dict]:
     if not perf_rows:
         return None
@@ -798,18 +833,58 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
     # Pre-compute the scheme-to-performance-scheme matching
     unique_schemes = df_res[["Scheme Name", "Asset Class"]].drop_duplicates()
     scheme_match_cache = {}  # (scheme_name, asset_class) -> matched_perf_schemeName
-    
+
+    # A representative NAV per scheme, used to identify its row in the
+    # performance feed. Keyed by the same date as the feed rows so the two
+    # figures are comparable.
+    nav_by_scheme = {}
+    if "NAV" in df_res.columns:
+        for _, r in df_res.iterrows():
+            k = (r["Scheme Name"], r["Asset Class"], r.get("Date_Str_Temp"))
+            v = r.get("NAV")
+            if k not in nav_by_scheme and pd.notna(v):
+                nav_by_scheme[k] = v
+
+    matched_by_nav = 0
+    matched_by_name = 0
+
     for _, row in unique_schemes.iterrows():
         s_name = row["Scheme Name"]
         a_class = row["Asset Class"]
+        plan = "Direct" if "direct" in str(s_name).lower() else "Regular"
         matched_perf_name = None
+
+        # Name first. NAV looked like the stronger key -- it is an exact value
+        # from the same feed -- but matching on it moved the MIS day flows from
+        # 14/14 against the reference to 4/14 while reporting every scheme as
+        # NAV-matched. The API's navRegular is stamped with its own navDate,
+        # which does not always correspond to the report date requested, so an
+        # apparently unique match can land on the wrong scheme. Name matching is
+        # fuzzy but was demonstrably right for these funds, so it leads and NAV
+        # only fills in where the name finds nothing.
         for key, p_rows in perf_lookup.items():
             if key[1] == a_class and p_rows:
                 match_row = find_matching_perf_row(s_name, p_rows)
                 if match_row:
                     matched_perf_name = match_row.get("schemeName")
+                    matched_by_name += 1
                     break
+
+        if not matched_perf_name:
+            for (date_str, key_class), p_rows in perf_lookup.items():
+                if key_class != a_class or not p_rows:
+                    continue
+                nav_val = nav_by_scheme.get((s_name, a_class, date_str))
+                hit = find_perf_row_by_nav(nav_val, p_rows, plan)
+                if hit:
+                    matched_perf_name = hit.get("schemeName")
+                    matched_by_nav += 1
+                    break
+
         scheme_match_cache[(s_name, a_class)] = matched_perf_name
+
+    if matched_by_nav or matched_by_name:
+        print(f"AUM row matching: {matched_by_nav} by NAV, {matched_by_name} by name.")
 
     # Build a flat O(1) lookup: (date_str, asset_class, perf_name) -> daily_aum
     # Only store AUMs for schemes we actually matched — this keeps the dict small.

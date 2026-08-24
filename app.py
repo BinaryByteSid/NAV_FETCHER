@@ -290,6 +290,51 @@ def clean_name(name: str) -> str:
 _thread_local = threading.local()
 
 
+def select_regular_growth_isins(df_matched):
+    """Regular-plan Growth ISINs for a set of AMFI index rows.
+
+    One rule in one place, because the fund count per category was wrong in
+    both directions:
+
+    * Direct plans are excluded. They are a separate plan of the same scheme,
+      and carrying them doubled the pipeline for figures the report never shows.
+    * A plan of "Unknown" is treated as Regular. Pre-2013 schemes carry no plan
+      in their name -- "Franklin India Large Cap Fund-Growth", "Aditya Birla Sun
+      Life Large Cap Fund-Growth" -- and dropping them lost real funds.
+    * Only the Growth option is kept; IDCW and Bonus are separate options.
+    * Only the Growth ISIN is taken. The reinvestment ISIN belongs to the
+      IDCW-reinvestment option, so appending it counted one scheme twice.
+
+    Returns (isins, kept, skipped_direct, skipped_option).
+    """
+    isins, skipped_direct, skipped_option = [], 0, 0
+    for _, row in df_matched.iterrows():
+        scheme_name = str(row.get("Scheme Name", "")).strip()
+        nm = scheme_name.lower()
+        plan_type = str(row.get("Plan Type", "")).strip().lower()
+        option_type = str(row.get("Option Type", "")).strip().lower()
+
+        if plan_type == "direct" or "direct" in nm or re.search(r"dir", nm):
+            skipped_direct += 1
+            continue
+        if plan_type not in ("regular", "unknown", ""):
+            skipped_direct += 1
+            continue
+        if is_idcw_scheme(option_type) or is_idcw_scheme(scheme_name) or "bonus" in option_type:
+            skipped_option += 1
+            continue
+        if option_type and "growth" not in option_type:
+            skipped_option += 1
+            continue
+
+        isin_g = row.get("ISIN Div Payout/ ISIN Growth") or row.get("ISIN Div Payout / ISIN Growth")
+        if isin_g and pd.notna(isin_g) and str(isin_g).strip() not in ("", "-"):
+            isins.append(str(isin_g).strip().upper())
+
+    isins = sorted(set(isins))
+    return isins, len(isins), skipped_direct, skipped_option
+
+
 def run_historical_export(
     parsed_isins: List[str],
     start_date: datetime.date,
@@ -1273,25 +1318,11 @@ def main() -> None:
                     if df_matched.empty:
                         st.warning("No schemes found in current AMFI index matching this subcategory.")
                     else:
-                        parsed_isins = []
-                        for idx, row in df_matched.iterrows():
-                            scheme_name = str(row.get("Scheme Name", "")).strip().lower()
-                            plan_type = str(row.get("Plan Type", "")).strip().lower()
-                            option_type = str(row.get("Option Type", "")).strip().lower()
-                            
-                            is_direct = "direct" in plan_type or "direct" in scheme_name or "dir" in plan_type or re.search(r"\bdir\b", scheme_name)
-                            is_idcw = is_idcw_scheme(option_type) or is_idcw_scheme(scheme_name)
-                            
-                            if is_direct or is_idcw:
-                                continue
-                                
-                            isin_g = row.get("ISIN Div Payout/ ISIN Growth") or row.get("ISIN Div Payout / ISIN Growth")
-                            isin_r = row.get("ISIN Div Reinvestment")
-                            if isin_g and pd.notna(isin_g) and str(isin_g).strip() != "-":
-                                parsed_isins.append(str(isin_g).strip().upper())
-                            if isin_r and pd.notna(isin_r) and str(isin_r).strip() != "-":
-                                parsed_isins.append(str(isin_r).strip().upper())
-                        parsed_isins = sorted(list(set(parsed_isins)))
+                        parsed_isins, n_kept, n_direct, n_option = select_regular_growth_isins(df_matched)
+                        st.caption(
+                            f"{len(df_matched)} scheme rows in this category → **{n_kept} Regular Growth "
+                            f"funds** ({n_direct} Direct plans and {n_option} IDCW/Bonus options excluded)."
+                        )
 
                         if not parsed_isins:
                             st.warning("No valid ISINs found for schemes in this subcategory.")
