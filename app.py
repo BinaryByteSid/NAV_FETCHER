@@ -290,6 +290,92 @@ def clean_name(name: str) -> str:
 _thread_local = threading.local()
 
 
+# SEBI's scheme categories and AMFI's ids for them. The dropdown is normally
+# populated from AMFI's getsubcategory endpoint, but that endpoint fails --
+# 403 under rate limiting, 503 when it is unwell -- and the category list is
+# not something the user should lose when it does. These ids are the same ones
+# map_section_to_ids() resolves against, and SEBI categories change about once
+# a decade, so a built-in list is a safe floor rather than a stale risk.
+SUBCATEGORY_FALLBACK = {
+    1: [("Large Cap Fund", 1), ("Large & Mid Cap Fund", 2), ("Flexi Cap Fund", 3),
+        ("Multi Cap Fund", 4), ("Mid Cap Fund", 5), ("Small Cap Fund", 6),
+        ("Value Fund", 7), ("ELSS", 8), ("Contra Fund", 9),
+        ("Dividend Yield Fund", 10), ("Focused Fund", 11),
+        ("Sectoral/Thematic Fund", 12)],
+    2: [("Long Duration Fund", 13), ("Medium to Long Duration Fund", 14),
+        ("Short Duration Fund", 15), ("Medium Duration Fund", 16),
+        ("Money Market Fund", 17), ("Low Duration Fund", 18),
+        ("Ultra Short Duration Fund", 19), ("Liquid Fund", 20),
+        ("Overnight Fund", 21), ("Dynamic Bond Fund", 22),
+        ("Corporate Bond Fund", 23), ("Credit Risk Fund", 24),
+        ("Banking and PSU Fund", 25), ("Floater Fund", 26),
+        ("Fixed Maturity Plan", 27), ("Gilt Fund", 28),
+        ("Gilt Fund with 10 year constant duration", 29)],
+    3: [("Aggressive Hybrid Fund", 30), ("Conservative Hybrid Fund", 31),
+        ("Equity Savings Fund", 32), ("Arbitrage Fund", 33),
+        ("Multi Asset Allocation Fund", 34),
+        ("Dynamic Asset Allocation/Balanced Advantage Fund", 35),
+        ("Balanced Hybrid Fund", 40)],
+    4: [("Children's Fund", 36), ("Retirement Fund", 37)],
+    5: [("Index Funds/ETFs", 38), ("Fund of Funds", 39)],
+}
+
+def _subcategory_cache_path() -> str:
+    """Resolved lazily: API_CACHE_DIR is defined further down this module."""
+    return os.path.join(API_CACHE_DIR, "subcategories.json")
+
+
+def load_subcategories(cat_id: int):
+    """Subcategories for a category, with the API as the preferred source.
+
+    Falls back to the last successful response, then to the built-in list, so
+    a failing endpoint degrades the freshness of the dropdown rather than
+    emptying it. Returns (list_of_(name, id), source_label).
+    """
+    import json as _json
+    try:
+        resp = requests.post(
+            "https://www.amfiindia.com/gateway/pollingsebi/api/amfi/getsubcategory",
+            json={"category": cat_id},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/plain, */*",
+                "Origin": "https://www.amfiindia.com",
+                "Referer": "https://www.amfiindia.com/research-information/other-data/fund-performance",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            items = [(i.get("name"), i.get("id")) for i in resp.json().get("data", []) if i.get("name")]
+            if items:
+                try:  # remember it for the next time the endpoint is unavailable
+                    cache = {}
+                    if os.path.exists(_subcategory_cache_path()):
+                        with open(_subcategory_cache_path(), "r", encoding="utf-8") as fh:
+                            cache = _json.load(fh)
+                    cache[str(cat_id)] = items
+                    with open(_subcategory_cache_path(), "w", encoding="utf-8") as fh:
+                        _json.dump(cache, fh)
+                except OSError:
+                    pass
+                return items, "live"
+    except requests.exceptions.RequestException:
+        pass
+
+    try:
+        with open(_subcategory_cache_path(), "r", encoding="utf-8") as fh:
+            cached = _json.load(fh).get(str(cat_id))
+        if cached:
+            return [(n, i) for n, i in cached], "cached"
+    except (OSError, ValueError):
+        pass
+
+    return list(SUBCATEGORY_FALLBACK.get(cat_id, [])), "builtin"
+
+
 def select_regular_growth_isins(df_matched):
     """Regular-plan Growth ISINs for a set of AMFI index rows.
 
@@ -1235,27 +1321,12 @@ def main() -> None:
             maturity_id = maturity_id_map[maturity_type]
             cat_id = cat_id_map[category]
 
-            subcategories = []
             with st.spinner("Fetching subcategories..."):
-                try:
-                    sub_resp = requests.post(
-                        "https://www.amfiindia.com/gateway/pollingsebi/api/amfi/getsubcategory",
-                        json={"category": cat_id},
-                        headers={
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                            "Content-Type": "application/json",
-                            "Accept": "application/json, text/plain, */*",
-                            "Origin": "https://www.amfiindia.com",
-                            "Referer": "https://www.amfiindia.com/research-information/other-data/fund-performance",
-                            "X-Requested-With": "XMLHttpRequest",
-                        },
-                        timeout=20,
-                    )
-                    if sub_resp.status_code == 200:
-                        sub_data = sub_resp.json()
-                        subcategories = [(item.get("name"), item.get("id")) for item in sub_data.get("data", []) if item.get("name")]
-                except Exception as e:
-                    st.error(f"Failed to fetch subcategories: {e}")
+                subcategories, sub_source = load_subcategories(cat_id)
+            if sub_source == "cached":
+                st.caption("⚠️ AMFI's category list is unavailable; using the last one retrieved.")
+            elif sub_source == "builtin":
+                st.caption("⚠️ AMFI's category list is unavailable; using the built-in SEBI categories.")
 
             sub_names = [name for name, _ in subcategories]
             # "ALL" pulls every subcategory in the chosen category together.
