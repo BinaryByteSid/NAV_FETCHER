@@ -93,6 +93,11 @@ def get_fund_seed(name: str) -> int:
 
 def load_portfolio_aum_data() -> pd.DataFrame:
     paths = [
+        # Preferred: scheme-level AUM only. The full portfolio workbook carries
+        # instrument holdings this function never reads, and shipping those to a
+        # deployment would publish position-level data to serve three columns.
+        "scheme_aum_monthly.xlsx",
+        "../scheme_aum_monthly.xlsx",
         "../portfolio last 6 months.xlsx",
         "portfolio last 6 months.xlsx",
         "../Misc/portfolio last 6 months.xlsx",
