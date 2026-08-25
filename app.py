@@ -997,26 +997,50 @@ def normalize_filename(value: str) -> str:
 
 
 def render_aum_health(stats: dict) -> None:
-    """Show how much AUM came from the live AMFI feed vs was carried/blank, so the
-    user can tell whether AMFI throttled the run rather than guessing at 'None'."""
+    """Report where each row's AUM actually came from.
+
+    The four sources are genuinely different in quality and must not be
+    conflated: a live feed value, a value derived from monthly AUM scaled by
+    NAV, one carried from an adjacent day, and none at all. Reporting derived
+    figures as live is what let a run with zero answered queries claim 86% live
+    coverage.
+    """
     if not stats or not stats.get("rows_total"):
         return
+
     total = stats["rows_total"]
-    real = stats.get("rows_real_aum", 0)
+    live = stats.get("rows_live_aum", 0)
+    derived = stats.get("rows_derived_aum", 0)
+    carried = stats.get("rows_carried", 0)
     blank = stats.get("rows_blank", 0)
     q_total = stats.get("perf_queries", 0)
     q_ok = stats.get("perf_ok", 0)
-    real_pct = (real / total * 100) if total else 0
-    msg = (
-        f"AUM data: {real:,}/{total:,} rows ({real_pct:.0f}%) came directly from the live "
-        f"AMFI performance feed; the rest were carried forward from the nearest real value. "
-        f"AMFI queries answered: {q_ok}/{q_total}."
-    )
-    if blank > 0 or (q_total and q_ok / q_total < 0.5):
+
+    parts = []
+    if live:
+        parts.append(f"{live:,} live from AMFI ({live / total * 100:.0f}%)")
+    if derived:
+        parts.append(f"{derived:,} derived from monthly AUM")
+    if carried:
+        parts.append(f"{carried:,} carried from an adjacent day")
+    if blank:
+        parts.append(f"{blank:,} with no AUM")
+    breakdown = "; ".join(parts) if parts else "no rows"
+
+    msg = f"AUM sources across {total:,} rows — {breakdown}. AMFI queries answered: {q_ok}/{q_total}."
+
+    if q_total and q_ok == 0:
         st.warning(
             msg
-            + f" {blank:,} rows have no AUM at all — AMFI likely throttled or has no data for "
-            "those funds/dates. Re-run to fill from cache, or narrow the date range."
+            + " AMFI answered none of them, so no figure here is live. Derived AUM moves only "
+            "with NAV, so the flows it implies are near zero rather than real. AMFI rate-limits "
+            "by IP and usually clears within a few hours — re-run then for live figures."
+        )
+    elif blank or (q_total and q_ok / q_total < 0.5):
+        st.warning(
+            msg
+            + " AMFI under-delivered; rows without AUM report no flow rather than a guess. "
+            "Re-running later will fill them, as answered queries are cached to disk."
         )
     else:
         st.caption(msg)

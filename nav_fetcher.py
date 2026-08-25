@@ -858,6 +858,12 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
     s_names = df_res["Scheme Name"].tolist()
     aums = df_res["AUM"].tolist()
     
+    # Track which rows actually received a figure from the performance feed.
+    # AUM starts out holding the derived fallback, so counting non-null values
+    # afterwards reports derived numbers as live -- which is how a run with zero
+    # answered queries still claimed 86% of rows came from the live feed.
+    live_flags = [False] * len(df_res)
+
     for i in range(len(df_res)):
         asset_class = a_classes[i]
         date_str = d_strs[i]
@@ -869,14 +875,20 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
             if daily_aum is not None and daily_aum != "":
                 try:
                     aums[i] = float(daily_aum)
+                    live_flags[i] = True
                 except Exception:
                     pass
     
     del flat_perf_lookup, scheme_match_cache
     df_res["AUM"] = pd.to_numeric(pd.Series(aums, index=df_res.index), errors="coerce")
 
-    # How many rows got a real, live AUM before any carry-forward.
-    real_aum_rows = int(df_res["AUM"].notna().sum())
+    live_rows = int(sum(live_flags))
+    # Rows standing on the derived monthly-AUM fallback rather than a feed value.
+    if len(df_res):
+        _not_live = ~pd.Series(live_flags, index=df_res.index)
+        derived_rows = int((_not_live & df_res["AUM"].notna()).sum())
+    else:
+        derived_rows = 0
 
     # Carry real AUM across gaps so no day is left blank when the scheme has at
     # least one real reading. Non-trading days (weekends/holidays, where NAV is
@@ -904,7 +916,9 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
         "perf_queries": int(len(ids_date_to_pairs)),
         "perf_ok": int(perf_query_ok),
         "rows_total": total_rows,
-        "rows_real_aum": real_aum_rows,
+        "rows_live_aum": live_rows,
+        "rows_derived_aum": derived_rows,
+        "rows_carried": max(filled_rows - live_rows - derived_rows, 0),
         "rows_filled": filled_rows,
         "rows_blank": total_rows - filled_rows,
     })
