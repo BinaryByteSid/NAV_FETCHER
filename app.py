@@ -996,6 +996,133 @@ def normalize_filename(value: str) -> str:
     return value.strip("_")[:80]
 
 
+def render_aum_cache_page() -> None:
+    """Build and share the AMFI AUM cache.
+
+    AMFI rate-limits by IP and refuses a caller that asks for a lot at once, so
+    fetching on demand fails exactly when a report is wanted. This collects the
+    data slowly instead and keeps it: past-date AUM never changes, so every
+    answered query is good permanently.
+    """
+    import aum_backfill
+    import aum_cache_sync
+    from datetime import date as _date, timedelta as _td
+
+    st.markdown("### AUM Cache")
+    st.caption(
+        "AMFI answers a slow caller and refuses a fast one. Build the cache here over "
+        "as long as it takes, then reuse it: reports read the cache and never wait on AMFI."
+    )
+
+    summary = aum_backfill.cache_summary()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Cached queries", f"{summary['files']:,}")
+    c2.metric("Dates covered", summary["dates"])
+    c3.metric("Size", f"{summary['mb']} MB")
+    if summary["earliest"]:
+        st.caption(f"Covers {summary['earliest']} to {summary['latest']}.")
+
+    st.divider()
+    st.markdown("**Collect**")
+    st.caption(
+        "Run this where AMFI answers you — your own machine. A hosted deployment fetches "
+        "from a datacenter address, which is what AMFI blocks hardest, and its disk is "
+        "wiped on restart so nothing accumulates."
+    )
+
+    d1, d2 = st.columns(2)
+    today = _date.today()
+    with d1:
+        bf_start = st.date_input("From", value=today - _td(days=90), max_value=today, key="bf_start")
+    with d2:
+        bf_end = st.date_input("To", value=today, max_value=today, key="bf_end")
+
+    planned = aum_backfill.plan_work(bf_start, bf_end)
+    st.caption(f"{len(planned):,} queries still to fetch for this range.")
+
+    budget_min = st.slider("Stop after (minutes)", 1, 240, 30, key="bf_budget",
+                           help="The job is resumable — whatever it fetches is kept, and "
+                                "re-running continues from there.")
+
+    if st.button("Start collecting", type="primary", disabled=not planned, key="bf_go"):
+        bar = st.progress(0.0, text="Starting…")
+        log = st.empty()
+
+        def on_progress(stats: dict) -> None:
+            done = stats.get("fetched", 0)
+            frac = done / max(stats.get("planned", 1), 1)
+            bar.progress(min(max(frac, 0.0), 1.0),
+                         text=f"{done:,} of {stats.get('planned', 0):,} fetched")
+            if stats.get("waiting"):
+                log.warning(
+                    f"AMFI refused the request ({stats['reason']}). Waiting "
+                    f"{stats['waiting']}s, then retrying {stats['current']}. "
+                    f"Nothing already fetched is lost."
+                )
+            else:
+                log.caption(f"Fetching {stats.get('current', '')}")
+
+        with st.spinner("Collecting — leave this tab open."):
+            stats = aum_backfill.backfill(
+                bf_start, bf_end, progress=on_progress, total_budget=budget_min * 60
+            )
+        bar.empty()
+        log.empty()
+
+        msg = (f"Fetched {stats['fetched']:,} queries "
+               f"({stats['empty']:,} had no data), waited out {stats['blocked_waits']:,} "
+               f"block(s) in {stats['elapsed']:.0f}s.")
+        if stats["stopped_early"]:
+            st.warning(msg + " Stopped at the time limit — press Start again to continue.")
+        else:
+            st.success(msg + " Range complete.")
+        st.rerun()
+
+    st.divider()
+    st.markdown("**Share with the deployed app**")
+    st.caption(
+        "Publishes the cache to a Hugging Face Dataset the Space reads at start-up, so the "
+        "deployment serves real AUM without ever calling AMFI."
+    )
+
+    hub_ok, hub_why = aum_cache_sync.available()
+    if not hub_ok:
+        st.info(f"Sync unavailable: {hub_why}")
+    else:
+        st.code(f"repo: {aum_cache_sync.repo_id()}", language=None)
+        token_present = bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"))
+        if not token_present:
+            st.info(
+                "Set HF_TOKEN in your environment before pushing. Keep it in the environment, "
+                "not in a file — a token committed once outlives every place you meant it to be used."
+            )
+        make_public = st.checkbox(
+            "Make the dataset public", value=False, key="sync_public",
+            help="The contents are AMFI's published AUM figures. Public means the Space needs "
+                 "no token to read it; private means adding HF_TOKEN as a Space secret.",
+        )
+        s1, s2 = st.columns(2)
+        with s1:
+            if st.button("Push cache", disabled=not token_present, key="sync_push"):
+                try:
+                    st.success(aum_cache_sync.push(private=not make_public))
+                except Exception as exc:
+                    st.error(f"Push failed: {exc}")
+        with s2:
+            if st.button("Pull cache", key="sync_pull"):
+                try:
+                    st.success(aum_cache_sync.pull())
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Pull failed: {exc}")
+
+    st.divider()
+    st.caption(
+        "To run it unattended instead, schedule `python aum_backfill.py --daily` once a day; "
+        "it tops up the newest dates and exits."
+    )
+
+
 def render_aum_health(stats: dict) -> None:
     """Report where each row's AUM actually came from.
 
@@ -1139,9 +1266,28 @@ def render_sip_calculator(default_nav: float | None) -> None:
         st.caption(f"Reference NAV used for display only: {default_nav:.4f}")
 
 
+@st.cache_resource(show_spinner=False)
+def _sync_aum_cache_once() -> str:
+    """Pull the shared AUM cache at start-up, once per process.
+
+    Only on a deployment: locally the cache is the source of truth and pulling
+    over it would replace fresh collection with whatever was last published.
+    Failure is reported, never raised -- without the dataset the app is exactly
+    where it would have been anyway.
+    """
+    if not os.environ.get("SPACE_ID") and not os.environ.get("AUM_CACHE_PULL"):
+        return "local — using the on-disk cache"
+    try:
+        import aum_cache_sync
+        return aum_cache_sync.pull_quietly()
+    except Exception as exc:  # noqa: BLE001
+        return f"AUM cache not synced: {type(exc).__name__}: {exc}"
+
+
 def main() -> None:
     inject_custom_css()
     render_top_bar()
+    _sync_aum_cache_once()
 
     with st.sidebar:
         st.markdown("### 📌 Navigation")
@@ -1185,13 +1331,17 @@ def main() -> None:
         render_section_header("🔍", "Fund Discovery", "Search single funds, run batch lookups, or generate historical ISIN reports")
         search_mode = st.radio(
             "Search mode",
-            ["Historical ISIN Export", "Fund Performance", "Portfolio Bucket Tracker", "MIS Generator"],
+            ["Historical ISIN Export", "Fund Performance", "Portfolio Bucket Tracker",
+             "MIS Generator", "AUM Cache"],
             horizontal=True,
             index=0,
             label_visibility="collapsed",
         )
 
-        if search_mode == "MIS Generator":
+        if search_mode == "AUM Cache":
+            render_aum_cache_page()
+
+        elif search_mode == "MIS Generator":
             from mis_generator import render_mis_generator_page
             render_mis_generator_page()
         elif search_mode == "Historical ISIN Export":
