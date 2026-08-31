@@ -400,13 +400,28 @@ def select_regular_growth_isins(df_matched):
         plan_type = str(row.get("Plan Type", "")).strip().lower()
         option_type = str(row.get("Option Type", "")).strip().lower()
 
-        if plan_type == "direct" or "direct" in nm or re.search(r"dir", nm):
+        if plan_type == "direct" or "direct" in nm or re.search(r"\bdir\b", nm):
             skipped_direct += 1
             continue
         if plan_type not in ("regular", "unknown", ""):
             skipped_direct += 1
             continue
-        if is_idcw_scheme(option_type) or is_idcw_scheme(scheme_name) or "bonus" in option_type:
+        # Bonus is often recorded in the scheme name rather than the option
+        # column -- "Nippon India Large Cap Fund- Growth Plan Bonus Option" --
+        # so both are checked. It slipped through as a second copy of the
+        # scheme, and since the performance feed has one row per scheme both
+        # copies were handed the same AUM.
+        if (is_idcw_scheme(option_type) or is_idcw_scheme(scheme_name)
+                or "bonus" in option_type or "bonus" in nm):
+            skipped_option += 1
+            continue
+
+        # Legacy lettered plans: "Edelweiss Large Cap Fund -Plan B - Growth
+        # option". These are closed pre-merger plans of a scheme the feed
+        # reports once, so keeping them repeated the fund and gave every copy
+        # the whole scheme's AUM. "Regular Plan" and "Growth Plan" are not
+        # matched -- the letter must stand alone.
+        if re.search(r"\bplan\s*[b-z]\b", nm):
             skipped_option += 1
             continue
         if option_type and "growth" not in option_type:
