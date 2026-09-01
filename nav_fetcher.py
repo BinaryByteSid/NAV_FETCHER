@@ -938,7 +938,14 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
         for key, p_rows in perf_lookup.items():
             if key[1] == a_class and p_rows:
                 match_row = find_matching_perf_row(s_name, p_rows)
-                verified = _verify_by_nav(match_row, s_name, nav_by_scheme_date) if match_row else None
+                if not match_row:
+                    # No name match in this batch of rows. Another batch for the
+                    # same asset class may still hold the scheme, so move on --
+                    # falling through here would call .get() on None, which is
+                    # what took the whole Equity/ALL run down.
+                    continue
+
+                verified = _verify_by_nav(match_row, s_name, nav_by_scheme_date)
 
                 if verified is True:
                     matched_perf_name = match_row.get("schemeName")
