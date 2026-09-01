@@ -574,6 +574,53 @@ def find_matching_perf_row(nav_name: str, perf_rows: list) -> Optional[dict]:
     return None
 
 
+def _nav_key(scheme_name: str) -> str:
+    """Stable key for a scheme's NAV series."""
+    return str(scheme_name).strip().lower()
+
+
+def _verify_by_nav(perf_row: dict, scheme_name: str,
+                   nav_by_scheme_date: dict) -> Optional[bool]:
+    """Does this performance row's NAV agree with the scheme's own?
+
+    Returns True if it agrees, False if it demonstrably does not, and None when
+    there is nothing to check against -- the row carries no navDate/navRegular,
+    or the scheme has no NAV on that date. None means "unverified", which is
+    not the same as "wrong" and must not be treated as a rejection.
+    """
+    if not perf_row:
+        return None
+    nav_date = str(perf_row.get("navDate") or "").strip()
+    raw = perf_row.get("navRegular")
+    if not nav_date or raw in (None, ""):
+        return None
+    try:
+        perf_nav = round(float(raw), 4)
+    except (TypeError, ValueError):
+        return None
+
+    own = nav_by_scheme_date.get((_nav_key(scheme_name), nav_date))
+    if own is None:
+        return None
+    # A paise of slack: the feeds round independently.
+    return abs(own - perf_nav) <= 0.01
+
+
+def _find_by_nav(scheme_name: str, perf_rows: list,
+                 nav_by_scheme_date: dict) -> Optional[dict]:
+    """The performance row whose NAV matches this scheme's, if exactly one does.
+
+    Used only to correct a name match the NAV contradicts. Ambiguity is refused
+    rather than guessed -- two schemes sharing a NAV to the paise cannot be told
+    apart, and picking either would be a coin toss.
+    """
+    hits = []
+    for pr in perf_rows:
+        if _verify_by_nav(pr, scheme_name, nav_by_scheme_date) is True:
+            hits.append(pr)
+    return hits[0] if len(hits) == 1 else None
+
+
 def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool = True,
                         fetch_live_aum: bool = False, budget_seconds: float | None = None,
                         max_workers: int | None = None, on_incomplete=None,
@@ -802,6 +849,31 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
             
     # Pre-compute the scheme-to-performance-scheme matching
     unique_schemes = df_res[["Scheme Name", "Asset Class"]].drop_duplicates()
+    # Scheme NAV by (name, dd-Mon-YYYY), taken from the frame already fetched.
+    # The performance row states which date its NAV belongs to, and that date is
+    # often not the one requested, so the whole series is needed rather than
+    # just the row's own day.
+    nav_by_scheme_date: dict = {}
+    try:
+        _nav_col = "NAV" if "NAV" in df_res.columns else None
+        _dt_col = "NAV Date" if "NAV Date" in df_res.columns else None
+        if _nav_col and _dt_col:
+            for _n, _d, _v in zip(df_res["Scheme Name"], df_res[_dt_col], df_res[_nav_col]):
+                if pd.isna(_v):
+                    continue
+                _ds = str(_d).strip()
+                try:
+                    _parsed = pd.to_datetime(_ds, dayfirst=True, errors="coerce")
+                except Exception:
+                    _parsed = None
+                if _parsed is not None and not pd.isna(_parsed):
+                    _ds = _parsed.strftime("%d-%b-%Y")
+                nav_by_scheme_date[(_nav_key(_n), _ds)] = round(float(_v), 4)
+    except Exception:
+        nav_by_scheme_date = {}
+
+    corrected_by_nav = 0
+    rejected = 0
     scheme_match_cache = {}  # (scheme_name, asset_class) -> matched_perf_schemeName
 
     matched_by_name = 0
@@ -824,18 +896,44 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
         # resolve, but that trades "no AUM" for "possibly wrong AUM" on exactly
         # the schemes least able to be checked. A missing figure is reported as
         # such elsewhere in this report; a wrong one is not visible at all.
+        # A name match is now checked against the scheme's own NAV before it is
+        # trusted. Each performance row states the navDate its navRegular
+        # belongs to, and a scheme's NAV on a given day is unique within its
+        # category -- 34 of 34 distinct in Large Cap -- so this turns a fuzzy
+        # match into a verified one using NAV history the report already holds.
+        # Where the two disagree the NAV wins, because it is an exact value and
+        # the name is not.
         for key, p_rows in perf_lookup.items():
             if key[1] == a_class and p_rows:
                 match_row = find_matching_perf_row(s_name, p_rows)
-                if match_row:
+                verified = _verify_by_nav(match_row, s_name, nav_by_scheme_date) if match_row else None
+
+                if verified is True:
                     matched_perf_name = match_row.get("schemeName")
                     matched_by_name += 1
                     break
+                if verified is False:
+                    # The name pointed at a scheme whose NAV does not agree.
+                    # Prefer the row whose NAV does, if exactly one qualifies.
+                    corrected = _find_by_nav(s_name, p_rows, nav_by_scheme_date)
+                    if corrected:
+                        matched_perf_name = corrected.get("schemeName")
+                        corrected_by_nav += 1
+                        break
+                    rejected += 1
+                    continue
+                # No NAV available to check against; the name stands on its own.
+                matched_perf_name = match_row.get("schemeName")
+                matched_by_name += 1
+                break
 
         if not matched_perf_name:
             unmatched += 1
         scheme_match_cache[(s_name, a_class)] = matched_perf_name
 
+    if corrected_by_nav or rejected:
+        print(f"AUM row matching: {corrected_by_nav} corrected by NAV, {rejected} name matches "
+              f"rejected as contradicted by NAV.")
     if matched_by_name or unmatched:
         print(f"AUM row matching: {matched_by_name} matched by name, {unmatched} unmatched "
               f"(those schemes report no AUM rather than a guessed one).")
