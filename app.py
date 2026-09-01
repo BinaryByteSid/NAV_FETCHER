@@ -421,7 +421,12 @@ def select_regular_growth_isins(df_matched):
         # reports once, so keeping them repeated the fund and gave every copy
         # the whole scheme's AUM. "Regular Plan" and "Growth Plan" are not
         # matched -- the letter must stand alone.
-        if re.search(r"\bplan\s*[b-z]\b", nm):
+        # Lettered plans ("-Plan B"), and the named legacy plans that predate
+        # the Regular/Direct split ("Eco Plan", "Institutional Plan"). Both are
+        # closed plans of a scheme the feed reports once, under the Regular
+        # plan's NAV, so keeping them duplicates the fund and misstates its AUM.
+        if re.search(r"\bplan\s*[b-z]\b", nm) or re.search(
+                r"\b(eco|institutional|retail|super)\s+plan\b", nm):
             skipped_option += 1
             continue
         if option_type and "growth" not in option_type:

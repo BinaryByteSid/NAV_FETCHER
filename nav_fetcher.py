@@ -538,6 +538,18 @@ def fetch_performance_data_from_api(date_str: str, maturity_id: int, category_id
     return []
 
 
+# Words that appear in most scheme names and identify nothing on their own.
+# Scoring a match on these pairs unrelated funds from different houses.
+GENERIC_SCHEME_TOKENS = {
+    "fund", "scheme", "plan", "growth", "option", "regular", "direct",
+    "large", "mid", "small", "cap", "midcap", "smallcap", "largecap",
+    "multi", "multicap", "flexi", "flexicap", "equity", "index", "focused",
+    "value", "contra", "dividend", "yield", "elss", "tax", "saver", "savings",
+    "opportunities", "opp", "bluechip", "blue", "chip", "top", "prime",
+    "advantage", "and", "&", "the", "of", "series", "long", "term",
+}
+
+
 def find_matching_perf_row(nav_name: str, perf_rows: list) -> Optional[dict]:
     if not perf_rows:
         return None
@@ -552,23 +564,43 @@ def find_matching_perf_row(nav_name: str, perf_rows: list) -> Optional[dict]:
         if cleaned_perf and (cleaned_perf in cleaned_nav or cleaned_nav in cleaned_perf):
             return p_row
             
-    # 2. Token overlap fallback
+    # 2. Token overlap fallback.
+    #
+    # Category words carry no identifying information and used to decide the
+    # match on their own: "edelweiss large & mid cap" against "axis large & mid
+    # cap" shares four of six tokens, scoring 0.67 and matching confidently.
+    # Every Large & Mid scheme collapsed onto whichever row came first, so
+    # Edelweiss, Quant and Union all reported Axis's 16,681cr.
+    #
+    # Scoring therefore ignores them and requires the distinguishing tokens --
+    # in practice the AMC name -- to agree.
     nav_tokens = set(cleaned_nav.split())
+    nav_distinct = nav_tokens - GENERIC_SCHEME_TOKENS
     best_row = None
     best_score = 0.0
+
     for p_row in perf_rows:
         p_name = p_row.get("schemeName") or ""
         cleaned_perf = clean_name(p_name)
         if not cleaned_perf:
             continue
         perf_tokens = set(cleaned_perf.split())
-        intersection = nav_tokens.intersection(perf_tokens)
-        if intersection:
-            score = len(intersection) / len(nav_tokens.union(perf_tokens))
-            if score > best_score:
-                best_score = score
-                best_row = p_row
-                
+        perf_distinct = perf_tokens - GENERIC_SCHEME_TOKENS
+
+        # Nothing but category words on either side: unidentifiable, so refuse.
+        if not nav_distinct or not perf_distinct:
+            continue
+        # The identifying part must overlap. Without this a shared "large mid
+        # cap" is enough to pair two different houses' funds.
+        if not nav_distinct & perf_distinct:
+            continue
+
+        union = nav_tokens | perf_tokens
+        score = len(nav_tokens & perf_tokens) / len(union) if union else 0.0
+        if score > best_score:
+            best_score = score
+            best_row = p_row
+
     if best_score > 0.4:
         return best_row
     return None
