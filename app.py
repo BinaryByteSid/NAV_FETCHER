@@ -425,8 +425,12 @@ def select_regular_growth_isins(df_matched):
         # the Regular/Direct split ("Eco Plan", "Institutional Plan"). Both are
         # closed plans of a scheme the feed reports once, under the Regular
         # plan's NAV, so keeping them duplicates the fund and misstates its AUM.
-        if re.search(r"\bplan\s*[b-z]\b", nm) or re.search(
-                r"\b(eco|institutional|retail|super)\s+plan\b", nm):
+        # ECO is matched on a word boundary, never as a substring: "eco"
+        # appears inside Canara Rob(eco), and a plain containment test drops
+        # all 158 of their rows -- Canara Robeco Multi Cap among them.
+        if (re.search(r"\bplan\s*[b-z]\b", nm)
+                or re.search(r"\beco\b", nm)
+                or re.search(r"\b(institutional|retail|super)\s+plan\b", nm)):
             skipped_option += 1
             continue
         if option_type and "growth" not in option_type:
