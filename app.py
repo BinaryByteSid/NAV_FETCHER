@@ -376,6 +376,12 @@ def load_subcategories(cat_id: int):
     return list(SUBCATEGORY_FALLBACK.get(cat_id, [])), "builtin"
 
 
+# Requested schemes that produced no rows in the last export. Read by the UI so
+# a category can say "37 selected, 34 returned data" instead of quietly
+# showing three fewer funds than it counted.
+_LAST_EXPORT_SILENT: list = []
+
+
 def select_regular_growth_isins(df_matched):
     """Regular-plan Growth ISINs for a set of AMFI index rows.
 
@@ -428,9 +434,17 @@ def select_regular_growth_isins(df_matched):
         # ECO is matched on a word boundary, never as a substring: "eco"
         # appears inside Canara Rob(eco), and a plain containment test drops
         # all 158 of their rows -- Canara Robeco Multi Cap among them.
+        #
+        # Institutional, Wealth and Blended plans go the same way. They are
+        # closed share classes that AMFI still lists but no longer prices:
+        # "ICICI Prudential Bluechip Fund - Institutional Option - I",
+        # "PGIM India Large Cap Fund Wealth Plan", "ICICI Prudential Blended
+        # Plan A". All four found across the equity categories returned zero
+        # NAVs over an eight-month window, so they only inflated the fund count
+        # and then showed up as schemes with no data.
         if (re.search(r"\bplan\s*[b-z]\b", nm)
                 or re.search(r"\beco\b", nm)
-                or re.search(r"\b(institutional|retail|super)\s+plan\b", nm)):
+                or re.search(r"\b(institutional|retail|super|wealth|blended)\b", nm)):
             skipped_option += 1
             continue
         if option_type and "growth" not in option_type:
@@ -823,7 +837,29 @@ def run_historical_export(
                 is_aum_only = False
         else:
             df_res_final = pd.DataFrame(columns=ordered_cols)
-            
+
+        # Which requested schemes produced nothing? A fund can be selected and
+        # still yield no row -- dormant share classes, or a scheme launched
+        # after the start date. Silently returning fewer schemes than the count
+        # promised is what made these look like a bug rather than a fact about
+        # the data, so the caller is told which ones and why.
+        try:
+            _asked = {str(i).strip().upper() for i in (parsed_isins or [])}
+            _got = set()
+            for _c in ("ISIN Div Payout / ISIN Growth", "ISIN Div Reinvestment"):
+                if _c in df_res_final.columns:
+                    _got |= {str(v).strip().upper() for v in df_res_final[_c].dropna()}
+            _silent = sorted(_asked - _got)
+            if _silent:
+                globals()["_LAST_EXPORT_SILENT"] = _silent
+                print(f"{len(_silent)} requested scheme(s) returned no NAV in this range "
+                      f"(dormant plans, or launched after the start date): "
+                      f"{', '.join(_silent[:6])}")
+            else:
+                globals()["_LAST_EXPORT_SILENT"] = []
+        except Exception:
+            globals()["_LAST_EXPORT_SILENT"] = []
+
         return df_res_final, is_aum_only, None
     except Exception as e:
         return pd.DataFrame(), False, str(e)
