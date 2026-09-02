@@ -554,24 +554,31 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
         i.strip().upper(): dict(empty) for i in isin_list
     }
     if df_nav_raw.empty or "Scheme Code" not in df_nav_raw.columns:
-        return result, None
+        return result, None, mtd_start
 
     # Flows accumulate day by day, so the whole FY-to-date window is needed —
     # plus one earlier observation to seed the first day's prior AUM.
     dates_present = sorted({d for d in df_nav_raw["NAV Date_Date"]
                             if d is not None and d <= report_date})
     if len(dates_present) < 2:
-        return result, None
+        return result, None, mtd_start
 
     # AUM lags NAV by a day, so the report date's own flow is not yet
     # published. Stop at the last trading day strictly before it.
     earlier = [d for d in dates_present if d < report_date]
     if not earlier:
-        return result, None
+        return result, None, mtd_start
     flow_date = max(earlier)
+
+    # MTD follows the month the flows actually reach, not the month the report
+    # is dated. A report dated the 1st has a flow date in the previous month,
+    # and deriving the window from the report date then spans (last day of
+    # previous month, that same day] -- zero days, so every MTD came back None
+    # while the day column showed figures.
+    mtd_start = get_mtd_start_date(flow_date)
     dates_present = [d for d in dates_present if d <= flow_date]
     if len(dates_present) < 2:
-        return result, None
+        return result, None, mtd_start
 
     # One day earlier than the first day being counted, so the seed observation
     # supplies the prior-day AUM that 1 April's own flow is measured against.
@@ -581,12 +588,12 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
     if seed:
         keep.add(max(seed))
     if len(keep) < 2:
-        return result, None
+        return result, None, mtd_start
 
     df_slice = df_nav_raw[df_nav_raw["NAV Date_Date"].isin(keep)].copy()
     df_slice = df_slice.dropna(subset=["Scheme Code"])
     if df_slice.empty:
-        return result, None
+        return result, None, mtd_start
 
     partial: List[str] = []
 
@@ -626,13 +633,13 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
         )
     except Exception:
         # Flows are supplementary; a failure here must not sink the whole report.
-        return result, flow_date
+        return result, flow_date, mtd_start
 
     if notes is not None:
         notes.extend(partial)
 
     if df_flows.empty or "Net flows on current day" not in df_flows.columns:
-        return result, flow_date
+        return result, flow_date, mtd_start
 
     # AMFI sometimes repeats yesterday's AUM verbatim. The flow formula is
     # AUM_t - AUM_(t-1) * (1 + return), so an unchanged AUM books the whole
@@ -712,7 +719,7 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
             f"subscription. MTD and YTD therefore understate any real flow on those days."
         )
 
-    return result, flow_date
+    return result, flow_date, mtd_start
 
 
 # ─── Per-scheme metric computation ────────────────────────────────────────────
@@ -1287,9 +1294,12 @@ def generate_mis_reports_data(
     flow_notes: List[str] = []
     flow_date: Optional[date] = None
     if include_flows:
-        flows, flow_date = compute_scheme_flows(
+        flows, flow_date, d_mtd_effective = compute_scheme_flows(
             df_nav_raw, all_isins, d_end, d_mtd, d_fy, notes=flow_notes
         )
+        # The flows engine may pull MTD back to the flow date's month; the
+        # column header has to name that month, not the report date's.
+        d_mtd = d_mtd_effective
 
     current = _build_reports(portfolio_df, nav_series, bm_series, flows,
                              d_end, d_start, d_fy, d_mtd, "14 Fund AR Model Portfolio", d_flow=flow_date,
