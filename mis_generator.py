@@ -616,7 +616,8 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
             # every carried day would be scored as a zero flow.
             gap_fill="fallback",
         )
-        df_aum = _align_quant_nav(df_aum)
+        # Quant's AUM/NAV alignment now happens inside
+        # calculate_flows_for_dataframe, so both reports get it.
         df_flows = calculate_flows_for_dataframe(
             df_aum,
             min(keep),

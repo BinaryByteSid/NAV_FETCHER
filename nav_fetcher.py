@@ -1088,6 +1088,51 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
 STALE_AUM_MIN_MOVE_PCT = 0.05
 
 
+def _align_quant_nav(df: pd.DataFrame) -> pd.DataFrame:
+    """Pair Quant AMC's AUM with the return that actually spans it.
+
+    Quant publishes AUM a day ahead of the rest of the industry: the figure
+    stamped for day D already reflects day D+1's book. The flow formula
+    AUM_t - AUM_(t-1) * (1 + return) then charges the wrong day's
+    mark-to-market against the pair, which is why Quant Large Cap reported a
+    51.15cr flow where the reference shows 2.04.
+
+    Taking the reported AUM as the previous day's and the next day's as the
+    current one -- with the return otherwise normal -- is the same as pairing
+    the unchanged AUM column with the *preceding* day's return. Shifting the
+    NAV column forward one observation does exactly that, and leaves the AUM
+    figures themselves untouched. Other AMCs are unaffected.
+
+    Lives here rather than in the MIS because both reports run through
+    calculate_flows_for_dataframe; applying it in only one of them left Fund
+    Performance showing the uncorrected figure.
+    """
+    if df.empty or "NAV" not in df.columns or "Scheme Name" not in df.columns:
+        return df
+
+    out = df.copy()
+    # The returns used for flows go in their own column. Overwriting NAV would
+    # shift the figure the report displays as well, so a Quant row would show
+    # the previous day's NAV beside the right flow -- correct arithmetic
+    # presented as a wrong price.
+    out["_flow_nav"] = out["NAV"]
+
+    is_quant = out["Scheme Name"].astype(str).str.strip().str.lower().str.startswith("quant")
+    if not is_quant.any():
+        return out
+
+    group_col = "Scheme Code" if "Scheme Code" in out.columns else "Scheme Name"
+    for _key, grp in out[is_quant].groupby(group_col):
+        if len(grp) < 2:
+            continue
+        shifted = grp["NAV"].shift(1)
+        # The opening observation has no predecessor; keep its own NAV so that
+        # day is simply not counted rather than turning into NaN.
+        shifted.iloc[0] = grp["NAV"].iloc[0]
+        out.loc[grp.index, "_flow_nav"] = shifted.values
+    return out
+
+
 def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list) -> pd.DataFrame:
     """Calculate the flows format columns for a vertical Mutual Fund DataFrame."""
     df = df.copy()
@@ -1117,8 +1162,9 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
         df["NAV Date"] = None
         
     df["NAV Date_parsed"] = parse_amfi_date_series(df["NAV Date"])
-        
+
     df = df.sort_values(by=["Scheme Code", "NAV Date_parsed"]).reset_index(drop=True)
+    df = _align_quant_nav(df)
     
     df["Closing AUM as on previous day"] = None
     df["Actual AUM as on current date"] = df["AUM"]
@@ -1144,8 +1190,8 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
                 continue
             prev_idx = indices[idx_in_group - 1]
             
-            nav_curr = df.at[idx, "NAV"]
-            nav_prev = df.at[prev_idx, "NAV"]
+            nav_curr = df.at[idx, "_flow_nav"]
+            nav_prev = df.at[prev_idx, "_flow_nav"]
             aum_prev = eff_prev if eff_prev is not None and pd.notna(eff_prev) else df.at[prev_idx, "AUM"]
             aum_curr = df.at[idx, "AUM"]
             
@@ -1209,6 +1255,7 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
     df = df[df["NAV Date_parsed"] >= start_date_ts].reset_index(drop=True)
     df = df.drop(columns=["NAV Date_parsed"])
     
+    df = df.drop(columns=["_flow_nav"], errors="ignore")
     df = df.rename(columns={"NAV": "NAVs"})
     
     flow_cols = [
