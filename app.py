@@ -406,10 +406,13 @@ def select_regular_growth_isins(df_matched):
         plan_type = str(row.get("Plan Type", "")).strip().lower()
         option_type = str(row.get("Option Type", "")).strip().lower()
 
-        if plan_type == "direct" or "direct" in nm or re.search(r"\bdir\b", nm):
+        # AMFI reports the plan as "Direct Plan" / "Regular Plan" in the new
+        # feed and as bare "Direct" / "Regular" in the old one, so both are
+        # matched by substring rather than equality.
+        if "direct" in plan_type or "direct" in nm or re.search(r"\bdir\b", nm):
             skipped_direct += 1
             continue
-        if plan_type not in ("regular", "unknown", ""):
+        if plan_type and not ("regular" in plan_type or "unknown" in plan_type):
             skipped_direct += 1
             continue
         # Bonus is often recorded in the scheme name rather than the option
@@ -435,8 +438,15 @@ def select_regular_growth_isins(df_matched):
         # appears inside Canara Rob(eco), and a plain containment test drops
         # all 158 of their rows -- Canara Robeco Multi Cap among them.
         #
-        # Institutional, Wealth and Blended plans go the same way. They are
-        # closed share classes that AMFI still lists but no longer prices:
+        # Wealth and Blended must carry the word "plan"; the others stand alone.
+        # "Wealth" on its own catches 47 funds of which only 4 are a Wealth
+        # Plan -- the rest belong to The Wealth Company, an AMC with funds in
+        # every category, and to Long Term Wealth Enhancement Fund. That is the
+        # Canara Rob(eco) trap again: a share-class word that is also part of a
+        # legitimate name.
+        #
+        # Institutional, Retail and Super are closed share classes AMFI still
+        # lists but no longer prices:
         # "ICICI Prudential Bluechip Fund - Institutional Option - I",
         # "PGIM India Large Cap Fund Wealth Plan", "ICICI Prudential Blended
         # Plan A". All four found across the equity categories returned zero
@@ -444,10 +454,18 @@ def select_regular_growth_isins(df_matched):
         # and then showed up as schemes with no data.
         if (re.search(r"\bplan\s*[b-z]\b", nm)
                 or re.search(r"\beco\b", nm)
-                or re.search(r"\b(institutional|retail|super|wealth|blended)\b", nm)):
+                or re.search(r"\b(institutional|retail|super)\b", nm)
+                or re.search(r"\b(wealth|blended)\s+plan\b", nm)):
             skipped_option += 1
             continue
-        if option_type and "growth" not in option_type:
+        # Option is "Growth", "Growth Option", "IDCW" or "Other" depending on
+        # which feed built the index. "Other" covers schemes whose option the
+        # feed does not state, which the name test above has already vetted, so
+        # only an explicitly non-Growth option is rejected here.
+        # "Other" means the feed states an option that is neither Growth nor
+        # IDCW, so it is not a Growth share class and must go. Only a genuinely
+        # absent option ("unknown") falls through to the name test above.
+        if option_type and option_type != "unknown" and "growth" not in option_type:
             skipped_option += 1
             continue
 

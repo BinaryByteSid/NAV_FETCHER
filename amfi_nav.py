@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Union
 
 import pandas as pd
+import time
 import requests
 
 
@@ -100,18 +101,55 @@ def _download_nav_text(session: Optional[requests.Session] = None, timeout: int 
     return response.text
 
 
+def _map_nav_columns(header_line: str) -> dict:
+    """Map the NAVAll header to column indices, falling back to the old layout."""
+    names = [h.strip().lower() for h in header_line.split(";")]
+    out: dict = {}
+    for i, h in enumerate(names):
+        if h.startswith("scheme code"):
+            out.setdefault("scheme_code", i)
+        elif "isin" in h and "reinvest" in h:
+            out.setdefault("isin_reinvest", i)
+        elif "isin" in h:
+            out.setdefault("isin_growth", i)
+        elif h in ("scheme name", "nav name") or h.endswith(" name"):
+            out.setdefault("scheme_name", i)
+        elif h == "plan":
+            out.setdefault("plan", i)
+        elif h == "option":
+            out.setdefault("option", i)
+        elif "net asset value" in h:
+            out.setdefault("nav", i)
+        elif h == "date":
+            out.setdefault("date", i)
+    for k, v in {"scheme_code": 0, "isin_growth": 1, "isin_reinvest": 2,
+                 "scheme_name": 3, "nav": 4, "date": 5}.items():
+        out.setdefault(k, v)
+    return out
+
+
 def _parse_nav_text(text: str) -> pd.DataFrame:
     rows: List[dict] = []
     current_amc = "Unknown AMC"
     current_section = "Unknown"
+
+    cols: dict = {}
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
         if line.startswith("Scheme Code;"):
+            # Read the layout from the header rather than assuming it. AMFI
+            # inserted Plan and Option, moving the ISINs from columns 1-2 to
+            # 4-5; the old positional unpack then read an ISIN as the NAV and
+            # produced nothing, which is why the index could not be refreshed.
+            cols = _map_nav_columns(line)
             continue
-        if line.startswith("Open Ended") or line.startswith("Closed Ended") or line.startswith("Interval Fund Schemes"):
+        # AMFI writes "Close Ended Schemes", not "Closed". Missing those five
+        # headers left their schemes inheriting the previous section, which put
+        # thousands of rows under Interval Fund and wrecked categorisation.
+        if line.startswith(("Open Ended", "Close Ended", "Closed Ended", "Interval Fund Schemes")):
             current_section = line
             continue
         if line.endswith("Mutual Fund") and line.count(";") == 0:
@@ -124,7 +162,18 @@ def _parse_nav_text(text: str) -> pd.DataFrame:
         if len(parts) < 6:
             continue
 
-        scheme_code, isin_growth, isin_reinvestment, scheme_name, nav_value, nav_date = parts[:6]
+        def _col(key: str, default: str = "") -> str:
+            i = cols.get(key)
+            return parts[i] if i is not None and i < len(parts) else default
+
+        scheme_code = _col("scheme_code")
+        isin_growth = _col("isin_growth")
+        isin_reinvestment = _col("isin_reinvest")
+        scheme_name = _col("scheme_name")
+        nav_value = _col("nav")
+        nav_date = _col("date")
+        _plan = _col("plan")
+        _option = _col("option")
         nav = pd.to_numeric(nav_value.replace(",", ""), errors="coerce")
         parsed_date = pd.to_datetime(nav_date, format="%d-%b-%Y", errors="coerce")
 
@@ -138,8 +187,15 @@ def _parse_nav_text(text: str) -> pd.DataFrame:
                 "Scheme Name": scheme_name,
                 "Family Name": derive_family_name(scheme_name),
                 "Family Key": build_family_key(scheme_name, current_amc),
-                "Plan Type": classify_plan_type(scheme_name),
-                "Option Type": classify_option_type(scheme_name),
+                # AMFI now publishes Plan and Option as their own columns, and
+                # the scheme name no longer carries them: the new feed says
+                # "The Wealth Company Large & Mid Cap Fund" where the old one
+                # said "... - Regular Plan - Growth". Classifying from the name
+                # then returned Unknown for every scheme and selection
+                # collapsed -- Large Cap fell from 34 funds to 4. Prefer the
+                # columns and keep the name-based reading as the fallback.
+                "Plan Type": (_plan.title() if _plan else classify_plan_type(scheme_name)),
+                "Option Type": (_option.title() if _option else classify_option_type(scheme_name)),
                 "NAV": nav,
                 "NAV Date": parsed_date,
                 "Source Section": current_section,
@@ -191,6 +247,26 @@ def _archive_snapshot(frame: pd.DataFrame, fetched_at: datetime) -> None:
     archive_frame.to_csv(archive_file, index=False, compression="gzip")
 
 
+# AMFI republishes NAVAll every business day, and new schemes only appear
+# there. Without an age check the cached index is returned forever: one built
+# on 3 August still had 14,215 rows against the live file's 17,988, so every
+# fund launched since -- whole AMCs among them -- was invisible to the app in
+# every category. A day keeps it current without refetching on every run.
+MAX_CACHE_AGE_HOURS = 24
+
+
+def _cache_is_stale() -> bool:
+    """True when the cached scheme index is older than a day, or unreadable."""
+    try:
+        age_hours = (time.time() - LATEST_CACHE_FILE.stat().st_mtime) / 3600.0
+    except OSError:
+        return True
+    if age_hours > MAX_CACHE_AGE_HOURS:
+        print(f"Scheme index cache is {age_hours:.0f}h old; refreshing from AMFI.")
+        return True
+    return False
+
+
 def fetch_nav_data(force_refresh: bool = False, session: Optional[requests.Session] = None) -> pd.DataFrame:
     """Fetch the latest AMFI NAV feed and cache it locally.
 
@@ -199,7 +275,7 @@ def fetch_nav_data(force_refresh: bool = False, session: Optional[requests.Sessi
     """
 
     ensure_cache_dirs()
-    if not force_refresh and LATEST_CACHE_FILE.exists():
+    if not force_refresh and LATEST_CACHE_FILE.exists() and not _cache_is_stale():
         try:
             cached = _read_cache()
             if not cached.empty:
@@ -216,6 +292,30 @@ def fetch_nav_data(force_refresh: bool = False, session: Optional[requests.Sessi
             source_url=AMFI_NAV_URL,
             row_count=int(len(frame)),
         )
+        # A parse that collapses is a parser problem, not an empty feed. Writing
+        # it would replace a working index with nothing -- which is exactly what
+        # happened when AMFI changed the column layout: a 14,215-row cache was
+        # overwritten by a header-only file, taking the whole app down with it.
+        if frame.empty:
+            print("Refusing to cache an empty NAV parse; keeping the existing index.")
+            if LATEST_CACHE_FILE.exists():
+                try:
+                    cached = _read_cache()
+                    if not cached.empty:
+                        return cached
+                except Exception:
+                    pass
+            raise AMFINavError("Parsed zero schemes from the AMFI NAV feed.")
+
+        try:
+            existing = _read_cache() if LATEST_CACHE_FILE.exists() else None
+        except Exception:
+            existing = None
+        if existing is not None and len(existing) > 100 and len(frame) < len(existing) * 0.5:
+            print(f"Refusing to cache {len(frame)} schemes over an existing "
+                  f"{len(existing)}; the feed or parser looks wrong.")
+            return existing
+
         try:
             _write_cache(frame, metadata)
             _archive_snapshot(frame, fetched_at)

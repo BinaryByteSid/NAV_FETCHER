@@ -184,6 +184,20 @@ def map_section_to_ids(sec):
         maturity_id = 2
         
     # Category
+    #
+    # These are separate SEBI categories that read as equity-ish, and the
+    # equity default below swept them all into Large Cap: 214 Fund of Funds,
+    # 192 Index Funds, 76 ETFs and 70 Overseas FoFs, against 164 real Large Cap
+    # schemes. Route them to Other before the default can claim them.
+    if ("fund of funds" in sec_lower or "fof" in sec_lower
+            or "index fund" in sec_lower
+            or "exchange traded" in sec_lower or "etf" in sec_lower
+            or "overseas" in sec_lower):
+        return (2 if "close" in sec_lower or "interval" in sec_lower else 1), 5, (
+            38 if ("index fund" in sec_lower or "exchange traded" in sec_lower
+                   or "etf" in sec_lower) else 39
+        )
+
     cat_id = 1  # Equity default
     if "debt" in sec_lower:
         cat_id = 2
@@ -2220,10 +2234,9 @@ def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = N
             # Fast section check (no semicolons in section headers)
             if ";" not in line:
                 line_stripped = line.strip()
-                if (
-                    line_stripped.startswith("Open Ended")
-                    or line_stripped.startswith("Closed Ended")
-                    or line_stripped.startswith("Interval Fund Schemes")
+                # "Close Ended", not "Closed" -- see amfi_nav._parse_nav_text.
+                if line_stripped.startswith(
+                    ("Open Ended", "Close Ended", "Closed Ended", "Interval Fund Schemes")
                 ):
                     current_section = line_stripped
                 continue
