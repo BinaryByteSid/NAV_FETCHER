@@ -1848,11 +1848,15 @@ def render_mis_generator_page():
         if st.session_state.get("mis_current_sig") is None:
             st.session_state["mis_current_sig"] = cur_sig
             st.session_state["mis_current_df"] = current_portfolio_df.copy()
-            # Seed the previous portfolio with the current one so every report
-            # carries both blocks from the first run. They stay identical until
-            # the current portfolio actually changes, at which point the prior
-            # version takes over below.
-            st.session_state["mis_auto_prev_df"] = current_portfolio_df.copy()
+            # Seed the previous portfolio with the current one so the very first
+            # report still carries both blocks -- but only when nothing was
+            # restored from disk. A refresh starts a fresh session and lands
+            # here every time, so seeding unconditionally overwrote a
+            # carried-over previous portfolio with the current one on every
+            # reload. It survives now until the current portfolio actually
+            # changes, which is the only thing that should replace it.
+            if st.session_state.get("mis_auto_prev_df") is None:
+                st.session_state["mis_auto_prev_df"] = current_portfolio_df.copy()
         elif cur_sig != st.session_state["mis_current_sig"]:
             # The current portfolio just changed: yesterday's current is today's previous.
             st.session_state["mis_auto_prev_df"] = st.session_state.get("mis_current_df")
