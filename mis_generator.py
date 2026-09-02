@@ -754,13 +754,35 @@ def _window_return(series: Optional[Series], d_base: date, d_to: date) -> Option
     return calc_return(v_to, v_base)
 
 
+def _inception_base(series: Series, d_base: date, d_end: date,
+                    since_inception: bool) -> Tuple[Optional[float], Optional[date], bool]:
+    """Baseline value for a window, falling back to the scheme's first NAV.
+
+    A fund launched inside the reporting period has no NAV at the baseline, so
+    the return is normally N/A. With since_inception on, the first observation
+    inside the window is used instead and the caller is told, so the figure can
+    be marked rather than passed off as covering the full period.
+
+    Returns (value, date_used, measured_from_inception).
+    """
+    v, dt = value_asof(series, d_base)
+    if v is not None or not since_inception or not series:
+        return v, dt, False
+    later = [d for d in series if d_base < d <= d_end]
+    if not later:
+        return None, None, False
+    first = min(later)
+    return series[first], first, True
+
+
 def _scheme_metrics(series: Series, d_end: date, d_period_base: date,
-                    d_fy_base: date, d_mtd_base: date) -> Dict[str, Any]:
+                    d_fy_base: date, d_mtd_base: date,
+                    since_inception: bool = False) -> Dict[str, Any]:
     """All return figures for a single observation series."""
     v_end, dt_end = value_asof(series, d_end)
     v_prev, dt_prev = value_prev(series, dt_end) if dt_end else (None, None)
-    v_period, dt_period = value_asof(series, d_period_base)
-    v_fy, dt_fy = value_asof(series, d_fy_base)
+    v_period, dt_period, period_inc = _inception_base(series, d_period_base, d_end, since_inception)
+    v_fy, dt_fy, fy_inc = _inception_base(series, d_fy_base, d_end, since_inception)
     v_mtd, dt_mtd = value_asof(series, d_mtd_base)
 
     # Don't dress a multi-week move up as a daily one when the feed has a hole.
@@ -780,6 +802,8 @@ def _scheme_metrics(series: Series, d_end: date, d_period_base: date,
         "date_period_base": dt_period,
         "date_fy_base": dt_fy,
         "date_mtd_base": dt_mtd,
+        "period_from_inception": period_inc,
+        "fy_from_inception": fy_inc,
     }
 
 
@@ -820,6 +844,7 @@ def _build_reports(portfolio_df: pd.DataFrame, nav_series: Dict[str, Series],
                    d_mis3_start: Optional[date] = None,
                    d_mis3_end: Optional[date] = None,
                    supplied_returns: Optional[Dict[str, Dict[Tuple[date, date], float]]] = None,
+                   since_inception: bool = False,
                    ) -> Dict[str, Any]:
     """Assemble MIS 1, 2 and 3 for one portfolio.
 
@@ -846,9 +871,13 @@ def _build_reports(portfolio_df: pd.DataFrame, nav_series: Dict[str, Series],
     n_metrics = _scheme_metrics(nifty_levels, d_end, d_period_base, d_fy_base, d_mtd)
 
     rows: List[Dict[str, Any]] = []
+    # Schemes whose period return had to start at their own inception, so the
+    # caller can say which figures do not cover the full window.
+    inception_rows: List[Tuple[str, date]] = []
     for _, r in portfolio_df.iterrows():
         isin = str(r["ISIN"]).strip().upper()
-        sm = _scheme_metrics(nav_series.get(isin, {}), d_end, d_period_base, d_fy_base, d_mtd)
+        sm = _scheme_metrics(nav_series.get(isin, {}), d_end, d_period_base, d_fy_base, d_mtd,
+                             since_inception=since_inception)
 
         bm_name = r["Benchmark"]
 
@@ -873,10 +902,37 @@ def _build_reports(portfolio_df: pd.DataFrame, nav_series: Dict[str, Series],
         # for the excess derived from it. Computing them separately is how a row
         # ended up showing 0.98 against 0.48 with an excess of 0.40.
         bm_day = _first_not_none(_supplied(d_end, d_end), bm["day"])
-        bm_period = _first_not_none(_supplied(d_start, d_end), bm["period"])
-        bm_fy = _first_not_none(
-            _supplied(d_m3_start, d_m3_end), _window_return(bm_levels, d_m3_base, d_m3_end)
-        )
+        # A scheme measured from its own inception must have its comparators
+        # measured over that same window, or the excess column subtracts a
+        # 9-month benchmark from a 5-month fund and reads as skill.
+        inc_from = sm.get("date_period_base") if sm.get("period_from_inception") else None
+        if inc_from:
+            inc_base = inc_from - timedelta(days=1)
+            n_period_for_row = _window_return(nifty_levels, inc_base, d_end)
+            bm_period_raw = _window_return(bm_levels, inc_base, d_end)
+            inception_rows.append((str(r["Scheme Name"]), inc_from))
+        else:
+            n_period_for_row = n_metrics["period"]
+            bm_period_raw = bm["period"]
+
+        bm_period = _first_not_none(_supplied(d_start, d_end), bm_period_raw)
+        _scheme_series = nav_series.get(isin, {})
+        m3_scheme = _window_return(_scheme_series, d_m3_base, d_m3_end)
+        if m3_scheme is None and since_inception and _scheme_series:
+            _later = [d for d in _scheme_series if d_m3_base < d <= d_m3_end]
+            if _later:
+                _m3_base = min(_later) - timedelta(days=1)
+                m3_scheme = _window_return(_scheme_series, _m3_base, d_m3_end)
+                m3_nifty = _window_return(nifty_levels, _m3_base, d_m3_end)
+                bm_fy_raw = _window_return(bm_levels, _m3_base, d_m3_end)
+            else:
+                m3_nifty = _window_return(nifty_levels, d_m3_base, d_m3_end)
+                bm_fy_raw = _window_return(bm_levels, d_m3_base, d_m3_end)
+        else:
+            m3_nifty = _window_return(nifty_levels, d_m3_base, d_m3_end)
+            bm_fy_raw = _window_return(bm_levels, d_m3_base, d_m3_end)
+
+        bm_fy = _first_not_none(_supplied(d_m3_start, d_m3_end), bm_fy_raw)
 
         rows.append({
             "Scheme Name": r["Scheme Name"],
@@ -892,19 +948,17 @@ def _build_reports(portfolio_df: pd.DataFrame, nav_series: Dict[str, Series],
             "Day Excess vs Benchmark": _diff(sm["day"], bm_day),
             # period
             "Period Scheme Return": sm["period"],
-            "Period Nifty Return": n_metrics["period"],
-            "Period Excess vs Nifty": _diff(sm["period"], n_metrics["period"]),
+            "Period Nifty Return": n_period_for_row,
+            "Period Excess vs Nifty": _diff(sm["period"], n_period_for_row),
             "Period Benchmark Return": bm_period,
             "Period Excess vs Benchmark": _diff(sm["period"], bm_period),
             # MIS 3 window — the financial year unless a separate range is set.
             # The "since 1st April" footers on MIS 1/2 keep using sm["fy"].
-            "FY Scheme Return": _window_return(nav_series.get(isin, {}), d_m3_base, d_m3_end),
-            "FY Nifty Return": _window_return(nifty_levels, d_m3_base, d_m3_end),
-            "FY Excess vs Nifty": _diff(_window_return(nav_series.get(isin, {}), d_m3_base, d_m3_end),
-                                        _window_return(nifty_levels, d_m3_base, d_m3_end)),
+            "FY Scheme Return": m3_scheme,
+            "FY Nifty Return": m3_nifty,
+            "FY Excess vs Nifty": _diff(m3_scheme, m3_nifty),
             "FY Benchmark Return": bm_fy,
-            "FY Excess vs Benchmark": _diff(
-                _window_return(nav_series.get(isin, {}), d_m3_base, d_m3_end), bm_fy),
+            "FY Excess vs Benchmark": _diff(m3_scheme, bm_fy),
             # Supplementary flow columns, in crores — these mirror the
             # reference report, where MTD and YTD are cumulative net flows
             # rather than returns.
@@ -1107,6 +1161,17 @@ def _build_reports(portfolio_df: pd.DataFrame, nav_series: Dict[str, Series],
             f"No NAV history available for: {', '.join(missing)}. Weights were renormalized over the rest."
         )
 
+    if inception_rows:
+        listed = ", ".join(f"{n} (from {d:%d-%b-%Y})" for n, d in inception_rows[:6])
+        more = f" and {len(inception_rows) - 6} more" if len(inception_rows) > 6 else ""
+        coverage_warnings.append(
+            f"{label}: {len(inception_rows)} scheme(s) launched inside the period, so their "
+            f"period and MIS 3 returns are measured from inception, not the report's start "
+            f"date: {listed}{more}. Their benchmark and Nifty figures are measured over the "
+            f"same shorter window so the excess columns stay comparable; the returns "
+            f"themselves cover less time than the other rows."
+        )
+
     return {
         "label": label,
         "mis1": mis1_spec,
@@ -1128,6 +1193,7 @@ def generate_mis_reports_data(
     supplied_levels_df: Optional[pd.DataFrame] = None,
     mis3_start: Optional[date] = None,
     mis3_end: Optional[date] = None,
+    since_inception: bool = False,
 ) -> Dict[str, Any]:
     """Build the full MIS pack for one (optionally two) portfolios."""
     global SKIP_WEEKEND_MARKS
@@ -1228,14 +1294,16 @@ def generate_mis_reports_data(
     current = _build_reports(portfolio_df, nav_series, bm_series, flows,
                              d_end, d_start, d_fy, d_mtd, "14 Fund AR Model Portfolio", d_flow=flow_date,
                              d_mis3_start=d_m3_start, d_mis3_end=d_m3_end,
-                             supplied_returns=supplied_returns)
+                             supplied_returns=supplied_returns,
+                             since_inception=since_inception)
 
     previous = None
     if previous_portfolio_df is not None and not previous_portfolio_df.empty:
         previous = _build_reports(previous_portfolio_df, nav_series, bm_series, flows,
                                   d_end, d_start, d_fy, d_mtd, "Previous 14 Fund AR Model Portfolio", d_flow=flow_date,
                                   d_mis3_start=d_m3_start, d_mis3_end=d_m3_end,
-                                  supplied_returns=supplied_returns)
+                                  supplied_returns=supplied_returns,
+                                  since_inception=since_inception)
 
     warnings: List[str] = list(bm_notes) + list(current["warnings"])
     if nifty_fallback_note:
@@ -2127,6 +2195,15 @@ def render_mis_generator_page():
         if start_date > end_date:
             st.error("Period Start Date must be on or before the Report Date.")
 
+        since_inception = st.checkbox(
+            "Measure new funds from inception", value=False, key="mis_since_inception",
+            help="A fund launched inside the reporting period has no NAV at the start date, "
+                 "so its period return is normally N/A. On: measure it from its first NAV "
+                 "instead, with its benchmark and Nifty measured over the same shorter "
+                 "window so the excess columns stay comparable. Those returns cover less "
+                 "time than the other rows, and the report says which.",
+        )
+
         skip_saturdays = st.checkbox(
             "Skip Saturday / Sunday NAV marks", value=True, key="mis_skip_sat",
             help="Markets are shut at weekends, but some AMCs still stamp a NAV. "
@@ -2210,6 +2287,7 @@ def render_mis_generator_page():
                         supplied_levels_df=supplied_levels_df,
                         mis3_start=mis3_start,
                         mis3_end=mis3_end,
+                        since_inception=since_inception,
                     )
                     if clicked:
                         st.success("MIS reports generated.")
