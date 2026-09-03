@@ -733,7 +733,11 @@ MAX_DAILY_GAP_DAYS = 7
 # year spans ~78 trading days across ~8 equity categories, so a full book is
 # ~600 calls; 90s only got through a third of them, and whichever categories
 # lost the race came back N/A while their neighbours reported numbers.
-AUM_BUDGET_SECONDS = 300.0
+# An hour, not five minutes. A financial year of flows is hundreds of AMFI
+# calls and the previous cap abandoned whichever categories lost the race,
+# leaving their schemes reporting no AUM while their neighbours reported
+# figures -- a partial answer that looks like a complete one.
+AUM_BUDGET_SECONDS = 3600.0
 AUM_FETCH_WORKERS = 6
 
 # A daily move smaller than this is too small to tell a stale AUM apart from a

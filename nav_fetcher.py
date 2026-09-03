@@ -2405,13 +2405,18 @@ def fetch_amfi_data(frmdt: str, todt: str, isin_list: tuple[str, ...] | None = N
 
 def fetch_amfi_data_chunked(start_date, end_date, isin_list: List[str] | None = None,
                             include_direct: bool = False, return_gaps: bool = False,
-                            progress=None, budget_seconds: float = 300.0,
+                            progress=None, budget_seconds: float | None = 3600.0,
                             chunk_days: int = 90):
     """Fetch AMFI data by chunking the date range into 90-day intervals to prevent timeout & memory crash.
 
     With return_gaps=True returns (df, gaps) where gaps lists the (start, end)
     windows AMFI would not serve, so callers can tell a partial history from a
     complete one instead of computing returns off a truncated series.
+
+    ``budget_seconds`` caps the whole fetch; pass None to let it run to
+    completion however long AMFI takes. The default is an hour rather than the
+    five minutes it was, because a truncated fetch silently drops date windows
+    and a report built on those is wrong in a way nobody can see.
 
     ``progress`` is an optional callable(done, total, label) for UI feedback --
     without it a slow fetch is an unexplained spinner. ``budget_seconds`` caps

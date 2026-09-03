@@ -257,10 +257,25 @@ MAX_CACHE_AGE_HOURS = 24
 
 def _cache_is_stale() -> bool:
     """True when the cached scheme index is older than a day, or unreadable."""
+    # Age comes from the recorded fetch time, not the file's mtime. A cache
+    # shipped inside a container image gets a fresh mtime at build time, so
+    # mtime would call a months-old index current and never refresh it.
+    age_hours = None
     try:
-        age_hours = (time.time() - LATEST_CACHE_FILE.stat().st_mtime) / 3600.0
-    except OSError:
-        return True
+        import json as _json
+        meta = _json.loads(META_CACHE_FILE.read_text(encoding="utf-8"))
+        fetched = datetime.fromisoformat(str(meta.get("fetched_at")))
+        if fetched.tzinfo is None:
+            fetched = fetched.replace(tzinfo=timezone.utc)
+        age_hours = (datetime.now(timezone.utc) - fetched).total_seconds() / 3600.0
+    except Exception:
+        age_hours = None
+
+    if age_hours is None:
+        try:
+            age_hours = (time.time() - LATEST_CACHE_FILE.stat().st_mtime) / 3600.0
+        except OSError:
+            return True
     if age_hours > MAX_CACHE_AGE_HOURS:
         print(f"Scheme index cache is {age_hours:.0f}h old; refreshing from AMFI.")
         return True
