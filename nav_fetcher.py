@@ -667,6 +667,55 @@ def _find_by_nav(scheme_name: str, perf_rows: list,
     return hits[0] if len(hits) == 1 else None
 
 
+# quant AMC files a day's AUM against the following day. Their own pipeline
+# states it directly: previous AUM is the day's own reported figure and the
+# observed AUM is the next day's, with the NAV return left normal. Pulling
+# the series back one observation expresses exactly that, because the flow
+# engine then pairs AUM(D+1) against AUM(D) with return r(D).
+#
+# Anchored at the start of the scheme name: the AMC name leads it and the NAV
+# frames carry no AMC column. Anchoring separates the AMC from everything
+# else containing the string -- Quantum is a different house, and Axis Quant
+# Fund and Aditya Birla Sun Life Quant Fund belong to Axis and ABSL. Checked
+# against the scheme index: 129 of 129 quant schemes matched, no false
+# positives.
+_QUANT_AMC = re.compile(r"^\s*quant\b", re.I)
+
+
+def _shift_quant_aum(df_res):
+    """Pull quant AMC's AUM back one observation per scheme.
+
+    Only a genuinely published figure may move: a carried or derived value
+    borrowed from tomorrow is not tomorrow's AUM. The final day has no
+    successor and is left empty rather than filled, so its flow is reported
+    as unmeasurable instead of invented.
+    """
+    if df_res.empty or "AUM" not in df_res.columns or "Scheme Name" not in df_res.columns:
+        return df_res
+    is_quant = df_res["Scheme Name"].astype(str).apply(lambda n: bool(_QUANT_AMC.match(n)))
+    if not is_quant.any():
+        return df_res
+    date_col = "NAV Date" if "NAV Date" in df_res.columns else (
+        "Date" if "Date" in df_res.columns else None)
+    if date_col is None:
+        return df_res
+    key_col = "Scheme Code" if "Scheme Code" in df_res.columns else "Scheme Name"
+
+    out = df_res.copy()
+    live = out["_aum_live"] if "_aum_live" in out.columns else None
+    source = out["AUM"].where(live.astype(bool)) if live is not None else out["AUM"]
+    order = parse_amfi_date_series(out[date_col])
+    moved = 0
+    for _key, grp_idx in out[is_quant].groupby(out.loc[is_quant, key_col]).groups.items():
+        idx = list(grp_idx)
+        idx.sort(key=lambda i: (order.loc[i] is pd.NaT, order.loc[i]))
+        out.loc[idx, "AUM"] = source.loc[idx].shift(-1).values
+        moved += len(idx)
+    if moved:
+        print(f"quant AMC: AUM realigned one day on {moved} row(s).")
+    return out
+
+
 def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool = True,
                         fetch_live_aum: bool = False, budget_seconds: float | None = None,
                         max_workers: int | None = None, on_incomplete=None,
@@ -1032,6 +1081,9 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
     
     del flat_perf_lookup, scheme_match_cache
     df_res["AUM"] = pd.to_numeric(pd.Series(aums, index=df_res.index), errors="coerce")
+    # Carried as a column because gap filling re-sorts and reindexes below; a
+    # positional list would silently misalign after that.
+    df_res["_aum_live"] = list(live_flags)
 
     live_rows = int(sum(live_flags))
     # Rows standing on the derived monthly-AUM fallback rather than a feed value.
@@ -1058,6 +1110,9 @@ def populate_actual_aum(df: pd.DataFrame, df_port: pd.DataFrame, want_aum: bool 
             df_res = df_res.drop(columns=["_aum_sort"])
         except Exception:
             pass
+
+    df_res = _shift_quant_aum(df_res)
+    df_res = df_res.drop(columns=["_aum_live"], errors="ignore")
 
     # Record fetch health so the UI can flag when the live AMFI feed under-delivered.
     total_rows = len(df_res)

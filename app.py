@@ -497,6 +497,12 @@ def run_historical_export(
     fetch_start_date = start_date
     if want_flows:
         fetch_start_date = start_date - timedelta(days=10)
+
+    # quant AMC files a day's AUM against the following day, so showing their
+    # figure for the last requested day means fetching past it. Without this the
+    # final row has no successor to draw from and falls back to a derived value:
+    # a 3,663cr fund reported 3,074cr on its most recent day.
+    fetch_end_date = end_date + timedelta(days=5)
         
     try:
         # Determine if running inside Streamlit context
@@ -510,6 +516,8 @@ def run_historical_export(
         # Split target date range into chunks of up to 90 days
         # (AMFI portal reliably returns CSV for 90-day windows)
         chunks = []
+        _requested_end = end_date
+        end_date = fetch_end_date
         curr_start = fetch_start_date
         while curr_start <= end_date:
             curr_end = min(curr_start + timedelta(days=90), end_date)
@@ -841,6 +849,13 @@ def run_historical_export(
             # non-trading ones have neither a NAV nor an AUM — they render as a
             # run of "None" cells that reads like a broken report rather than a
             # closed market. Nothing is lost: these rows never held a value.
+            # Trim the extra days fetched for quant's one-day offset.
+            try:
+                _d = parse_amfi_date_series(df_res_final["NAV Date"])
+                df_res_final = df_res_final[_d.dt.date <= _requested_end].reset_index(drop=True)
+            except Exception:
+                pass
+
             _obs = [c for c in ("NAV", "AUM") if c in df_res_final.columns]
             if _obs:
                 _empty = df_res_final[_obs].isna().all(axis=1)
