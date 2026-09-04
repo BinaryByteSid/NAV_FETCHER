@@ -716,7 +716,8 @@ def compute_scheme_flows(df_nav_raw: pd.DataFrame, isin_list: List[str],
             f"AMFI repeated the previous day's AUM on {stale_days} scheme-day(s) "
             f"({shown}{more}). Those days are counted as zero flow, since an unchanged "
             f"AUM against a moved NAV is a feed that has not updated rather than a "
-            f"subscription. MTD and YTD therefore understate any real flow on those days."
+            f"subscription. The movement is not lost: the next day measures against "
+            f"the published figure and carries both days, so MTD and YTD stay whole."
         )
 
     return result, flow_date, mtd_start

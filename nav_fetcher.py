@@ -1234,11 +1234,6 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
         # so the following day is measured against where the fund actually was.
         # Zeroing the stale day alone would just push its error onto the next.
         eff_prev = None
-        # A day whose AUM never updated leaves the next day's change spanning
-        # two days, so that day cannot be attributed either. Both are reported
-        # as zero and normal measurement resumes on the day after, anchored to
-        # a real published AUM.
-        zero_next = False
         for idx_in_group, idx in enumerate(indices):
             if idx_in_group == 0:
                 eff_prev = df.at[idx, "AUM"]
@@ -1287,20 +1282,17 @@ def calculate_flows_for_dataframe(df: pd.DataFrame, start_date, meta_cols: list)
 
             unmeasurable = curr_is_zero or prev_is_zero or aum_unchanged or derived_aum is None                 or pd.isna(aum_curr)
 
-            if zero_next and not unmeasurable:
-                # The day after an unmeasurable one. Its AUM change covers both
-                # days, so attributing it to today would be a guess; report zero
-                # and anchor tomorrow to today's real AUM.
+            if unmeasurable:
+                # No usable AUM movement to attribute: report no flow. The
+                # baseline stays the published figure, so the next day measures
+                # against it and picks the missed movement up.
                 df.at[idx, "Net flows on current day"] = 0.0
-                eff_prev = aum_curr
-                zero_next = False
-            elif unmeasurable:
-                df.at[idx, "Net flows on current day"] = 0.0
-                zero_next = True
-                # Anchor to whatever real AUM exists; the next day is zeroed
-                # regardless, so this only sets the baseline for the day after.
                 eff_prev = aum_curr if (pd.notna(aum_curr) and float(aum_curr) != 0.0) else eff_prev
             else:
+                # A day following a stale one carries both days' movement. It is
+                # reported here rather than discarded: the alternative loses the
+                # flow entirely, and MTD and YTD then understate by whatever
+                # moved while AMFI was not updating.
                 df.at[idx, "Net flows on current day"] = aum_curr - derived_aum
                 eff_prev = aum_curr
 
